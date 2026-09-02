@@ -660,6 +660,10 @@ def candidate_score(candidate: dict) -> float:
     Percentage gain on the day times how heavily it is trading against its own
     normal pace. Both matter and neither is enough alone: a big gain on thin
     volume is noise, and heavy volume going nowhere is not a trend.
+
+    The scanner works out a score of its own too. This is not that one, and it
+    does not replace it: the scanner's stays in the packet as scanner_score, so
+    whoever reads the packet can see both.
     """
     gain = _number(candidate.get("gain_pct"))
     relative_volume = _number(candidate.get("rel_volume"), 1.0) or 1.0
@@ -678,7 +682,11 @@ def build_decision_packet(client: mcp.McpClient, candidates: list[dict], now: da
     enriched: list[dict] = []
     for candidate in sorted(candidates, key=candidate_score, reverse=True):
         row = dict(candidate)
-        row["score"] = candidate_score(candidate)
+        # Keep the scanner's own score rather than writing over it.
+        if "score" in row:
+            row["scanner_score"] = row["score"]
+        row["loop_score"] = candidate_score(candidate)
+        row["score"] = row["loop_score"]
         try:
             bars = client.bars_5m_today(contract_for(candidate))
         except mcp.McpError as exc:
