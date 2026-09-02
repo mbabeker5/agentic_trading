@@ -2,7 +2,9 @@
 
 Mo's checklist, in order. This is the part only Mo can do. The software side is already done and listed at the bottom.
 
-## 1. Open the live account (today, about 15 minutes)
+**Status (2026-09-02):** Step 1 done. Live account application submitted under mtalib.personal@gmail.com, approval pending. Steps 2 to 4 wait on approval.
+
+## 1. Open the live account (done 2026-09-02)
 
 1. Go to https://www.interactivebrokers.com and click **Open Account**. Pick **Individual**.
 2. Pricing plan: **IBKR Pro**, not Lite. Lite sells your orders to wholesalers and skips SmartRouting, and good routing is the whole reason we picked IBKR.
