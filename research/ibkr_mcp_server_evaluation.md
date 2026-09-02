@@ -127,6 +127,13 @@ Released 28 July 2026. Easy to miss because it is a hosted endpoint, not a repos
 
 There is also an open bug where every tool taking an integer or a list fails validation, filed with Interactive Brokers as ticket 584301.
 
+**But there is a real idea buried in here.** The official connector needs no gateway, no code, no daily login and no maintenance, and it is reportedly fine with paper accounts. It is genuinely good at the reading half of the job. So the sharpest shape for this project may be a **split**:
+
+- **Reads** (positions, cash, margin, profit and loss, option chains, risk) come from the official connector. You build and maintain nothing.
+- **Orders** come from one small local server whose only job is the order path plus your own risk rules.
+
+That is a materially smaller build than a full server, because account summary, positions, quotes and open orders all come free. It is worth ten minutes in a browser to confirm the official connector's tool list and that it accepts your paper account before committing either way, since the paper support is corroborated by third parties rather than stated in the announcement itself.
+
 ---
 
 ## The recommendation: patrickpxp/ibkr-mcp-server
@@ -178,6 +185,7 @@ The quote tool retries with delayed data when it hits a subscription error, whic
 - **`transmit=False` by default parks the order.** It sits in the trading window waiting for a human click. For genuinely unattended paper fills the agent has to ask for transmission, and once it does, the safety story is thinner than the three defaults suggest.
 - **No quantity, value or symbol caps.** The author lists these as unbuilt.
 - **Docker and a web endpoint**, rather than the simpler direct-pipe transport. More moving parts.
+- **It requires Python 3.12 exactly**, declaring `>=3.12,<3.13`. See the version section below, because this matters more than the library's own tolerance does.
 - Single author, and quiet since May 2026.
 
 ---
@@ -209,7 +217,13 @@ It also has a real integration test that connects to port 4002 and asserts the c
 
 It uses the simple direct-pipe transport, so there is no network endpoint to secure. That is a genuine advantage over the recommendation.
 
-**Why it is second, not first.** Market, limit and stop only: no bracket, no trailing stop, no modify. No live prices attached to position reads. Nobody but the author appears to have run it, so there are no bug reports, which is not the same as no bugs. And **the install command in its README does not work**: it tells you to run `uvx ibkr-mcp-guarded`, but I checked the Python package index directly and that package returns HTTP 404. It was never published. You must clone the repository and install from source.
+**Why it is second, not first.** Market, limit and stop only: no bracket, no trailing stop, no modify. No live prices attached to position reads. Nobody but the author appears to have run it, so there are no bug reports, which is not the same as no bugs.
+
+And two install problems, the second of which is worse than the first:
+
+**The command in its README does not work.** It tells you to run `uvx ibkr-mcp-guarded`, but that package returns HTTP 404 on the Python package index. It was never published, so you must clone and install from source.
+
+**It will not start on a fresh install today.** It declares `mcp>=1.2.0` with no upper limit, and its server file opens with `from mcp.server.fastmcp import FastMCP`. In version 2 of the official MCP library that class was renamed, and the old path was replaced with a file that deliberately raises an error telling you so. Install it now, pip resolves to version 2, and it fails on import. The fix is small, either pin `mcp<2` or port about ten lines to the new `MCPServer` name, but "fork it and add order types" is not quite the afternoon job it first looks like. Fourteen of the servers I surveyed share this exact problem, so expect it wherever you see the old import.
 
 ---
 
@@ -255,13 +269,15 @@ Good architecture on paper, with complete order routers including a preview endp
 
 The highest-quality codebase I looked at, and the most sustained work in the field: 37 commits across 16 working days from August 2025 to July 2026, typed throughout, pre-commit hooks, real tests, a Docker image, BSD 3-Clause licence. Properly published, so `pip install ib-mcp` works.
 
-It cannot trade. Its connection call is:
+It cannot trade, and the reason is simply that **there is no order code anywhere in its 1,277-line server.** I searched for every order class and function name and found nothing.
+
+Its connection call also passes `readonly=True`, and it is worth being precise about what that does, because it is widely misread as a safety feature:
 
 ```python
 await self.ib.connectAsync(self.host, self.port, self.client_id, readonly=True)
 ```
 
-That `readonly=True` is not configurable, and there is no order code anywhere in the 1,277-line server.
+**That flag does not block order placement.** In the library it is consulted in exactly two places, both of which only decide whether existing orders are fetched when you connect. Do not treat `readonly=True` as a trading lock anywhere. The real read-only switch is the "Read Only API" checkbox inside the gateway's own settings, and since you need to place orders you will be turning that off, which is why the paper login carries the weight.
 
 **It is still useful to you.** It is the best available reference for the read side, it proves the `ib_async` and FastMCP combination works, and it is a good model to read before writing your own. Its option-chain and option-quote tools default to delayed data, so they work without a market data subscription. Its default port is 7497, so change that to 4002 for IB Gateway. Because it is structurally incapable of trading, it is also a safe second server to run alongside a trading one, on a different client id.
 
@@ -341,18 +357,36 @@ Three of those matter more than they look:
 
 Call it **two to four days** for a competent developer working with an AI assistant, and most of that is not typing. It is discovering how Interactive Brokers actually behaves. The commit log on the recommended project is a good preview of what that discovery looks like.
 
+### Three implementation rules that save a day each
+
+These came out of testing the library rather than reading about it, and each one prevents a bug that is painful to diagnose.
+
+**Write every tool as `async def`, with no exceptions.** The MCP library runs a tool written as a plain `def` on a worker thread. There is no event loop on that thread, so the library quietly creates a *second* one, while your broker connection lives on the first. The result is a hang or a nonsense error with nothing pointing at the cause. One rule, free to follow, removes the whole class of bug. Relatedly, never call the library's `sleep`, `waitOnUpdate`, `loopUntil` or `run` helpers, which all drive the loop themselves; use `await asyncio.sleep(...)` instead.
+
+**Turn off the "not a number" placeholders at construction.** MCP speaks JSON, and **JSON cannot represent "not a number"**. By default the library fills absent prices with exactly that, so a quote for an illiquid symbol produces invalid JSON that strict parsers reject. One argument fixes it:
+
+```python
+ib = IB(defaults=IBDefaults(emptyPrice=None, unset=None))
+```
+
+Missing values then arrive as `null`, which JSON handles.
+
+**Skip the completed-order preload when connecting.** Orders are keyed on client id plus order id, and the library preloads historical completed orders into that same map at connect time. Paper account resets restart the order-id sequence, so a fresh order can collide with a preloaded old one, and the collision is a bare assertion that crashes the server with no useful message. Passing `fetchFields=StartupFetchALL & ~StartupFetch.ORDERS_COMPLETE` to the connect call removes the collision surface and connects faster.
+
 **The genuinely hard parts:**
 
-1. **Contract qualification.** Turning "AAPL" into something the broker accepts sounds trivial and is where most of the time goes. Ambiguous symbols return several matches, and exchange and currency have to be right.
+1. **Contract qualification.** Turning "AAPL" into something the broker accepts sounds trivial and is where most of the time goes. Ambiguous symbols return nothing rather than a list, so pass `returnAll=True` to get the candidates and let the agent choose, otherwise it just sees an unexplained failure. There is also an open bug, unfixed since February 2025, where qualifying a futures contract writes back a malformed timezone that IBKR then **rejects on its own order placement**: the reporter found that removing the qualify call made the order work. Cache successful resolutions and budget real time here.
 2. **Multi-leg options.** Leave this out unless you truly need it. It needs combo legs assembled by contract id in the right ratios, and it is where the remaining time would go.
 3. **Orders are not synchronous.** `placeOrder` returns immediately with an object that is still empty. Fills arrive later as events. If you return that straight away, the agent sees a blank order and concludes it failed. Wait briefly for a status, or be explicit that the order is working and must be polled.
 
 ### Which safety guards are worth building
 
-Worth it:
+**The strongest guard is not in your code at all: run a gateway logged in with paper credentials.** IB Gateway authenticates one username per process, and paper trading is a separate username reached by clicking Paper Trading on the login screen. A gateway logged in as paper **cannot reach the live account whatever your Python does**. That is a guarantee at the process boundary, which is a different and better category than a check inside your own program. Everything below is a second line of defence.
 
-- **Pin the port to 4002 and refuse to start on 4001 or 7496.** The strongest single guard, because the live account is not reachable there.
-- **Assert the account id starts with `DU`.** Confirmed: Interactive Brokers paper accounts are the live username with a `DU` prefix, so live `U12345678` becomes paper `DU12345678`. Cheap, independent second check.
+Worth building:
+
+- **Assert the account id starts with `DU`.** Confirmed: Interactive Brokers paper accounts are the live username with a `DU` prefix, so live `U12345678` becomes paper `DU12345678`. Read it from `managedAccounts()` right after connecting and refuse to proceed otherwise. This is the strongest in-code check, because it reflects what the gateway actually reports rather than what you hoped you connected to.
+- **Pin the port to 4002.** Worth doing, but weaker than it sounds and I want to correct my own earlier framing. 4001 and 4002 are only *defaults*: the socket port is a user-editable setting, so a gateway logged in to the live account could be told to listen on 4002. The port pin catches the honest mistake of pointing at the wrong running gateway, which is worth catching, but it is not a guarantee. The paper login and the `DU` check are.
 - **A required confirmation argument on every order tool.** Costs nothing, stops the whole class of accident where a model places a trade while exploring.
 - **A maximum order value cap**, remembering it can only be enforced when a price is known.
 - **A kill switch**, which is one call to `reqGlobalCancel`.
@@ -377,13 +411,18 @@ Mostly theatre:
 
 So the connection path works on 3.14. Do not let the issue tracker scare you off a working setup.
 
-**That said, use Python 3.12 if you are choosing fresh.** Three reasons, none of them panic:
+**Use Python 3.12 anyway, and the reason has nothing to do with the library.** Both servers I recommend refuse anything newer in their own packaging:
 
-1. The maintainers have not closed those issues, so some code path presumably still breaks, and I only exercised connection and setup, not a full trading session.
-2. The alternative server's packaging declares 3.11 or 3.12 only, so installing it under 3.14 will be refused by the package manager regardless of whether the code would run.
-3. `nest_asyncio` was last released in January 2024, so nobody is actively keeping it current with Python's internals.
+- https://github.com/patrickpxp/ibkr-mcp-server declares `>=3.12,<3.13`
+- https://github.com/nganiet/safe-ibkr-mcp declares `>=3.11,<3.13`
 
-If you already have a 3.14 environment, it is worth testing before rebuilding it.
+So the package manager will decline to install either one on 3.13 or 3.14, whatever the code would have done at runtime. **If you already have a Python 3.14 environment, it cannot run either server**, and that is the binding constraint, not `nest_asyncio`.
+
+Two smaller reasons to stay on 3.12: the maintainers have not closed those 3.14 issues, so some path presumably still breaks and I only exercised setup and connection rather than a full trading session, and `nest_asyncio` was last released in January 2024 so nobody is keeping it current with Python's internals.
+
+The useful takeaway is narrower than "3.14 is broken": build on 3.12 because the servers require it, and know that if you ever write your own, 3.14 is not the obstacle it appears to be.
+
+One more packaging wrinkle to expect: `ib_async` caps its timezone dependency below version 2026, while the current release of that dependency is 2026.3. It resolves fine on its own, but it will collide the moment something else in the same environment wants a current one. A one-character fix has been sitting unmerged since April 2026.
 
 `ib_async` itself deserves a caveat too. It has 1,729 stars and is not archived, but **its last commit to the main branch was 6 December 2025**, the 2.1.0 release. That is nine months of quiet with 93 open issues. Still much the best option, and far better than the archived `ib_insync`, but not a busy project.
 
@@ -530,9 +569,10 @@ A second alternative worth knowing: **https://github.com/QuantConnect/IBAutomate
 
 ## What I would actually do
 
-1. **Install IB Gateway** from the verified Apple Silicon stable link above. There is no Homebrew route, so download it. If Homebrew management matters more than the lighter program, use `brew install --cask trader-workstation` and stay on port 7497, which is the recommended server's default anyway.
+0. **Check what you already have.** IB Gateway 10.45 is already installed on this machine at `/Users/mtalib/Applications/IB Gateway 10.45`, and it is not currently running. Steps 1 and 2 may already be done.
+1. **If you do need to install it**, use the verified Apple Silicon stable link above and mind the `arm` versus `macosx-x64` filenames. There is no Homebrew route for IB Gateway. If Homebrew management matters more than the lighter program, use `brew install --cask trader-workstation` and stay on port 7497, which is the recommended server's default anyway.
 2. **Turn on the API** inside Gateway: enable socket clients, add `127.0.0.1` as trusted, confirm the port, and make sure Read-Only API is unticked when you are ready to trade.
-3. **Python 3.12 is the safe choice**, though I confirmed `ib_async` connects fine on 3.14 too, so an existing 3.14 environment is worth testing before you rebuild it. The one hard constraint is that the alternative server's packaging refuses anything above 3.12.
+3. **Build a Python 3.12 environment, and this one is not optional.** Both recommended servers cap themselves below 3.13 in their packaging, so the Python 3.14 environment currently sitting at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv/` cannot install either of them. That is a packaging constraint, not a library one: I confirmed `ib_async` itself connects fine on 3.14, which only matters if you end up writing your own server.
 4. **Stand up https://github.com/patrickpxp/ibkr-mcp-server**, and set two things before anything else: `MCP_BIND_HOST=127.0.0.1` so the trading endpoint is not exposed to your whole network, and `IBKR_PORT=4002` if you are on IB Gateway rather than Trader Workstation.
 5. **Leave trading disabled and confirm the read path first.** Trading is off by default. Check that account summary, positions, quotes and historical bars all come back before you enable anything that can place an order.
 6. **Then enable trading and place one order.** Preview it first, so you see the real margin and commission numbers, then place a single-share limit order. Remember that transmission is off by default, so decide deliberately whether you want the order to go through without a human click.
