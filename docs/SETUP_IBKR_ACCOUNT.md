@@ -2,7 +2,7 @@
 
 Mo's checklist, in order. This is the part only Mo can do. The software side is already done and listed at the bottom.
 
-**Status (2026-09-02):** Step 1 done. Live account under mtalib.personal@gmail.com approved 2026-09-02 12:45 PM ET, account U28440091, IBKR Pro. Paper account enabled the same day, paper account number DUT077572. Next: step 4, paper login into .secrets.
+**Status (2026-09-02):** Step 1 done. Live account under mtalib.personal@gmail.com approved 2026-09-02 12:45 PM ET, account U28440091, IBKR Pro. Paper account enabled the same day, paper account number DUT077572. Paper login saved to `.secrets/ibkr_paper.env` (username is the live one, mbabeker5; IBC logs it into the paper side). First Gateway login 13:27 ET succeeded in 5 seconds with no two-factor prompt. API confirmed: connects, contract lookup, delayed quotes and historical bars all work. Account summary is still empty (IBKR provisions a new paper account overnight) and live quotes are not subscribed yet. Next: step 3, buy the $10 data bundle on the live login and tick data sharing; re-run the smoke test 2026-09-03.
 
 ## 1. Open the live account (done 2026-09-02)
 
@@ -33,7 +33,7 @@ You do not need to fund the account to paper trade. Fund it only when we decide 
 Create a file at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/ibkr_paper.env` with two lines:
 
 ```
-IBKR_PAPER_USER=your_paper_username
+IBKR_PAPER_USER=your_username   # the live username works, IBC picks the paper side
 IBKR_PAPER_PASSWORD=your_paper_password
 ```
 
@@ -46,5 +46,5 @@ IBKR sends a two-factor prompt to the IBKR Mobile app on most logins. Paper acco
 ## Already done on the software side
 
 - IB Gateway 10.45 stable, native Apple silicon build, installed at `/Users/mtalib/Applications/IB Gateway 10.45/`.
-- Python environment with `ib_async` (the maintained fork of `ib_insync`) at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv/`.
+- Python environments: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/` (Python 3.12, used for Gateway work and the MCP server, which refuses newer Pythons) and `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv/` (Python 3.14, general scripts).
 - Guardrail template at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.example.yaml`.
