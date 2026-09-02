@@ -16,3 +16,6 @@ ibc/
 Jts/
 # mac
 .DS_Store
+
+# non-secret settings files that happen to end in .env
+!config/mcp_ibkr.env

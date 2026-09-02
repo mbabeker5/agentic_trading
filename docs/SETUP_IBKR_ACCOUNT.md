@@ -2,7 +2,7 @@
 
 Mo's checklist, in order. This is the part only Mo can do. The software side is already done and listed at the bottom.
 
-**Status (2026-09-02):** Step 1 done. Live account under mtalib.personal@gmail.com approved 2026-09-02 12:45 PM ET, account U28440091, IBKR Pro. Paper account enabled the same day, paper account number DUT077572. Paper login saved to `.secrets/ibkr_paper.env` (username is the live one, mbabeker5; IBC logs it into the paper side). First Gateway login 13:27 ET succeeded in 5 seconds with no two-factor prompt. API confirmed: connects, contract lookup, delayed quotes and historical bars all work. Account summary is still empty (IBKR provisions a new paper account overnight) and live quotes are not subscribed yet. Next: step 3, buy the $10 data bundle on the live login and tick data sharing; re-run the smoke test 2026-09-03.
+**Status (2026-09-02):** Step 1 done. Live account under mtalib.personal@gmail.com approved 2026-09-02 12:45 PM ET, account U28440091, IBKR Pro. Paper account enabled the same day, paper account number DUT077572. Paper login saved to `.secrets/ibkr_paper.env` (username is the live one, mbabeker5; IBC logs it into the paper side). First Gateway login 13:27 ET succeeded in 5 seconds with no two-factor prompt. API confirmed: connects, contract lookup, delayed quotes and historical bars all work. Paper balance appeared the same afternoon: $1,000,000 simulated cash. Live quotes are not subscribed yet (delayed data works). MCP server installed and verified read-only, see docs/MCP_SERVER.md. Next: step 3, buy the $10 data bundle on the live login and tick data sharing.
 
 ## 1. Open the live account (done 2026-09-02)
 
