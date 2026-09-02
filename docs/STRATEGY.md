@@ -44,6 +44,10 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | Options | Not in month one | |
 | Order types | Limit entries, bracket stops, market exits at close | |
 
+## Price feed in month one
+
+Mo enabled real-time data sharing to the paper account on 2026-09-02 (IBKR applies it overnight). The live account holds only IBKR's free feed, "US Real-Time Non Consolidated Streaming Quotes", which is the top of book from the Cboe exchanges plus IEX, roughly a fifth of US volume. So month one prices off a real-time but partial view of the market: last prices track the real market closely on liquid names, while bid and ask can sit a cent or two off the true national best on thinner ones. The agent's entries are limit orders, so a stale quote costs a missed fill rather than a bad one. If Mo adds the $10 a month "US Securities Snapshot and Futures Value Bundle", the feed becomes the full consolidated quote and this section should be updated. Whichever feed was live is recorded in the ledger notes each day.
+
 ## The pattern day trader rule, and why paper ignores it
 
 US regulators call anyone who makes four or more round-trip day trades in five business days in a margin account a pattern day trader, and require that account to hold at least $25,000. Fall below it and the broker blocks day trading for 90 days. This strategy would trip the rule in its first week.

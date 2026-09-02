@@ -39,6 +39,12 @@ IBKR_PAPER_PASSWORD=your_paper_password
 
 That folder is gitignored, so it never reaches GitHub. Do not paste the credentials into chat. Once the file exists, say so and the Gateway login test can run.
 
+## 4b. Market data: three things to know
+
+- **Sharing is on.** On 2026-09-02 Mo set "Share real-time market data subscriptions with paper trading account" to Yes for paper username futzmp555 (account DUT077572), sharing from live username mbabeker5. IBKR applies it overnight, so the first real-time check is the morning of 2026-09-03 after 9:30 AM Eastern. Note the auto-login still uses the live username mbabeker5 with the paper button; that logs into the same paper account and has worked.
+- **Only one login can hold market data at a time.** IBKR allows one market data session per user, and live and paper share it. While Gateway runs the paper account during market hours, do not keep a quote screen, Client Portal watchlist or the mobile app streaming prices on the live login. It will steal the data session from the agent and its quotes will go stale (Gateway reports error 10197).
+- **Subscriber status.** Mo's status showed Professional on 2026-09-02 and IBKR asked for the Non-Professional questionnaire. Professional status triples data fees and can change which feeds are shared to paper. Complete the questionnaire on the live login under Settings, User Settings, Market Data Subscriptions. The smoke test on 2026-09-03 records whether quotes come back flagged professional.
+
 ## 5. Two-factor authentication
 
 IBKR sends a two-factor prompt to the IBKR Mobile app on most logins. Paper accounts are usually gentler about it, and the auto-login helper (IBC) holds the session and restarts it daily. If the prompt keeps coming back, enable IBKR Mobile Authentication (IB Key) in the app and keep the phone nearby.
