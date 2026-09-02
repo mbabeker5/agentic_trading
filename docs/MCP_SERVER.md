@@ -49,6 +49,8 @@ Historical bars want `endDateTime` (empty string for now), `durationStr` like `"
 
 ## Known gaps
 
+- **A market order that fills instantly comes back as an error.** Verified 2026-09-02 with the first real paper buy (1 SPY, order 8, filled at $765.15 on ARCA): the order filled, but the server's response failed its own validation (`TradeSnapshotModel fills.0: Input should be a valid dictionary`) and the tool reported `isError=true`. The agent must never read an error from `ibkr_place_order` as "nothing happened". Always confirm with `ibkr_get_executions` and `ibkr_get_open_orders` afterwards. Limit orders that rest do not hit this bug.
+
 - No modify-order tool. Cancel and re-place.
 - Orders default to `transmit=false`, which parks them in Gateway waiting for a click. The agent must pass `transmit=true` deliberately when we enable trading.
 - No built-in position or dollar caps. Those live in our own guardrail layer, not in the server.
