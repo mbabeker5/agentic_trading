@@ -2,7 +2,7 @@
 
 Mo's checklist, in order. This is the part only Mo can do. The software side is already done and listed at the bottom.
 
-**Status (2026-09-02):** Step 1 done. Live account under mtalib.personal@gmail.com approved 2026-09-02 12:45 PM ET, account U28440091, IBKR Pro. One pending item (Investor Category form) still to complete. Next: step 2, enable paper account.
+**Status (2026-09-02):** Step 1 done. Live account under mtalib.personal@gmail.com approved 2026-09-02 12:45 PM ET, account U28440091, IBKR Pro. Paper account enabled the same day, paper account number DUT077572. Next: step 4, paper login into .secrets.
 
 ## 1. Open the live account (done 2026-09-02)
 
