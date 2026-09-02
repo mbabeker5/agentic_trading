@@ -22,6 +22,8 @@ Four findings drive the answer.
 
 **Recommendation: https://github.com/patrickpxp/ibkr-mcp-server.** It is the only server that can place a trade through IB Gateway *and* shows four months of genuine iteration against a real broker. Two environment variables must be changed before you trust it, and I spell them out.
 
+**One more finding that simplifies the plumbing.** The IBC auto-login helper was retired on 1 September 2026, and its author's parting explanation is that Gateway's own built-in auto-restart has largely replaced it. That setting restarts Gateway daily **without re-authenticating**, and Interactive Brokers themselves recommend it for API users, so the daily-restart problem may need no helper software at all.
+
 ---
 
 ## Some jargon, once
@@ -385,7 +387,7 @@ Missing values then arrive as `null`, which JSON handles.
 
 Worth building:
 
-- **Assert the account id starts with `DU`.** Confirmed: Interactive Brokers paper accounts are the live username with a `DU` prefix, so live `U12345678` becomes paper `DU12345678`. Read it from `managedAccounts()` right after connecting and refuse to proceed otherwise. This is the strongest in-code check, because it reflects what the gateway actually reports rather than what you hoped you connected to.
+- **Assert the account number starts with `DU`.** Paper **account numbers** are prefixed `DU` and live ones `U`. Read it from `managedAccounts()` right after connecting and refuse to proceed otherwise. This is the strongest in-code check, because it reflects what the gateway actually reports rather than what you hoped you connected to. Be careful with a widespread misconception here: the `DU` prefix belongs to the account **number**, not to the **username**. Your paper username is a separate string you chose, not your live username with letters prepended, so do not try to derive one from the other.
 - **Pin the port to 4002.** Worth doing, but weaker than it sounds and I want to correct my own earlier framing. 4001 and 4002 are only *defaults*: the socket port is a user-editable setting, so a gateway logged in to the live account could be told to listen on 4002. The port pin catches the honest mistake of pointing at the wrong running gateway, which is worth catching, but it is not a guarantee. The paper login and the `DU` check are.
 - **A required confirmation argument on every order tool.** Costs nothing, stops the whole class of accident where a model places a trade while exploring.
 - **A maximum order value cap**, remembering it can only be enforced when a price is known.
@@ -472,6 +474,8 @@ The human-readable pages are https://www.interactivebrokers.com/en/trading/ibgat
 
 **Watch the architecture in those filenames, because it is genuinely easy to get wrong.** The Apple Silicon build ends `macos-arm.dmg` and the Intel build ends `macosx-x64.dmg`. One letter and one word apart, and the Intel one is the more conventional-looking name, so it is the easy mistake. This Mac is Apple Silicon, so the `arm` file is the right one. Interactive Brokers' download pages do not make this obvious.
 
+**Current versions, straight from Interactive Brokers' own machine-readable manifests rather than a web page:** stable is **10.45.1j** (built 5 August 2026) and latest is **10.50.1e** (built 25 August 2026). You can re-check these any time at `https://download2.interactivebrokers.com/installers/ibgateway/stable-standalone/version.json` and the matching `latest-standalone` URL. Gateway and Trader Workstation share version numbers exactly. The trailing letter is a patch counter that changes without announcement.
+
 **Stable or latest?** Stable. "Latest" gets new features and new bugs, and the automation tooling is tested against stable. At 281 megabytes against Trader Workstation's 94 megabytes, the installer clearly bundles its own Java runtime, so you do not install Java yourself.
 
 ### Settings you must change inside IB Gateway
@@ -484,9 +488,20 @@ Nothing connects until you do this, under the API settings:
 - **Socket port.** Confirm it says 4002 for paper.
 - **Master client ID.** Each connecting program needs its own. Two programs sharing one id will fight.
 
-### The daily restart, and the paper-account dialog
+### The daily restart, and the built-in fix most people miss
 
-IB Gateway forces a logout roughly once every 24 hours. For an agent meant to run unattended, that is the central operational problem.
+IB Gateway insists on restarting once every 24 hours. Interactive Brokers explains why, and it is not a licensing trick: the platform needs to re-download contract definitions in case instruments changed.
+
+**Gateway solves this itself, and this is the most useful thing in this section.** Under `Configure` then `Settings` then `Lock and Exit` there are two mutually exclusive options:
+
+- **Set Auto Log Off Time.** Shuts down and stays down. Your agent's connection dies until a human logs in. Useless here.
+- **Set Auto Restart Time.** Interactive Brokers' own wording is the important part: it restarts "**without authentication requirements**". Gateway shuts down and comes straight back up reusing its session token, so no password and no second factor. Your agent loses its socket for a minute or two and reconnects.
+
+Interactive Brokers' API documentation recommends exactly this pairing: "For API users, it is recommended to choose 'Never lock Trader Workstation' and 'Auto restart'." Set both. A screen lock kills the API connection, so "never lock" matters too.
+
+**So the daily restart needs no helper software at all.** That reframes the whole IBC question below, and it is the same conclusion IBC's own author reached.
+
+What auto-restart does *not* cover: a crash, a power cut, a manual quit, or the weekly token expiry. Those are the only gaps a helper actually fills.
 
 There is a second, less known trap specific to paper accounts. Logging into a paper account makes Gateway show a dialog asking you to confirm you understand this is not a brokerage account, and **until that dialog is dismissed, API connections will not succeed.** A server that cannot connect on a fresh paper login is usually stuck behind this dialog, not broken.
 
@@ -502,6 +517,18 @@ This is the most time-sensitive finding here.
 
 The repository is read-only: no new issues, pull requests or comments. Releases remain downloadable and the author intends one final release to clear outstanding issues. After 23 years, support moves to a mailing list at https://groups.io/g/ibcalpha.
 
+**The author's reasoning matters more than the retirement itself**, because it tells you what to use instead. From his own explanation at https://github.com/IbcAlpha/IBC/discussions/347:
+
+> I've been developing, maintaining and supporting IBC (and its predecessor IBController) continuously for 23 years, and I've really had enough of it. [...] at the age of 73 I don't feel it's unreasonable to want to stop working on it.
+
+And then the line that should shape your plan:
+
+> There is less need for IBC than there used to be, particularly because of the auto-restart mechanism in Gateway and TWS. While IBC adds some convenience to the TWS/Gateway experience, there are plenty of users who manage without it.
+
+**That is the maintainer of the auto-login tool telling you that Gateway's own auto-restart has largely replaced his software.** Combined with the built-in restart settings described above, the honest conclusion is that **you may not need IBC at all.** What it still buys you is unattended recovery from crashes and the weekly cold restart. If you are willing to click a login once a week, Gateway alone will do.
+
+There is a further reason to hesitate. IBC works by recognising window titles and dialog text, so every change Interactive Brokers makes to a dialog needs a corresponding IBC change. That maintenance has now stopped, and there are already open, unfixable bugs of exactly this kind: passkey logins failing, the wrong passkey device being chosen on Apple Silicon, and a 2FA shutdown timer that can terminate a healthy logged-in session. Frozen window-scraping software degrades rather than holding steady.
+
 **Current facts:** 1,605 stars, 278 forks, 24 open issues frozen in place, Java, GPL 3.0. Latest release **3.24.2**, published 21 August 2026, with a macOS build named `IBCMacos-3.24.2.zip`, from https://github.com/IbcAlpha/IBC/releases/latest.
 
 **No successor has emerged.** I checked every recently active fork. All have zero stars and look like personal mirrors rather than a continuation.
@@ -510,7 +537,22 @@ The repository is read-only: no new issues, pull requests or comments. Releases 
 
 It fills in your username and password, clicks the login button, dismisses the dialogs that block API access including the paper-account warning above, and restarts Gateway daily without you re-authenticating.
 
-It genuinely supports macOS, which answers the launchd question directly. Among its shipped resources are `gatewaystartmacos.sh`, a macOS-specific start script, and **`local.ibc-gateway.plist`, a ready-made launchd configuration** for keeping Gateway running as a background service on a Mac. You do not have to write that yourself.
+It genuinely supports macOS, which answers the launchd question directly. Among its shipped resources are `gatewaystartmacos.sh`, a macOS-specific start script, and **`local.ibc-gateway.plist`, a ready-made launchd configuration** for keeping Gateway alive on a Mac. It belongs at `/Users/mtalib/Library/LaunchAgents/local.ibc-gateway.plist`.
+
+The design is cleverer than it looks. The job runs hourly, and the start script checks whether IBC is already running with the same config and quietly exits if so, so an hourly job costs nothing almost all the time and restarts Gateway within an hour of any crash. That is the self-healing behaviour Gateway's built-in restart does not give you.
+
+**But the shipped plist has two defects you must fix.** First, it points at `/Users/user/Applications/ibc/gatewaystartmacos.sh`, which matches neither the documented install location nor the script's own default; use `/opt/ibc/gatewaystartmacos.sh`. Second, and more important, **it does not pass the `-inline` flag, and it must.** Without it the script does not run Gateway: it runs AppleScript to open a brand new Terminal window and re-runs itself inside that. Under launchd that loses track of the real process, triggers a macOS automation permission prompt, and accumulates Terminal windows. The fix:
+
+```xml
+<array>
+	<string>/opt/ibc/gatewaystartmacos.sh</string>
+	<string>-inline</string>
+</array>
+```
+
+Two more macOS constraints, both structural. **Use a LaunchAgent, never a LaunchDaemon:** Gateway is a Java program that draws windows, so it needs a real graphical login session, and a daemon has no access to one. Interactive Brokers states outright that "a headless session of TWS or IBGW without a GUI is not supported", and unlike Linux there is no fake-display workaround on macOS. Screen lock and display sleep are fine, but **system sleep is not**, so disable it on an always-on Mac. And surviving a reboot unattended needs automatic login, which is incompatible with FileVault in the way that matters, since the disk stays locked until a human types the password. Given the config file holds your password in plain text, that is a real trade-off rather than a formality.
+
+Do not use cron on a Mac for this. IBC's author is explicit that launchd is the right mechanism, and the user guide's cron section is marked Linux only.
 
 Two settings you must get right for a paper account:
 
@@ -521,24 +563,30 @@ The user guide is at https://github.com/IbcAlpha/IBC/blob/master/userguide.md.
 
 ### Two-factor authentication: the honest answer
 
-**Does two-factor apply to paper accounts? Yes, and you cannot turn it off.** I went looking for the usual "paper accounts are exempt" answer and it is not true. Interactive Brokers does not allow two-factor authentication to be disabled for paper trading accounts. Paper money still sits behind a real login.
-
-IBC cannot complete it for you either. The user guide is blunt:
+First, what IBC can and cannot do. Its user guide is blunt:
 
 > Note that IBC cannot itself assist in the process, so you'll have to actually perform the necessary actions on your device yourself.
 
-But the practical answer is much better than that sounds, and it is the most useful operational fact in this report.
+So IBC never completes a second factor for you. It only handles the failure modes: `ReloginAfterSecondFactorAuthenticationTimeout=yes` detects the three-minute alert timeout and restarts the login so a fresh alert fires, repeating until you acknowledge one, and `SecondFactorAuthenticationExitInterval` covers the case where you tapped the alert but login still failed. The reliable method is the IBKR Mobile app with seamless authentication. If Interactive Brokers issued you a physical security card, IBC states plainly it cannot automate that login at all, and you should ask to be switched to the mobile app. Automated one-time codes are refused on principle: IBC's author called them "not 2FA at all" and publicly disowned a third-party project that added them, warning it may breach Interactive Brokers' terms.
 
-**You authenticate roughly once a week, not once a day.** Interactive Brokers invalidates login tokens every **Sunday at 01:00 US Eastern time**. IBC's daily restart runs without re-authenticating. So the pattern is:
+**Does two-factor apply to paper accounts? This is genuinely contested, and it hinges on which username you log in with.** I could not settle it from documentation, so here is the honest state of the evidence, because it decides whether your agent needs a human at all.
 
-- Sunday, some time after 01:00 Eastern: you log in once and tap the alert on your phone.
-- Every other day that week: IBC restarts Gateway on schedule, silently, with no phone involvement.
+Interactive Brokers' own API documentation says flatly:
 
-The cost of running an agent all week is one phone tap on a Sunday. That is a reasonable amount of human involvement and a very different proposition from the daily interruption people assume.
+> Two Factor Authentication (2FA) is required for all users at Interactive Brokers.
 
-Two supporting settings matter. `ReloginAfterSecondFactorAuthenticationTimeout=yes` detects the three-minute alert timeout and restarts the login so you get another alert, repeating until you acknowledge one. `SecondFactorAuthenticationExitInterval` handles the case where you acknowledged but login still failed.
+But their paper trading documentation never mentions two-factor or the Secure Login System anywhere, and it describes a password rule of six to eight characters, which is a legacy scheme rather than what a Secure-Login-System account looks like. Meanwhile several credible practitioners report paper logins presenting no second factor at all: QuantRocket's production documentation states "Two-factor authentication is not required for paper accounts", and the maintainer of the widely used container project reports running his paper account with no second factor while his live account demands one.
 
-One caveat on method. The reliable setup is the IBKR Mobile app with its seamless authentication. If Interactive Brokers issued you a physical security card instead, IBC states plainly it cannot automate that login at all, and you should ask them to switch you to the mobile app.
+**The mechanism that reconciles this is the username, and IBC exposes the fork explicitly.** Its configuration comment on `TradingMode` reads: if set to `live` the live credentials must be supplied, but **if set to `paper`, either the live or the paper credentials may be supplied.** So there are two different routes with different outcomes:
+
+- **Live username with `TradingMode=paper`.** You are authenticating a real brokerage login, so you get a second-factor challenge. Landing in the paper account afterwards is irrelevant to the login itself.
+- **The separate paper username with `TradingMode=paper`.** This is the route people report running unattended for months with no second factor.
+
+Note that a paper account has **its own username and password that you choose**, distinct from the live ones. It is not your live username with something prepended.
+
+**What this means practically.** If the separate paper username really does escape two-factor, the human-attention problem disappears entirely and the agent can run for weeks untouched. If it does not, your ceiling is one week, because Interactive Brokers invalidates login tokens every **Sunday at 01:00 US Eastern time** and no setting avoids that. Either way the daily restart needs nobody.
+
+**This is the single highest-value ten-minute test in the whole project:** start Gateway once in the foreground with the separate paper username and watch whether a second-factor dialog appears. Do that before you build any scheduling around it. Note that Interactive Brokers' own pages disagree on the exact day of the weekly reset, variously giving Sunday 01:00 Eastern, Saturday night, and Monday, so treat the boundary as a weekend window rather than a precise instant. Advisors, brokers, hedge funds and residents of India and Japan must always use paper credentials, so the picture may differ by jurisdiction.
 
 Note the contrast with the other architecture: the Client Portal Web API route needs a **browser login every day**, on the same machine, and it cannot be scripted. That is the strongest practical argument for the socket API and IB Gateway, and it is why the two most popular servers in this field are a poor fit for unattended work.
 
@@ -557,13 +605,51 @@ A second alternative worth knowing: **https://github.com/QuantConnect/IBAutomate
 
 ## Paper account practicalities
 
-**Market data is the thing people get wrong.** A paper account does not automatically get live prices. Without a market data subscription you get delayed data, and many servers request live data, get nothing, and hand your agent empty quotes. This is why both recommended servers defaulting to delayed data matters more than it sounds: delayed data is free and it works. If your agent needs live prices, that is a paid subscription on the live account, which then extends to paper.
+### Market data, which is where this project will actually get stuck
+
+A paper account cannot buy market data of its own. It gets whatever the linked live username has, **and only if you deliberately switch sharing on**: log into Client Portal with the **live** account, then Settings, Account Configuration, Paper Trading Account, and choose which username lends its data. Changes can take up to 24 hours.
+
+**Trap one, and it is probably the number one cause of "it worked yesterday".** Interactive Brokers' own API documentation states it plainly:
+
+> A TWS or IBGW session logged into a paper trading account will not to receive market data if it is sharing data from a live user which is used to login to Client Portal.
+
+So **opening Client Portal in a browser with the data-lending live username silently starves your running agent of quotes.** There is a dedicated error for it, 10197, "No market data during competing session", and preference goes to the live account. The same documentation warns that this can also stop Gateway automatically reconnecting after the nightly server reset. Interactive Brokers' own fix is to create a **second live username purely for human browsing and mobile use**, sharing data from the first. Do that early; it removes a whole family of mystery outages.
+
+**Trap two: delayed data arrives on different tick numbers, and your code cannot see the difference.** Delayed quotes are not a variant of live quotes, they are separate fields, numbered 66 through 76 (delayed bid, ask, last, sizes, high, low, volume, close, open). They only arrive at all if you first call `reqMarketDataType(3)`. Forget that call and you get **no ticks whatsoever**, not delayed ones, with error 10186.
+
+The dangerous part is what happens next. The library maps delayed tick 66 into `ticker.bid` and 67 into `ticker.ask`, exactly where live values would go. **Nothing in the field name or the number tells you the price is fifteen minutes old.** The only signal is a separate `marketDataType` value on the ticker.
+
+That matters because paper fills are simulated against the **real, current** market, not against your delayed feed. An agent seeing a stale 100.00 and buying at 100.05 gets filled wherever the stock actually is now. If it ran to 101 the order never fills; if it fell to 99 the agent books a phantom win it cannot explain. Interactive Brokers will also reject orders priced too far from the real market with error 202, "too far through the market", which in a fast market is exactly what a fifteen-minute-old price produces. Your agent then sees a stream of rejections that have nothing to do with its logic.
+
+**Recommendation: make the agent refuse to place any marketable order unless the market data type says live, and stamp every decision it logs with the data type and the tick timestamp.** Delayed tick 88 gives you the true age of the last trade.
+
+Two further limits: delayed data works only with snapshot quotes and historical bars, **never with tick-by-tick or market depth**. And forex and metals need no market data subscription at all, so they are the honest choice for a first agent running unsubscribed.
+
+**If you do want live US equity quotes through the API**, expect roughly **USD 14.50 a month** at non-professional rates: the US Securities Snapshot and Futures Value Bundle at USD 10.00, whose fee is waived if the live account generates USD 30 or more in monthly commissions, **plus** the US Equity and Options Add-On Streaming Bundle at USD 4.50. The bundle alone is a snapshot product charged per quote, not a streaming one, which is the detail most people miss. If Interactive Brokers classes you as a professional, that add-on becomes USD 125.00 a month and the economics change completely.
+
+One more caution worth knowing before you trust a price you can see on screen: Interactive Brokers treats API access as "off-platform" with different licensing, so **the free real-time feed that displays fine in the Trader Workstation window may not reach the API at all**. Test what your agent actually receives rather than what the desktop shows you.
 
 **Credentials.** A standalone paper account gets its own username. A paper account attached to a live one shares the live credentials.
 
-**Account numbers.** Paper accounts are prefixed `DU`, live accounts `U`. Cheap safety check, worth using.
+**Account numbers versus usernames, because these get conflated constantly.** Paper account **numbers** are prefixed `DU` and live ones `U`, which is the cheap safety check worth using in code. But the paper **username** is a separate credential you choose yourself, not your live username with a prefix, whatever third-party guides say.
 
-**One session at a time.** Interactive Brokers allows one brokerage session per username. If you log into the IBKR website or Trader Workstation while your agent is connected, you can knock it offline. If you want to watch the account while the agent trades it, ask Interactive Brokers for a second username.
+**Starting balance is USD 1,000,000** of equity with loan value. You can reset it, but only to at most five times your live account's value, and it processes overnight rather than on request. A reset changes cash only: it does not close your positions, so never reset while the agent is holding any.
+
+**One session at a time.** Interactive Brokers allows one session per username. If you log into their website or Trader Workstation while your agent is connected, you can knock it offline, surfacing as system message 1100 citing "a competing session". This is the main argument for pointing the agent at the **paper** username: it leaves the live username free for you to use.
+
+**Watch for system messages 1101 and 1102 on reconnect.** After the nightly reset, 1102 means your data subscriptions survived, but **1101 means market data was lost and every subscription must be re-requested.** An agent that ignores 1101 runs on frozen prices indefinitely, with no error to show for it.
+
+**Not everything works in paper.** Interactive Brokers publishes an explicitly incomplete exclusion list: **no VWAP, Auction, RFQ or Pegged-to-Market orders**, limited combination trading, no mutual funds, no penny fills for US options, and fills simulated from the top of the book only. Stops are always software-simulated, so they behave slightly differently from live. Asset permissions mirror the live account, so if the live one lacks futures permission, the paper one does too, and you fix that on the live side.
+
+**What paper trading is actually good for.** Fills come off real prices, but the simulator only watches the market rather than participating in it, so there is **no queue position, no market impact and no modelled latency**. A resting limit order at the best price gets filled whenever the price touches it, with no notion of being tenth in line behind forty thousand shares. Any strategy that depends on passive fills will look far better than it is.
+
+Treat it accordingly: **paper trading validates your plumbing, not your profitability.** It will honestly tell you whether your orders are well formed, whether reconnection works, whether position tracking matches the broker, and whether your risk limits fire. It will not tell you whether the strategy makes money.
+
+---
+
+## A research trick worth keeping
+
+Interactive Brokers blocks automated fetching of their normal documentation pages, which is why most of the guides written about this are second-hand and wrong. **Append `.md` to any of their documentation URLs and you get clean plain text**, and there is a full index at https://ibkrcampus.com/docs/llms.txt. Most of the direct quotations in this report came from there. If you need to settle a question about their behaviour, go to that index rather than to a blog post.
 
 ---
 
@@ -576,6 +662,8 @@ A second alternative worth knowing: **https://github.com/QuantConnect/IBAutomate
 4. **Stand up https://github.com/patrickpxp/ibkr-mcp-server**, and set two things before anything else: `MCP_BIND_HOST=127.0.0.1` so the trading endpoint is not exposed to your whole network, and `IBKR_PORT=4002` if you are on IB Gateway rather than Trader Workstation.
 5. **Leave trading disabled and confirm the read path first.** Trading is off by default. Check that account summary, positions, quotes and historical bars all come back before you enable anything that can place an order.
 6. **Then enable trading and place one order.** Preview it first, so you see the real margin and commission numbers, then place a single-share limit order. Remember that transmission is off by default, so decide deliberately whether you want the order to go through without a human click.
-7. **Leave the daily restart until last.** Get a trade working by hand first. When you automate it, prefer https://github.com/gnzsnz/ib-gateway-docker over the retired IBC, and expect to tap your phone once a week on a Sunday.
+7. **Do the ten-minute 2FA test early**, because it decides the whole operational shape. Start Gateway in the foreground with your **separate paper username** and see whether a second-factor prompt appears. If it does not, the agent can run for weeks untouched. If it does, your ceiling is one week.
+8. **For the daily restart, try Gateway's own setting first.** Set Auto Restart Time and "Never lock" under `Configure` then `Settings` then `Lock and Exit`. It restarts without re-authenticating and needs no extra software, which is what IBC's own author now recommends. Only add a helper if you also need automatic recovery from crashes and the weekly cold restart, and in that case prefer https://github.com/gnzsnz/ib-gateway-docker over the retired IBC. If you do run IBC directly, fix the two defects in its launchd file and set `AcceptNonBrokerageAccountWarning=yes`, or your paper Gateway will appear to log in fine and then silently refuse every API connection.
+9. **Sort out market data before you judge any results.** Enable sharing from the live account, create a second live username for your own browsing so you do not starve the agent of quotes, and make the agent refuse marketable orders unless it can confirm the data is live rather than fifteen minutes old.
 
 If the recommendation frustrates you, the fallback is **https://github.com/nganiet/safe-ibkr-mcp** for a stricter paper guarantee and a simpler transport, accepting market, limit and stop orders only, and remembering you must install it from a clone because its published package does not exist.
