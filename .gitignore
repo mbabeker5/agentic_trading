@@ -1,4 +1,18 @@
+# secrets
 .secrets/
+*.env
+token_*.json
+# python
 venv/
 __pycache__/
-.env
+*.pyc
+# generated output, logs, scratch
+output/
+logs/
+*.log
+scratchpad/
+# IB Gateway / IBC local state
+ibc/
+Jts/
+# mac
+.DS_Store

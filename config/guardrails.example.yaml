@@ -1,0 +1,39 @@
+# Guardrails for the agent. Copy to guardrails.yaml and edit.
+# These are enforced in code before any order reaches IB Gateway.
+# The model never gets to override them.
+
+account:
+  mode: paper                 # paper | live. Live also requires the live port below.
+  gateway_host: 127.0.0.1
+  gateway_port_paper: 4002
+  gateway_port_live: 4001
+  client_id: 7
+
+money:
+  starting_equity: 100000     # what the paper account is reset to on day 1
+  max_position_pct: 10        # no single position above this % of equity
+  max_open_positions: 8
+  max_daily_loss_pct: 2       # stop trading for the day once realised + unrealised loss hits this
+  max_order_notional: 10000   # hard cap on any single order in dollars
+
+universe:
+  whitelist: []               # empty = any US stock or ETF; otherwise only these symbols
+  blacklist: []
+  allow_options: false
+  allow_shorts: false
+
+schedule:
+  timezone: America/New_York
+  trade_only_regular_hours: true
+  no_new_positions_after: "15:45"   # flatten logic can still run after this
+  wake_every_minutes: 20
+
+orders:
+  default_type: limit         # limit | market
+  limit_offset_bps: 5         # limit price this many basis points through the quote
+  always_bracket: true        # every entry gets a stop loss and a take profit attached
+  stop_loss_pct: 3
+  take_profit_pct: 6
+
+kill_switch:
+  file: output/STOP           # if this file exists, the agent cancels open orders and does nothing else
