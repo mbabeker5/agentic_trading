@@ -1,7 +1,7 @@
 # ============================================================================
-# EXAMPLE file. Copy it to guardrails.yaml and edit your copy:
-#   cp config/guardrails.example.yaml config/guardrails.yaml
-# The values below are the PROPOSED ones, pending Mo's approval on 2026-09-02.
+# PROPOSED VALUES, pending Mo's approval on 2026-09-02.
+# Nothing here has been signed off yet. Every number below comes from the
+# table in docs/STRATEGY.md and is a starting suggestion, not a decision.
 # ============================================================================
 #
 # What this file is: the hard limits the trading agent is not allowed to break.
