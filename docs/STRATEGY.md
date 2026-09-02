@@ -1,21 +1,21 @@
 # Strategy spec: opening momentum, month one
 
-Status: draft for Mo's approval, written 2026-09-02. Nothing here trades until Mo says the numbers are right.
+Status: draft for Mo's approval, written 2026-09-02, shorting added the same day at Mo's request. Nothing here trades until Mo says the numbers are right.
 
 ## The idea in one paragraph
 
-Some stocks open the day with a jump and unusually heavy trading, usually because of news overnight. When such a stock keeps pushing above the high of its first five minutes, and volume backs it up, the move often carries on for an hour or two. We buy that push, protect it with a tight stop, and are out of everything before the close. No overnight risk, no shorting, no options. It is one of the oldest day-trading patterns because it is simple to see and simple to test, which is exactly what month one needs.
+Some stocks open the day with a jump and unusually heavy trading, usually because of news overnight. When such a stock keeps pushing above the high of its first five minutes, and volume backs it up, the move often carries on for an hour or two. We buy that push, protect it with a tight stop, and are out of everything before the close. The mirror image applies too: a stock gapping down on heavy volume that keeps breaking below its opening range can be shorted, with the same tight stop above. No overnight risk, no options, no borrowed money beyond what a short technically needs. It is one of the oldest day-trading patterns because it is simple to see and simple to test, which is exactly what month one needs.
 
 ## Who does what
 
 The code does the boring, rule-bound work and enforces every hard limit. Claude does the judgment in between and writes down why. Neither side can skip the other.
 
-- **Code**: scans the market at the open, filters candidates, watches prices every five minutes, refuses any order that breaks a limit, closes everything at 3:55 PM, writes the ledger.
+- **Code**: scans the market at the open for both gappers up and gappers down, filters candidates, watches prices every five minutes, refuses any order that breaks a limit, closes everything at 3:55 PM, writes the ledger.
 - **Claude**: at 9:35 reads the shortlist, the five-minute bars and any headline, picks up to five names, sets each one's entry trigger, stop and target, and sizes them. Through the day it decides whether a position is fading and whether a new entry still makes sense. Every decision, including "do nothing", gets a one-line reason in the ledger.
 
 ## The day, step by step
 
-**Before 9:35 AM Eastern.** IBKR's scanner ranks US stocks and ETFs by percentage gain and by unusual volume. The code keeps names priced above $5 with average daily volume above one million shares, whose opening volume is well above their normal pace, and throws out leveraged and inverse ETFs. Result: a shortlist of at most 20, each tagged with why it was flagged.
+**Before 9:35 AM Eastern.** IBKR's scanner ranks US stocks and ETFs by percentage gain and by unusual volume. The code keeps names priced above $5 with average daily volume above one million shares, whose opening volume is well above their normal pace, and throws out leveraged and inverse ETFs. Result: a shortlist of at most 20, long and short candidates together, each tagged with why it was flagged.
 
 **9:35 AM.** Claude reviews the shortlist and picks up to five. For each it records the opening range (the high and low of 9:30 to 9:35), an entry trigger (price breaks above the range high on rising volume), a stop (the range low or 1.5% below entry, whichever is closer), and a target or a trailing rule.
 
@@ -39,7 +39,9 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | Price floor | $5 | |
 | Volume floor | 1,000,000 shares average daily | |
 | Shortlist size | 20 at most | |
-| Shorting, options | Not in month one | |
+| Shorting | Allowed (Mo, 2026-09-02) | Same caps as longs, stop 1.5% above entry or the range high if closer, easy-to-borrow names only, price floor $10 |
+| Gross exposure cap | 100% of equity | Longs plus shorts added together may never exceed the account value. No margin borrowing for longs. Proposed backstop; 50% is the tighter alternative |
+| Options | Not in month one | |
 | Order types | Limit entries, bracket stops, market exits at close | |
 
 ## The pattern day trader rule, and why paper ignores it
