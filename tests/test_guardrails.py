@@ -1065,6 +1065,29 @@ def test_a_part_filled_position_plus_pending_orders_counts_towards_the_cap(
     assert just_right.allowed is True, just_right.reasons
 
 
+def test_a_short_position_uses_up_room_rather_than_creating_it(tmp_path: Path):
+    """A short shows up at the broker as a negative value, and money is still at risk.
+
+    Subtracting a negative number would quietly hand out extra room, which is
+    the opposite of what a limit is for.
+    """
+    guardrails = load_with(tmp_path, {"universe": {"allow_shorts": True}})
+    short = PositionInfo(symbol="AAPL", qty=-160, avg_cost=50.0, market_value=-8000.0)
+    state = make_state(MID_MORNING, positions={"AAPL": short})
+
+    assert state.held_market_value("AAPL") == -8000.0
+    assert state.held_exposure("AAPL") == 8000.0
+    # 8,000 dollars of the 10,000 limit is used up, so 2,000 is left.
+    assert max_shares_for(guardrails, state, "AAPL", 50.0) == 40
+
+    intent = OrderIntent(
+        symbol="AAPL", side="SELL", qty=100, limit_price=50.0, purpose="entry"
+    )
+    decision = check_order(guardrails, state, intent)
+    assert decision.allowed is False
+    assert "max_position_pct" in decision.rule_ids
+
+
 def test_a_single_order_cannot_be_worth_more_than_the_order_cap(tmp_path: Path):
     """A big account, so only the order cap can be the thing that blocks it."""
     guardrails = load_with(tmp_path, {"money": {"max_open_positions": 20}})

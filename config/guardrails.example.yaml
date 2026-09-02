@@ -44,7 +44,11 @@ universe:
   min_avg_volume: 1000000     # ignore anything that normally trades fewer than
                               # this many shares a day
   allow_options: false        # no options in month one
-  allow_shorts: false         # no betting on falls in month one
+  allow_shorts: false         # no betting on falls. Mo changed the strategy spec
+                              # on 2026-09-02 to propose shorting with mirrored
+                              # stops, but this switch stays false until the
+                              # mirrored stop and the gross exposure cap are
+                              # actually built. See agent/README_guardrails.md.
   allowed_sec_types: [STK]    # STK means ordinary shares and ETFs
   allowed_currencies: [USD]   # US dollars only
   whitelist: []               # leave empty to allow any symbol that passes the

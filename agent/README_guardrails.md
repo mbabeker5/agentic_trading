@@ -117,7 +117,7 @@ Or in one line from anywhere:
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python -m pytest -q
 ```
 
-You want to see something ending in `164 passed`. It takes under a second, and
+You want to see something ending in `165 passed`. It takes under a second, and
 no account or internet connection is needed. Run it after changing any number in
 the yaml file: several tests read the real settings file, so they will tell you
 straight away if a change broke something.
@@ -154,3 +154,26 @@ Written down here so they can be argued with rather than discovered later.
   this file has never heard of Thanksgiving, so it would think the market is
   open that day. Something upstream needs a holiday calendar before any of this
   runs with real money.
+
+## One open question: shorting
+
+The strategy spec was changed on 2026-09-02, while this module was being
+written, to propose that shorting is allowed with mirrored stops and a new
+gross exposure cap of 100 percent of equity. The settings file still says
+`allow_shorts: false`, deliberately, and that needs a decision from Mo.
+
+Turning the switch to `true` today would half work, which is the worst of the
+three options. Sell orders would be permitted and the per stock and per order
+limits would hold, including for a short position, whose negative market value
+is counted as money at risk rather than as spare room. But two pieces the new
+spec calls for do not exist yet:
+
+- `stop_price_for` only ever returns a stop below the entry price. A short needs
+  the mirror image, 1.5 percent above entry or the opening range high if that is
+  nearer, and there is no setting or argument for it.
+- There is no gross exposure cap. Longs and shorts added together are not
+  measured against the account value anywhere, and the spec also asks for a $10
+  price floor for shorts against the $5 floor everything else uses.
+
+So the honest position is: shorting stays off until those two are built and Mo
+approves the numbers. The switch is not a light to flick.

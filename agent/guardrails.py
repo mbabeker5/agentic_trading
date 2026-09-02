@@ -278,9 +278,21 @@ class AccountState:
         return int(position.qty) if position is not None else 0
 
     def held_market_value(self, symbol: str) -> float:
-        """Dollar value of what we hold in one symbol, zero when we hold none."""
+        """Dollar value of what we hold in one symbol, as the broker reports it.
+
+        Zero when we hold none, and negative for a short position.
+        """
         position = self.open_positions.get(_clean_symbol(symbol, "symbol"))
         return float(position.market_value) if position is not None else 0.0
+
+    def held_exposure(self, symbol: str) -> float:
+        """How much money is riding on one symbol, short or long, always positive.
+
+        A short position shows up at the broker as a negative market value, and
+        a limit that subtracted a negative number would quietly hand out more
+        room rather than less, so the size checks use this instead.
+        """
+        return abs(self.held_market_value(symbol))
 
     def open_position_count(self) -> int:
         """How many symbols we actually hold. A zero quantity does not count."""
@@ -952,7 +964,7 @@ def max_shares_for(
     position_cap = float(state.equity) * (g.money.max_position_pct / 100.0)
     position_room = (
         position_cap
-        - state.held_market_value(clean_symbol)
+        - state.held_exposure(clean_symbol)
         - float(state.pending_order_notional)
     )
     budget = min(position_room, float(g.money.max_order_notional), available_cash(state))
@@ -1172,7 +1184,7 @@ def _check_size(
                 f"more than {_money(g.money.max_order_notional)}.",
             )
 
-        held_value = state.held_market_value(intent.symbol)
+        held_value = state.held_exposure(intent.symbol)
         pending = float(state.pending_order_notional)
         would_hold = held_value + pending + notional
         position_cap = float(state.equity) * (g.money.max_position_pct / 100.0)
