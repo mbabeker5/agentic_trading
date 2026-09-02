@@ -45,6 +45,6 @@ IBKR sends a two-factor prompt to the IBKR Mobile app on most logins. Paper acco
 
 ## Already done on the software side
 
-- IB Gateway 10.45 stable installed at `/Users/mtalib/Applications/IB Gateway 10.45/`. It runs under Rosetta because IBKR ships no Apple silicon build.
+- IB Gateway 10.45 stable, native Apple silicon build, installed at `/Users/mtalib/Applications/IB Gateway 10.45/`.
 - Python environment with `ib_async` (the maintained fork of `ib_insync`) at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv/`.
 - Guardrail template at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.example.yaml`.
