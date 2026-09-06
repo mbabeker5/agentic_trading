@@ -20,3 +20,8 @@ Jts/
 # non-secret settings files that happen to end in .env
 !config/mcp_ibkr.env
 !config/gateway.env
+
+# SQLite system of record and its backups live outside git
+data/
+!data/schema.sql
+!data/migrations/
