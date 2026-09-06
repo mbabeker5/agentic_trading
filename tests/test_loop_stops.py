@@ -553,12 +553,29 @@ def test_an_exit_is_one_plain_order_and_never_a_bracket(sandbox):
     assert len(broker.placed) == 1
 
 
-def test_a_dry_run_prints_all_three_legs():
+def test_a_dry_run_prints_every_leg_it_would_send():
+    """The stop is last, because that is the leg that transmits the bracket."""
     lines = loop.bracket_lines(entry_intent(), 98.5, 103.0, "BOOK_A")
     assert len(lines) == 3
     assert lines[0].startswith("entry")
-    assert "98.50" in lines[1] and "BOOK_A" in lines[1]
-    assert "103.00" in lines[2] and "BOOK_A" in lines[2]
+    assert "103.00" in lines[1] and "BOOK_A" in lines[1]
+    assert lines[2].startswith("stop")
+    assert "98.50" in lines[2] and "BOOK_A" in lines[2]
+
+
+def test_a_dry_run_shows_the_stops_own_limit_price():
+    """A rehearsal has to show the stop-limit, not a summary of it."""
+    lines = loop.bracket_lines(entry_intent(), 98.5, 0.0, "BOOK_A")
+    assert len(lines) == 2, "a momentum book has no target leg (item A2)"
+    # Half a percent below the 98.50 trigger, because this one closes a long.
+    assert "stop 98.50" in lines[1]
+    assert "limit 98.01" in lines[1]
+
+
+def test_a_short_stop_limit_sits_above_its_trigger():
+    lines = loop.bracket_lines(entry_intent(side="SELL"), 101.5, 0.0, "BOOK_A")
+    assert "stop 101.50" in lines[1]
+    assert "limit 102.01" in lines[1]
 
 
 # ---------------------------------------------------------------------------

@@ -78,9 +78,21 @@ PENNY_BARS = [
     bar(9, 45, 1.95, 1.99, 1.88, 1.90),
 ]
 
+# A name that falls off a cliff, so a stop-limit can trigger and then have the
+# price run away from its limit before it can fill. Kept out of the shared broker
+# below on purpose, because adding a fourth name would change every bar count the
+# tests further down assert on.
+GAP_BARS = [
+    bar(9, 30, 100.00, 100.50, 99.80, 100.20),
+    bar(9, 35, 100.10, 100.30, 99.00, 99.20),
+    bar(9, 40, 95.00, 95.20, 94.00, 94.50),
+    bar(9, 45, 94.40, 94.80, 93.50, 93.80),
+]
+
 SPY = {"symbol": "SPY", "secType": "STK", "exchange": "SMART", "currency": "USD"}
 QQQ = {"symbol": "QQQ", "secType": "STK", "exchange": "SMART", "currency": "USD"}
 PENNY = {"symbol": "PENNY", "secType": "STK", "exchange": "SMART", "currency": "USD"}
+GAPPY = {"symbol": "GAPPY", "secType": "STK", "exchange": "SMART", "currency": "USD"}
 
 
 def broker(**options) -> FakeBroker:
@@ -104,6 +116,17 @@ def limit(action: str, shares: int, price: float) -> dict:
 def stop(action: str, shares: int, price: float) -> dict:
     return {"action": action, "totalQuantity": shares, "orderType": "STP",
             "auxPrice": price, "tif": "DAY"}
+
+
+def stop_limit(action: str, shares: int, trigger: float, limit_price: float) -> dict:
+    """A stop-limit: auxPrice wakes it up, lmtPrice is the worst price it takes."""
+    return {"action": action, "totalQuantity": shares, "orderType": "STP LMT",
+            "auxPrice": trigger, "lmtPrice": limit_price, "tif": "DAY"}
+
+
+def order_row(b: FakeBroker, order_id) -> dict:
+    """The broker's own record of one order, however that order has ended up."""
+    return [row for row in b.all_orders() if row["orderId"] == order_id][0]
 
 
 # ---------------------------------------------------------------- market fills
@@ -279,6 +302,330 @@ def test_buy_stop_triggers_on_the_way_up():
     fills = b.advance_to(at(9, 40))["fills"]
     assert len(fills) == 1
     assert fills[0]["price"] == pytest.approx(101.62)
+
+
+
+# ------------------------------------------------------------ stop-limit orders
+
+def test_a_stop_limit_sits_still_until_the_price_touches_its_trigger():
+    """A sell stop-limit protecting a long: trigger 99.50, limit 99.00.
+
+    Three things in order. The 09:35 bar never gets below 100.00, so nothing
+    happens at all. The 09:40 bar trades down to 99.00, which touches the
+    trigger and wakes the order up, but like a plain stop it does not get to fill
+    on the bar that set it off. The 09:45 bar opens at 99.10, which is above the
+    99.00 limit, so it fills there.
+    """
+    b = broker()
+    b.advance_to(at(9, 30))
+    answer = b.place_order(SPY, stop_limit("SELL", 100, 99.50, 99.00),
+                           order_ref="BOOK_A")
+
+    assert b.advance_to(at(9, 35))["fills"] == []
+    asleep = order_row(b, answer["orderId"])
+    assert asleep["status"] == "Submitted"
+    assert asleep["triggered"] is False
+    assert asleep["triggered_at"] is None
+
+    assert b.advance_to(at(9, 40))["fills"] == []
+    awake = order_row(b, answer["orderId"])
+    assert awake["status"] == "Triggered"
+    assert awake["triggered"] is True
+    assert awake["triggered_at"] == at(9, 40)
+
+    fills = b.advance_to(at(9, 45))["fills"]
+    assert len(fills) == 1
+    assert fills[0]["price"] == pytest.approx(99.10)
+    assert "stop-limit triggered" in fills[0]["reason"]
+
+
+def test_a_stop_limit_that_gaps_through_its_limit_stays_triggered_and_unfilled():
+    """The whole risk of a stop-limit, and the reason the loop needs a backstop.
+
+    The trigger at 99.50 is touched on the 09:35 bar. The next bar opens at 95.00
+    and never trades as high as the 99.00 limit again, so the order is awake,
+    live, and cannot fill. The position it was meant to protect is now
+    unprotected, and this broker says so plainly rather than quietly filling at a
+    price that was never there.
+    """
+    b = FakeBroker(bars={"GAPPY": list(GAP_BARS)})
+    b.advance_to(at(9, 30))
+    answer = b.place_order(GAPPY, stop_limit("SELL", 100, 99.50, 99.00),
+                           order_ref="BOOK_A")
+    b.advance_to(at(9, 45))
+
+    assert b.executions()["executions"] == []
+    stranded = order_row(b, answer["orderId"])
+    assert stranded["status"] == "Triggered"
+    assert stranded["triggered"] is True
+    assert stranded["remaining"] == 100
+    # Still working, because it is: it is a live limit order nobody will hit.
+    assert [row["orderId"] for row in b.open_orders()["orders"]] == [answer["orderId"]]
+
+
+def test_a_buy_stop_limit_protects_a_short_the_other_way_round():
+    """Closing a short, so the trigger is above and the limit is above that.
+
+    Trigger 101.80 is touched by the 09:35 bar's high of 102.00. The 09:40 bar
+    opens at 101.60, which is below the 102.20 limit, so the buy fills at the
+    open and pays less than it was willing to.
+    """
+    b = broker()
+    b.advance_to(at(9, 30))
+    b.place_order(SPY, stop_limit("BUY", 100, 101.80, 102.20), order_ref="BOOK_A")
+    assert b.advance_to(at(9, 35))["fills"] == []
+    fills = b.advance_to(at(9, 40))["fills"]
+    assert len(fills) == 1
+    assert fills[0]["price"] == pytest.approx(101.60)
+
+
+def test_a_stop_limit_needs_both_a_trigger_and_a_limit():
+    b = broker()
+    b.advance_to(at(9, 35))
+    no_limit = {"action": "SELL", "totalQuantity": 100, "orderType": "STP LMT",
+                "auxPrice": 99.50, "tif": "DAY"}
+    with pytest.raises(FakeBrokerError, match="lmtPrice"):
+        b.place_order(SPY, no_limit, order_ref="BOOK_A")
+
+    no_trigger = {"action": "SELL", "totalQuantity": 100, "orderType": "STP LMT",
+                  "lmtPrice": 99.00, "tif": "DAY"}
+    with pytest.raises(FakeBrokerError, match="auxPrice"):
+        b.place_order(SPY, no_trigger, order_ref="BOOK_A")
+
+
+# ----------------------------------------------- one cancels the other, and parents
+
+def test_a_fill_on_one_leg_cancels_the_other_in_the_same_group():
+    """Two orders, one group. The buy fills on the 09:40 bar at 99.50.
+
+    The sell at 101.50 would have filled on that very same bar, because it traded
+    up to 101.90. It does not, because by the time it is looked at the buy has
+    already pulled it, and the note on it says which order did that.
+    """
+    b = broker()
+    b.advance_to(at(9, 35))
+    group = "BOOK_A-SPY-093500"
+    buy = b.place_order(SPY, dict(limit("BUY", 100, 99.50), ocaGroup=group, ocaType=1),
+                        order_ref="BOOK_A")
+    sell = b.place_order(SPY, dict(limit("SELL", 100, 101.50), ocaGroup=group,
+                                   ocaType=1), order_ref="BOOK_A")
+
+    fills = b.advance_to(at(9, 40))["fills"]
+    assert len(fills) == 1
+    assert fills[0]["side"] == "BUY"
+    assert fills[0]["price"] == pytest.approx(99.50)
+
+    pulled = order_row(b, sell["orderId"])
+    assert pulled["status"] == "Cancelled"
+    assert pulled["remaining"] == 0
+    assert pulled["ocaGroup"] == group
+    assert f"order {buy['orderId']} filled" in pulled["notes"][-1]
+    assert group in pulled["notes"][-1]
+    assert b.open_orders()["orders"] == []
+
+
+def test_an_order_with_no_oca_group_cancels_nothing():
+    """The same two orders with no group name. Both fill, and that is right.
+
+    An empty group links to nothing, which is how every plain order in the file
+    behaves and why nothing that does not ask for a group has changed.
+    """
+    b = broker()
+    b.advance_to(at(9, 35))
+    b.place_order(SPY, limit("BUY", 100, 99.50), order_ref="BOOK_A")
+    sell = b.place_order(SPY, limit("SELL", 100, 101.50), order_ref="BOOK_A")
+
+    fills = b.advance_to(at(9, 40))["fills"]
+    assert len(fills) == 2
+    assert order_row(b, sell["orderId"])["status"] == "Filled"
+
+
+def test_a_child_cannot_fill_before_its_parent_has():
+    """The hole this closes: a stop that fires before there is anything to protect.
+
+    The parent bids 97.00, which is below every print in the recording, so it
+    never fills. The child would have sold at 101.50 on the 09:35 bar. Because
+    its parent never filled it never becomes an order at all, and the replay does
+    not end up short 100 shares nobody bought.
+    """
+    b = broker()
+    b.advance_to(at(9, 30))
+    parent = b.place_order(SPY, limit("BUY", 100, 97.00), order_ref="BOOK_A")
+    child = b.place_order(SPY, dict(limit("SELL", 100, 101.50),
+                                    parentId=parent["orderId"]), order_ref="BOOK_A")
+    b.advance_to(at(9, 45))
+
+    assert b.executions()["executions"] == []
+    waiting = order_row(b, child["orderId"])
+    assert waiting["status"] == "Submitted"
+    assert waiting["remaining"] == 100
+    assert waiting["parentId"] == parent["orderId"]
+    assert b.positions.get("SPY", 0) == 0
+
+
+def test_a_child_becomes_able_to_fill_once_its_parent_has():
+    """The other half of the same rule.
+
+    The child's price is there on the 09:35 bar, which trades up to 102.00, and
+    it still must not fill. The parent buys on the 09:40 bar, and from that
+    moment the child is a real order. It wakes up on the same bar its parent
+    filled on, because the fill machinery walks the orders in the order they were
+    placed and the parent was placed first.
+    """
+    b = broker()
+    b.advance_to(at(9, 30))
+    parent = b.place_order(SPY, limit("BUY", 100, 99.50), order_ref="BOOK_A")
+    b.place_order(SPY, dict(limit("SELL", 100, 101.50), parentId=parent["orderId"]),
+                  order_ref="BOOK_A")
+
+    assert b.advance_to(at(9, 35))["fills"] == []
+    fills = b.advance_to(at(9, 40))["fills"]
+    assert [fill["side"] for fill in fills] == ["BUY", "SELL"]
+    assert fills[0]["price"] == pytest.approx(99.50)
+    assert fills[1]["price"] == pytest.approx(101.60)
+    assert b.positions.get("SPY", 0) == 0
+
+
+def test_an_untransmitted_order_rests_and_cannot_fill():
+    """IBKR holds an untransmitted order in Gateway where nothing can trade on it."""
+    b = broker()
+    b.advance_to(at(9, 35))
+    resting = b.place_order(SPY, limit("BUY", 100, 99.50), order_ref="BOOK_A",
+                            transmit=False)
+    assert resting["transmitted"] is False
+    b.advance_to(at(9, 40))          # the bar trades to 99.00, well through the limit
+    assert b.executions()["executions"] == []
+    assert order_row(b, resting["orderId"])["remaining"] == 100
+
+
+def test_a_child_sent_transmitted_releases_the_parent_that_was_waiting():
+    """One call puts a whole bracket on the market, which is the point of transmit."""
+    b = broker()
+    b.advance_to(at(9, 35))
+    group = "BOOK_A-SPY-093500"
+    parent = b.place_order(SPY, dict(limit("BUY", 100, 99.50), ocaGroup=group),
+                           order_ref="BOOK_A", transmit=False)
+    assert order_row(b, parent["orderId"])["transmitted"] is False
+
+    b.place_order(SPY, dict(limit("SELL", 100, 110.00), ocaGroup=group,
+                            parentId=parent["orderId"]),
+                  order_ref="BOOK_A", transmit=True)
+    assert order_row(b, parent["orderId"])["transmitted"] is True
+
+    fills = b.advance_to(at(9, 40))["fills"]
+    assert len(fills) == 1
+    assert fills[0]["price"] == pytest.approx(99.50)
+
+
+# -------------------------------------------------------------------- brackets
+
+def test_a_bracket_is_an_entry_and_a_stop_limit_in_one_group():
+    """What every momentum book sends since the profit target went, on 2026-09-06.
+
+    Two legs and no more. The stop goes out as a stop-limit with its limit half a
+    percent below the 99.50 trigger, which is 99.0025 and rounds to 99.00, it
+    carries the entry's order id as its parent, and both legs share one group.
+    """
+    b = broker()
+    b.advance_to(at(9, 35))
+    answer = b.bracket_order(SPY, limit("BUY", 100, 101.00),
+                             stop("SELL", 100, 99.50), None, "BOOK_A")
+
+    assert answer["bracketed"] is True
+    assert [leg["purpose"] for leg in answer["legs"]] == ["entry", "stop"]
+    group = answer["oca_group"]
+    assert group.startswith("BOOK_A-SPY-")
+
+    entry_leg, stop_leg = answer["legs"]
+    entry = order_row(b, entry_leg["order_id"])
+    child = order_row(b, stop_leg["order_id"])
+    assert child["orderType"] == "STP LMT"
+    assert child["auxPrice"] == pytest.approx(99.50)
+    assert child["lmtPrice"] == pytest.approx(99.00)
+    assert stop_leg["price"] == pytest.approx(99.50)
+    assert stop_leg["limit_price"] == pytest.approx(99.00)
+    assert child["parentId"] == entry["orderId"]
+    assert entry["ocaGroup"] == child["ocaGroup"] == group
+    # The child went out transmitted, and that released the parent with it.
+    assert entry["transmitted"] is True
+
+
+def test_a_bracket_takes_a_third_leg_when_a_target_is_asked_for():
+    """The insider and Congress books still take a profit target, so it still works."""
+    b = broker()
+    b.advance_to(at(9, 35))
+    answer = b.bracket_order(SPY, limit("BUY", 100, 101.00),
+                             stop("SELL", 100, 99.50),
+                             limit("SELL", 100, 103.00), "BOOK_A")
+
+    assert [leg["purpose"] for leg in answer["legs"]] == ["entry", "target", "stop"]
+    rows = [order_row(b, leg["order_id"]) for leg in answer["legs"]]
+    assert {row["ocaGroup"] for row in rows} == {answer["oca_group"]}
+    assert {row["parentId"] for row in rows[1:]} == {answer["legs"][0]["order_id"]}
+    assert answer["legs"][1]["price"] == pytest.approx(103.00)   # the target's limit
+    assert answer["legs"][2]["price"] == pytest.approx(99.50)    # the stop's trigger
+    assert rows[1]["orderType"] == "LMT"
+    assert rows[2]["orderType"] == "STP LMT"
+
+
+def test_a_whole_bracket_runs_from_the_entry_to_the_stop():
+    """End to end, with every price written out.
+
+    The 09:40 bar dips to 99.00, which fills the 101.00 entry at its limit and,
+    on the same bar, touches the 99.50 trigger of the stop the entry just woke
+    up. The 09:45 bar opens at 99.10, above the 99.00 limit, so the stop gets out
+    there and the book is flat again.
+    """
+    b = broker()
+    b.advance_to(at(9, 35))
+    answer = b.bracket_order(SPY, limit("BUY", 100, 101.00),
+                             stop("SELL", 100, 99.50), None, "BOOK_A")
+
+    bought = b.advance_to(at(9, 40))["fills"]
+    assert len(bought) == 1
+    assert bought[0]["side"] == "BUY"
+    assert bought[0]["price"] == pytest.approx(101.00)
+    protection = order_row(b, answer["legs"][1]["order_id"])
+    # The entry filling woke the stop rather than cancelling it, even though they
+    # share a group. A bracket that pulled its own stop would be worse than none.
+    assert protection["status"] == "Triggered"
+    assert protection["triggered"] is True
+
+    sold = b.advance_to(at(9, 45))["fills"]
+    assert len(sold) == 1
+    assert sold[0]["side"] == "SELL"
+    assert sold[0]["price"] == pytest.approx(99.10)
+    assert b.positions.get("SPY", 0) == 0
+    assert b.book_positions("BOOK_A") == {}
+
+
+def test_a_bracket_whose_entry_never_fills_cannot_short_out_of_thin_air():
+    """The bug this whole change exists to close.
+
+    The entry bids 97.00 and never fills. The 09:40 bar would have touched the
+    99.50 stop trigger and the 09:45 bar would have filled it at 99.10, selling
+    100 shares that were never bought. Hung off its parent, the stop never wakes
+    up at all.
+    """
+    b = broker()
+    b.advance_to(at(9, 35))
+    answer = b.bracket_order(SPY, limit("BUY", 100, 97.00),
+                             stop("SELL", 100, 99.50), None, "BOOK_A")
+    b.advance_to(at(9, 45))
+
+    assert b.executions()["executions"] == []
+    assert b.positions.get("SPY", 0) == 0
+    asleep = order_row(b, answer["legs"][1]["order_id"])
+    assert asleep["status"] == "Submitted"
+    assert asleep["triggered"] is False
+
+
+def test_a_bracket_with_no_stop_price_is_refused():
+    """No stop leg means nothing would transmit the entry, so it is refused outright."""
+    b = broker()
+    b.advance_to(at(9, 35))
+    with pytest.raises(FakeBrokerError, match="stop price"):
+        b.bracket_order(SPY, limit("BUY", 100, 101.00), None, None, "BOOK_A")
 
 
 # ------------------------------------------------------------------ commission

@@ -23,7 +23,7 @@ Nothing is ordered today. Not on paper, not through a preview, not through the b
 | The launchd job | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.tick.plist` |
 | The tests | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_loop_books.py` |
 
-The project folder is read from the environment variable `AGENTIC_TRADING_ROOT`, and falls back to `/Users/mtalib/workspace_repos/personal_repo/agentic_trading` when that is not set. Nothing has to be configured for the normal case.
+The project folder comes from `AGENTIC_TRADING_ROOT` when that is set, and otherwise `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/paths.py` works it out from where it sits on disk, which means a plain `git clone` anywhere on any Mac finds itself. Nothing has to be configured for the normal case, and there is no path to one particular Mac written into the code any more.
 
 ---
 

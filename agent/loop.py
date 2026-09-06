@@ -72,15 +72,14 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-DEFAULT_ROOT = Path("/Users/mtalib/workspace_repos/personal_repo/agentic_trading")
-ROOT_ENV_VAR = "AGENTIC_TRADING_ROOT"
-
-
-def project_root() -> Path:
-    """The project folder, from AGENTIC_TRADING_ROOT or the default above."""
-    raw = (os.environ.get(ROOT_ENV_VAR) or "").strip()
-    return Path(raw).expanduser() if raw else DEFAULT_ROOT
-
+# Where the project lives is agent/paths.py's job and nobody else's. This file
+# used to carry a second copy of the answer, written out as a path to Mo's
+# laptop, which is a path that has to be edited on every new machine and which
+# would quietly disagree with paths.py the day one of them was changed. Now it
+# asks. paths.py works it out from where it sits on disk, so a plain git clone
+# anywhere finds itself with nothing configured.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import ROOT_ENV_VAR, project_root  # noqa: E402,F401
 
 PROJECT = project_root()
 for _extra in (PROJECT, PROJECT / "agent", PROJECT / "ledger"):
@@ -152,6 +151,30 @@ DAY_TRADE_HARD_LIMIT_BOOKS = ("C", "D")
 def output_dir() -> Path:
     path = project_root() / "output"
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+#: Touched at the end of every tick that got all the way through. The dead man's
+#: handle in agent/deadman.py prefers this file over guessing at the loop's
+#: pulse from log files, because a log line can be written by a tick that then
+#: fell over, and this one is only written when the tick finished.
+HEARTBEAT_FILE = "heartbeat"
+
+
+def touch_heartbeat(when: datetime | None = None) -> Path:
+    """Say the loop got all the way through a tick, by touching one file.
+
+    agent/deadman.py reads output/heartbeat and pulls the kill switch when it is
+    more than fifteen minutes old during market hours, so a loop that dies
+    holding something does not sit there unwatched. It falls back to reading log
+    files when this is missing, which is a guess; this file is the real answer.
+
+    Written last, on purpose. A tick that fell over halfway must not leave a
+    fresh heartbeat behind saying everything is fine.
+    """
+    path = output_dir() / HEARTBEAT_FILE
+    stamp = (when or datetime.now(ZoneInfo("America/New_York"))).isoformat()
+    path.write_text(f"{stamp}\n")
     return path
 
 
@@ -459,6 +482,84 @@ def phase_for(now: datetime, plan: BookPlan, *, pick_done: bool = False,
 
 # --------------------------------------------------------------- reconciliation
 
+#: Written by agent/kill_switch.py when it has flattened the account, so the
+#: next tick knows the difference between "somebody pulled the handle" and "the
+#: books have lost track of what they hold".
+KILL_SWITCH_FLATTENED_FILE = "KILL_SWITCH_FLATTENED"
+
+
+def kill_switch_flattened(root: Path | None = None) -> bool:
+    """Has the kill switch flattened the account since the last tick?
+
+    The kill switch closes everything at the broker and cannot open the five
+    book files to say so, because it acts through the broker on purpose so that
+    it still works when the loop is dead. So the books wake up believing they
+    hold positions the account no longer has, which is exactly the shape of a
+    reconciliation mismatch, and a mismatch halts a book for the day.
+
+    Halting for the day would be the wrong answer here. Nothing has gone wrong
+    and nobody has lost track of anything: somebody pulled the handle and it
+    worked. So the next tick marks those positions closed by the kill switch,
+    writes it down, and carries on with the books flat.
+    """
+    folder = (root or project_root()) / "output"
+    for name in (KILL_SWITCH_FLATTENED_FILE, "STOP", "LOOP_DISABLED"):
+        if (folder / name).exists():
+            return name == KILL_SWITCH_FLATTENED_FILE or _stop_flattened(folder)
+    return False
+
+
+def _stop_flattened(folder: Path) -> bool:
+    """True when the stop file itself says the account was flattened.
+
+    agent/kill_switch.py writes a line into output/STOP saying what it did. A
+    stop file somebody made by hand with `touch` holds nothing, and that is not
+    a flatten, so the books are left exactly as they were.
+    """
+    try:
+        text = (folder / "STOP").read_text().lower()
+    except OSError:
+        return False
+    return "flatten" in text or "closed" in text
+
+
+def close_positions_flattened_by_the_kill_switch(
+        tick: BookTick, state: bs.BookState,
+        broker_positions: dict[str, dict]) -> int:
+    """Mark this book's positions closed because the kill switch closed them.
+
+    Only ever touches a position the ACCOUNT no longer holds. A name the broker
+    still reports is left alone, because that one really is a mismatch and the
+    reconciliation should still halt the book over it.
+
+    Returns how many were closed, so the caller can say so in one line.
+    """
+    closed = 0
+    for symbol, position in list(state.all_positions().items()):
+        if _number((broker_positions.get(symbol) or {}).get("position")):
+            continue
+        price = _number(position.last_close) or _number(position.avg_cost)
+        direction = 1.0 if position.qty > 0 else -1.0
+        state.realized_pnl_today = round(
+            state.realized_pnl_today
+            + (price - position.avg_cost) * abs(position.qty) * direction, 2)
+        state.drop_position(symbol)
+        state.working_orders = {
+            order_id: order for order_id, order in (state.working_orders or {}).items()
+            if not isinstance(order, dict)
+            or str(order.get("symbol") or "").upper() != symbol}
+        tick.rule("kill_switch_flattened",
+                  f"{symbol}: the kill switch closed this position at the broker, "
+                  f"so the book is marked flat in it at {price:.2f}",
+                  "closed by the kill switch, not a reconciliation mismatch")
+        tick.record(state, symbol, "closed by the kill switch",
+                    "the kill switch flattened the account and this position is no "
+                    "longer at the broker, so the book file was brought into line "
+                    "rather than halted over the difference")
+        closed += 1
+    return closed
+
+
 @dataclass
 class ReconcileOutcome:
     """What the reconciliation said, in the shape this loop acts on."""
@@ -759,6 +860,98 @@ def snapshot_by_symbol(broker: broker_mod.Broker, rows: list[dict],
     return out
 
 
+#: IBKR's halted tick is tick type 49. It comes back as a number: 0 means not
+#: halted, 1 means halted, and 2 means halted with a common reason. Anything
+#: else, or nothing at all, means nobody told us, and the guardrails refuse an
+#: entry on an unknown halt status rather than reading it as clean.
+HALTED_TICK_KEYS = ("halted", "halted_tick", "tick49", "tick_49")
+
+#: A name sitting in a limit-up limit-down band is one step away from a
+#: volatility halt. IBKR reports the band's own high and low limit prices, so
+#: the tell is a last price sitting at or beyond one of them.
+LIMIT_BAND_HIGH_KEYS = ("limitUpPrice", "limit_up_price", "highLimitPrice",
+                        "auctionHighLimit")
+LIMIT_BAND_LOW_KEYS = ("limitDownPrice", "limit_down_price", "lowLimitPrice",
+                       "auctionLowLimit")
+
+
+def _first_present(row: dict, keys: tuple[str, ...]):
+    """The first of these keys that carries anything at all, or None."""
+    for key in keys:
+        if row.get(key) is not None:
+            return row[key]
+    return None
+
+
+def halted_from(row: dict | None) -> bool | None:
+    """Is this name halted right now, from IBKR's halted tick? None means unknown.
+
+    Tick type 49. Zero is trading, anything above zero is halted. A missing
+    answer comes back as None and NOT as False, because the whole point of the
+    halted rule in agent/guardrails.py is that an unknown halt status stops an
+    entry rather than being read as a clean name. Handing it False would quietly
+    turn that rule off.
+    """
+    if not isinstance(row, dict):
+        return None
+    raw = _first_present(row, HALTED_TICK_KEYS)
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    try:
+        return float(raw) > 0
+    except (TypeError, ValueError):
+        return None
+
+
+def limit_state_from(row: dict | None) -> bool | None:
+    """Is this name sitting in a limit-up limit-down band? None means unknown.
+
+    IBKR reports the band as a pair of prices, so the test is whether the last
+    price has reached one of them. A quote that carries no band at all comes
+    back as None, which the guardrails refuse an entry on for the same reason as
+    an unknown halt.
+    """
+    if not isinstance(row, dict):
+        return None
+    high = _first_present(row, LIMIT_BAND_HIGH_KEYS)
+    low = _first_present(row, LIMIT_BAND_LOW_KEYS)
+    if high is None and low is None:
+        return None
+    last = snapshot_price(row)
+    if last is None:
+        return None
+    top = _number(high, 0.0)
+    bottom = _number(low, 0.0)
+    if top > 0 and last >= top:
+        return True
+    if bottom > 0 and last <= bottom:
+        return True
+    return False
+
+
+def tradeable_now(broker: broker_mod.Broker, row: dict,
+                  notes: list[str]) -> tuple[bool | None, str | None]:
+    """Ask the broker whether this name is tradeable at all right now.
+
+    Comes back as (halted, limit_state), passing on exactly what IBKR said,
+    unknowns included. A quote that could not be fetched at all gives (None,
+    None), which stops an entry, and that is the designed answer: deciding to
+    buy a name without knowing whether it is even trading is the failure this
+    rule exists to prevent.
+    """
+    try:
+        answer = broker.snapshot([contract_for(row)]) or {}
+    except Exception as exc:                     # noqa: BLE001
+        notes.append(f"{row.get('symbol')}: the halt status could not be read "
+                     f"({exc}), so no new position is opened in it")
+        return None, None
+    rows = answer.get("snapshots") or answer.get("quotes") or []
+    quote = next((r for r in rows if isinstance(r, dict)), None)
+    return halted_from(quote), limit_state_from(quote)
+
+
 def snapshot_price(row: dict | None) -> float | None:
     """The most useful price in a snapshot: last, then the mark, then the close."""
     if not isinstance(row, dict):
@@ -1033,9 +1226,16 @@ def child_orders(intent: gr.OrderIntent, stop: float,
     """The two protective legs that hang off an entry: the stop, and the target.
 
     Both are on the opposite side to the entry and for the same number of
-    shares, because their whole job is to close what the entry opened. The stop
-    is a STP order, so it becomes a market order when the price trades through
-    it. The target is a plain limit.
+    shares, because their whole job is to close what the entry opened.
+
+    The stop leaves here as a plain STP, with the trigger price on auxPrice, and
+    agent/broker.py turns it into a STP LMT on the way out: same trigger, plus a
+    limit half a percent beyond it. The conversion lives there rather than here
+    because it is a fact about how orders reach IBKR, not about the strategy.
+
+    The target is a plain limit, and it is None on all three momentum books,
+    which take no profit target at all since Momentum v2 (item A2, Mo
+    2026-09-06). The insider and Congress books still use it.
     """
     other = _other_side(intent.side)
     stop_order = None
@@ -1053,18 +1253,27 @@ def child_orders(intent: gr.OrderIntent, stop: float,
 
 def bracket_lines(intent: gr.OrderIntent, stop: float, target: float,
                   order_ref: str) -> list[str]:
-    """The legs of a would-be bracket, one readable line each, for a dry run."""
-    lines = [f"entry  {describe(intent)} tagged {order_ref}"]
+    """The legs of a would-be bracket, one readable line each, for a dry run.
+
+    Shows exactly what the live path would send, the stop-limit's own limit
+    price included, so a rehearsal is a rehearsal and not a summary. A momentum
+    book has no target (item A2, Mo 2026-09-06), so it shows two legs.
+    """
+    lines = [f"entry  {describe(intent)} tagged {order_ref} (parent, untransmitted "
+             "until the stop is attached)"]
     stop_order, target_order = child_orders(intent, stop, target)
-    if stop_order:
-        lines.append(f"stop   {stop_order['action']} {stop_order['totalQuantity']} "
-                     f"{intent.symbol} stop {stop_order['auxPrice']:.2f} tagged {order_ref}")
-    else:
-        lines.append("stop   none, and an entry with no stop is refused above")
     if target_order:
         lines.append(f"target {target_order['action']} {target_order['totalQuantity']} "
                      f"{intent.symbol} limit {target_order['lmtPrice']:.2f} tagged "
                      f"{order_ref}")
+    if stop_order:
+        child = broker_mod.stop_limit_child(stop_order)
+        lines.append(f"stop   {child['action']} {child['totalQuantity']} "
+                     f"{intent.symbol} stop {child['auxPrice']:.2f} limit "
+                     f"{child.get('lmtPrice', child['auxPrice']):.2f} tagged "
+                     f"{order_ref} (child, one OCA group with the parent)")
+    else:
+        lines.append("stop   none, and an entry with no stop is refused above")
     return lines
 
 
@@ -1591,8 +1800,10 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
         return
 
     borrow = _borrow_answer(state, symbol)
+    halted, limit_state = tradeable_now(broker, {"symbol": symbol}, tick.notes)
     intent = _entry_intent(symbol, short, quantity, entry, tick.book.book_id, borrow,
-                           sector=sector_for(state, symbol))
+                           sector=sector_for(state, symbol),
+                           halted=halted, limit_state=limit_state)
 
     # Written before the order is considered, not after, because a fill can come
     # back inside consider() and the ledger row for it reads these facts.
@@ -1758,7 +1969,8 @@ def _borrow_answer(state: bs.BookState, symbol: str) -> broker_mod.BorrowTerms:
 
 def _entry_intent(symbol: str, short: bool, quantity: int, price: float,
                   book_id: str, borrow: broker_mod.BorrowTerms,
-                  sector: str | None = None) -> gr.OrderIntent:
+                  sector: str | None = None, halted: bool | None = None,
+                  limit_state: bool | None = None) -> gr.OrderIntent:
     """One entry order, with the borrow terms on it when it is a short.
 
     A long carries none of them, because nothing is being borrowed. A short
@@ -1768,11 +1980,17 @@ def _entry_intent(symbol: str, short: bool, quantity: int, price: float,
     sector is the industry the sector cap counts against (Momentum v2, item A9).
     It is passed on exactly as the scanner reported it, None included, because
     None is what that rule refuses on for the same reason.
+
+    halted and limit_state are what IBKR's halted tick and its limit-up
+    limit-down band say about the name right now, read by tradeable_now above.
+    Both are passed on exactly as the broker answered, None included. None means
+    nobody could tell us, and an unknown halt status stops an entry rather than
+    being read as a clean name.
     """
     return gr.OrderIntent(
         symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
         limit_price=round(price, 2), purpose="entry", book_id=book_id,
-        sector=sector,
+        sector=sector, halted=halted, limit_state=limit_state,
         shortable=bool(borrow.shortable) if short else False,
         shortable_level=borrow.level if short else None,
         borrow_fee_pct_annual=borrow.fee_pct_annual if short else None,
@@ -2145,10 +2363,156 @@ def move_resting_stop(tick: BookTick, state: bs.BookState, position: bs.Position
                 f"at the broker")
 
 
+#: How long a triggered stop-limit is given to fill before the loop stops
+#: waiting and gets out at market. Sixty seconds.
+#:
+#: The stop child is a stop-limit rather than a plain stop, so a thin gap down
+#: cannot fill it at any price at all. That protects against a terrible fill.
+#: The cost is the opposite risk: a price that gaps straight through the limit
+#: leaves the order triggered and unfilled, and the position unprotected while
+#: it keeps falling. This is the backstop for exactly that, and it is why the
+#: momentum books look every 30 seconds in the morning: a minute is the most a
+#: position should ever sit behind a stop that has fired and not filled.
+STOP_BACKSTOP_SECONDS = 60
+
+
+def stop_backstop_due(order: dict, now: datetime,
+                      seconds: int = STOP_BACKSTOP_SECONDS) -> bool:
+    """Has a triggered stop-limit been sitting unfilled for too long?
+
+    True only when all three hold: the resting order is this book's stop, the
+    broker says it has triggered, and the trigger was more than `seconds` ago.
+    A stop that has not triggered is doing its job by waiting, so it is left
+    alone, and so is one that triggered a moment ago and may yet fill.
+    """
+    if not isinstance(order, dict):
+        return False
+    if str(order.get("purpose") or "").lower() != "stop":
+        return False
+    when = order.get("triggered_at")
+    if not when:
+        return False
+    if isinstance(when, str):
+        try:
+            when = datetime.fromisoformat(when)
+        except ValueError:
+            return False
+    if not isinstance(when, datetime):
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=now.tzinfo)
+    return (now - when).total_seconds() >= max(0, int(seconds))
+
+
+def note_stop_triggers(tick: BookTick, state: bs.BookState,
+                       broker: broker_mod.Broker,
+                       broker_orders: list | None = None) -> None:
+    """Write down the moment a resting stop first shows as triggered.
+
+    The broker reports a stop-limit as triggered before it fills. The loop has
+    to know WHEN that happened to be able to say it has waited a minute, and
+    nothing else on this Mac remembers between ticks, so the moment is written
+    into the book file the first time it is seen.
+
+    broker_orders is the account's working orders, already read once for the
+    whole tick by main(). It is passed in rather than fetched because five books
+    each asking IB Gateway the same question in the same second is how a data
+    pacing violation happens, and it is what actually happened the first time
+    this ran end to end: the fifth book's call timed out at 45 seconds. Left out,
+    it is read here, which is what a test does.
+    """
+    rows = broker_orders
+    if rows is None:
+        try:
+            rows = (broker.open_orders() or {}).get("orders") or []
+        except Exception as exc:                 # noqa: BLE001
+            tick.note(f"the working orders could not be read, so a triggered stop "
+                      f"cannot be spotted this tick: {exc}")
+            return
+    triggered = {str(row.get("orderId")): row for row in rows
+                 if isinstance(row, dict) and _is_triggered(row)}
+    for order_id, order in (state.working_orders or {}).items():
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("purpose") or "").lower() != "stop":
+            continue
+        if str(order_id) in triggered and not order.get("triggered_at"):
+            order["triggered_at"] = tick.now.isoformat()
+            tick.note(f"{order.get('symbol')}: the stop {order_id} has triggered and "
+                      f"is working its limit. If it has not filled in "
+                      f"{STOP_BACKSTOP_SECONDS} seconds the position goes out at "
+                      "market.")
+
+
+def _is_triggered(row: dict) -> bool:
+    """Does the broker say this working order has triggered but not filled yet?"""
+    if row.get("triggered") is True or row.get("triggered_at"):
+        return True
+    status = str(row.get("status") or "").strip().lower()
+    return status in ("triggered", "presubmitted_triggered")
+
+
+def market_out_unfilled_stops(tick: BookTick, state: bs.BookState,
+                              guard: gr.Guardrails, broker: broker_mod.Broker,
+                              account_state, guards: Guards) -> None:
+    """Get out at market when a stop has fired and its limit will not fill.
+
+    The stop-limit's limit price keeps a bad fill from being catastrophic. It
+    cannot keep the position from being unprotected if the price runs away
+    below it, and a position sitting behind a stop that fired and did not fill
+    is the worst state this book can be in. So after
+    STOP_BACKSTOP_SECONDS the resting child is cancelled and the position is
+    closed at market, and both halves of that are written down.
+    """
+    positions = state.all_positions()
+    for order_id, order in list((state.working_orders or {}).items()):
+        if not stop_backstop_due(order, tick.now):
+            continue
+        symbol = str(order.get("symbol") or "").upper()
+        position = positions.get(symbol)
+        if position is None or not position.qty:
+            state.working_orders.pop(str(order_id), None)
+            continue
+
+        tick.say(f"  {symbol}: the stop triggered over {STOP_BACKSTOP_SECONDS} "
+                 "seconds ago and has not filled, so it goes out at market")
+        tick.rule("stop_backstop",
+                  f"{symbol}: the stop-limit {order_id} triggered at "
+                  f"{order.get('triggered_at')} and had not filled "
+                  f"{STOP_BACKSTOP_SECONDS} seconds later",
+                  "the resting stop was cancelled and the position was closed at "
+                  "market")
+
+        open_locks, _ = live_locks(tick.book, account_state.account_id, guards)
+        if not tick.dry and open_locks:
+            try:
+                broker.cancel_order(order_id)
+            except Exception as exc:             # noqa: BLE001
+                tick.note(f"{symbol}: the triggered stop {order_id} would not "
+                          f"cancel ({exc}), so the market order below may leave a "
+                          "duplicate resting at the broker")
+        state.working_orders.pop(str(order_id), None)
+
+        intent = gr.OrderIntent(
+            symbol=symbol, side="BUY" if position.is_short else "SELL",
+            qty=int(round(abs(position.qty))), limit_price=None, purpose="stop",
+            book_id=tick.book.book_id)
+        consider(tick, state, guard, account_state, intent, broker, guards,
+                 extra=f"market backstop, the stop-limit did not fill in "
+                       f"{STOP_BACKSTOP_SECONDS} seconds")
+
+
 def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guardrails,
-              broker: broker_mod.Broker, account_state, guards: Guards) -> None:
+              broker: broker_mod.Broker, account_state, guards: Guards,
+              broker_orders: list | None = None) -> None:
     """Watch what is open, and let picks that have not fired yet still fire."""
     state.last_manage_at = tick.now.isoformat()
+
+    # First, before anything else: a stop that fired and did not fill is the
+    # worst state a position can be in, so it is dealt with before the loop
+    # spends a second thinking about anything else.
+    note_stop_triggers(tick, state, broker, broker_orders)
+    market_out_unfilled_stops(tick, state, guard, broker, account_state, guards)
     positions = state.all_positions()
     notes: list[str] = []
     today = tick.now.date()
@@ -2472,9 +2836,11 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
             continue
 
         borrow = _borrow_answer(state, symbol)
+        halted, limit_state = tradeable_now(broker, {"symbol": symbol}, tick.notes)
         intent = _entry_intent(symbol, short, quantity, last_close,
                                tick.book.book_id, borrow,
-                               sector=sector_for(state, symbol))
+                               sector=sector_for(state, symbol),
+                               halted=halted, limit_state=limit_state)
         tick.say(f"  {symbol} broke its {entry:.2f} trigger, now {last_close:.2f}")
 
         # Same order as the pick path: the trigger record first, because a fill
@@ -2610,6 +2976,74 @@ def write_daily(tick: BookTick, state: bs.BookState) -> None:
 
 # ------------------------------------------------------------------- one book
 
+@dataclass(frozen=True)
+class AccountWide:
+    """What all five books hold between them, which no single book can see.
+
+    owners     {symbol: book id} for every name a book already holds or has a
+               working order in, settled first come first served: whichever book
+               comes first in config/books.yaml keeps a symbol two books both
+               want on the same tick.
+    exposure   {symbol: dollars} added up across every book, for the account
+               level per symbol cap (item A9).
+    equity     what the five books are worth added together, which is what that
+               cap is a percentage of.
+    """
+
+    owners: dict[str, str] = field(default_factory=dict)
+    exposure: dict[str, float] = field(default_factory=dict)
+    equity: float = 0.0
+
+    def without(self, book_id: str) -> dict[str, str]:
+        """The owners map as one book sees it, with its own names taken out."""
+        return {symbol: owner for symbol, owner in self.owners.items()
+                if owner != book_id}
+
+
+def read_account_wide(books, now: datetime,
+                      broker_positions: dict[str, dict] | None = None) -> AccountWide:
+    """Read every book's file once, and add up what the five of them hold.
+
+    The shared IBKR account nets positions by symbol, so it can say the account
+    holds 400 shares of AAPL and it cannot say which book owns which hundred.
+    Only the book files can. This is the one place that reads all five, and it
+    runs once a tick rather than once a book, which is also why the order checks
+    take these numbers rather than working them out for themselves.
+
+    Ties go first come, first served, resolved by the order the books appear in
+    config/books.yaml, which is the rule named as SYMBOL_TIE_BREAK in
+    agent/guardrails.py.
+    """
+    owners: dict[str, str] = {}
+    exposure: dict[str, float] = {}
+    equity = 0.0
+    for book in books:
+        state = bs.load_state(book.book_id, book.order_ref, now.date(),
+                              capital=book.capital_usd)
+        if broker_positions:
+            bs.mark_positions(state, broker_positions)
+        equity += bs.book_equity(state)
+        for symbol, position in state.all_positions().items():
+            owners.setdefault(symbol, book.book_id)
+            exposure[symbol] = round(
+                exposure.get(symbol, 0.0) + abs(_number(position.market_value)), 2)
+        for order in (state.working_orders or {}).values():
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("purpose") or "entry") != "entry":
+                continue
+            symbol = str(order.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            owners.setdefault(symbol, book.book_id)
+            remaining = _number(order.get("remaining"), _number(order.get("qty")))
+            price = _number(order.get("limit_price")) or _number(order.get("price"))
+            if remaining > 0 and price > 0:
+                exposure[symbol] = round(
+                    exposure.get(symbol, 0.0) + remaining * price, 2)
+    return AccountWide(owners=owners, exposure=exposure, equity=round(equity, 2))
+
+
 def sector_exposure_for(state: bs.BookState) -> dict[str, float]:
     """How much money this book has in each industry, as {industry: dollars}.
 
@@ -2627,7 +3061,7 @@ def sector_exposure_for(state: bs.BookState) -> dict[str, float]:
 
 
 def fill_v2_state(account_state, state: bs.BookState, book: gr.BookConfig,
-                  now: datetime) -> None:
+                  now: datetime, account_wide: "AccountWide | None" = None) -> None:
     """Put the Momentum v2 facts on the snapshot the guardrails check against.
 
     Three of the new rules need facts only the loop can see (Mo, 2026-09-06):
@@ -2636,10 +3070,16 @@ def fill_v2_state(account_state, state: bs.BookState, book: gr.BookConfig,
                           item A8, read out of this book's earlier state files
         sector_exposure   item A9, this book's money by industry
 
-    The two account wide figures, account_equity and symbol_exposure_all_books,
-    are filled in by main() instead, because only main() sees all five books at
-    once. Left empty here they fall back to this book's own numbers, which is
-    the tighter and therefore safer answer.
+    The rest come off account_wide, which main() reads once for the whole tick
+    because only main() sees all five books at once:
+
+        symbols_held_elsewhere    which names the other books already have
+        symbol_exposure_all_books item A9's account level per symbol cap
+        account_equity            what the five books are worth together
+
+    Called with account_wide left out, all three stay empty and the account
+    level cap falls back to this book's own equity, which is the smaller and
+    therefore tighter number.
     """
     history = loss_history(book.order_ref, now.date(),
                            _number(state.realized_pnl_today))
@@ -2648,17 +3088,35 @@ def fill_v2_state(account_state, state: bs.BookState, book: gr.BookConfig,
     account_state.consecutive_losing_days = history.losing_days
     account_state.sector_exposure = sector_exposure_for(state)
 
+    if account_wide is not None:
+        account_state.symbols_held_elsewhere = account_wide.without(book.book_id)
+        account_state.symbol_exposure_all_books = dict(account_wide.exposure)
+        account_state.account_equity = account_wide.equity or None
+
 
 def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: Guards,
              broker: broker_mod.Broker, account_id: str, broker_positions: dict,
              rules: str, write_ledger: bool, halt_reason: str | None = None,
-             quiet: bool = False) -> tuple[BookTick, bs.BookState]:
+             quiet: bool = False,
+             account_wide: "AccountWide | None" = None,
+             broker_orders: list | None = None) -> tuple[BookTick, bs.BookState]:
     """One book's whole turn: work out the phase, do it, write the file."""
     tick = BookTick(book, now, rules, write_ledger, quiet=quiet)
     plan = plan_for(book, guard)
     day = now.date()
     state = bs.load_state(book.book_id, book.order_ref, day, capital=book.capital_usd)
     state.account_id = account_id
+
+    # A kill switch flatten is not a mismatch. It is the handle working. So the
+    # books are brought into line with the account and told why, rather than
+    # being halted for the day over a difference somebody made on purpose.
+    if kill_switch_flattened():
+        closed = close_positions_flattened_by_the_kill_switch(
+            tick, state, broker_positions)
+        if closed:
+            tick.say(f"The kill switch flattened {closed} position(s) in this book. "
+                     "They are marked closed rather than treated as a mismatch.")
+            halt_reason = None
 
     if halt_reason:
         state.halt(halt_reason)
@@ -2669,7 +3127,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
 
     account_state = bs.account_state_for(
         state, gr, now, account_id, guards.stop_present, broker_positions)
-    fill_v2_state(account_state, state, book, now)
+    fill_v2_state(account_state, state, book, now, account_wide)
 
     phase, why = phase_for(now, plan, pick_done=state.picked_at is not None,
                            last_manage_at=state.last_manage_at, swept_at=state.swept_at)
@@ -2696,7 +3154,8 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         elif phase == PICK:
             do_pick(tick, state, plan, guard, broker, account_state, guards)
         elif phase == MANAGE:
-            do_manage(tick, state, plan, guard, broker, account_state, guards)
+            do_manage(tick, state, plan, guard, broker, account_state, guards,
+                      broker_orders)
         elif phase == FLATTEN:
             do_flatten(tick, state, plan, guard, broker, account_state, guards)
         elif phase == CLOSED:
@@ -2914,6 +3373,10 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                           for symbol, p in state.all_positions().items()},
             "working_orders": dict(state.working_orders)}
 
+    # Read once for the whole tick, because it opens all five book files and
+    # five books each opening all five would be twenty five reads a tick.
+    account_wide = read_account_wide(books, now, broker_positions)
+
     outcome = run_reconciliation(broker_positions_for_reconcile(broker_positions),
                                  broker_orders_for_reconcile(broker_orders),
                                  books_state, expected_orphans())
@@ -2949,7 +3412,9 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
 
         tick, state = run_book(book, guard, now, guards, broker, account_id,
                                broker_positions, rules, args.write_ledger,
-                               halt_reason=halts.get(book.book_id))
+                               halt_reason=halts.get(book.book_id),
+                               account_wide=account_wide,
+                               broker_orders=broker_orders)
         lines.append(tick_log_line(now, rules, book, tick, state))
         totals["would_be"] += tick.would_be_orders
         totals["approved"] += tick.approved
@@ -2971,6 +3436,9 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
 
     path = write_tick_log(lines)
     cadence = write_next_tick(int(totals["next_tick"]))
+    # Written last, because a tick that fell over halfway must not leave a fresh
+    # heartbeat behind saying everything is fine.
+    beat = touch_heartbeat(now)
     print("\n" + "=" * 78)
     for line in lines:
         print(line)
@@ -2979,6 +3447,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
           f"{totals['cost']:.4f} dollars of model spend")
     print(f"Tick log {path}")
     print(f"Next tick wanted in {int(totals['next_tick'])} seconds ({cadence})")
+    print(f"Heartbeat {beat}")
     if RECONCILE_ERROR:
         print(f"agent/reconcile.py could not be imported ({RECONCILE_ERROR}), so every "
               "book was halted this tick.")

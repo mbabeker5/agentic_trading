@@ -50,6 +50,12 @@ does not work in real life.
   stop           triggers on the bar that trades through the stop, then fills on
                  the NEXT bar exactly like a market order. So a stop always costs
                  at least one bar of slippage, which is the honest version.
+  stop-limit     triggers the same way, and from the next bar it is a limit order
+                 at lmtPrice and nothing else. A price that jumps straight past
+                 the limit leaves it triggered and UNFILLED, holding a position
+                 with nothing protecting it. That is not a bug, it is the whole
+                 risk of a stop-limit, and it is why the loop carries a market
+                 backstop for a stop that has fired and not filled.
   quantities     whole shares only.
   commission     0.005 a share, at least 1.00 an order, never more than 1 percent
                  of the order's value. That is IBKR Pro's fixed tier.
@@ -58,6 +64,20 @@ Two knobs are off by default and can be turned on to make life harder:
 slippage_bps adds a fixed cost to every market fill, and partial_fill_probability
 makes some orders fill in pieces so the loop has to cope with a half filled
 position.
+
+BRACKETS
+--------
+An entry and the stop that protects it go out as one bracket, built the same way
+agent/broker.py builds the one it sends to IBKR:
+
+  parent and child   the stop carries parentId set to the entry's order id, and a
+                     child cannot fill until its parent has. So a stop only
+                     starts protecting shares once there are shares to protect.
+  transmit           the parent is placed untransmitted and rests here until the
+                     child hung off it is sent transmitted, which releases the
+                     whole group to the market at once.
+  one cancels other  every leg carries the same ocaGroup, and a fill on any one
+                     of them cancels the rest.
 
 BOOKS
 -----
@@ -125,6 +145,21 @@ FAULT_KINDS = (
 COMPETING_SESSION_CODE = 10197
 #: IBKR's code for a rejected order.
 ORDER_REJECTED_CODE = 201
+
+#: IBKR's one-cancels-the-other type 1: when one order in a group fills, every
+#: other order in that group is cancelled. It is what makes an entry and its stop
+#: one bracket rather than two orders that happen to be about the same shares.
+#:
+#: This and the number below are deliberate copies of the same two constants in
+#: agent/broker.py. They are copied rather than imported because that file is the
+#: live order path and this one must not be able to reach IBKR even by accident.
+#: If either number changes there, change it here in the same sitting.
+OCA_CANCEL_REMAINING = 1
+
+#: How far past the trigger a stop-limit's limit price sits: below the trigger
+#: when selling to close a long, above it when buying to close a short. Half a
+#: percent (Momentum v2, 2026-09-06).
+STOP_LIMIT_OFFSET_PCT = 0.5
 
 WORKING = "Submitted"
 TRIGGERED = "Triggered"
@@ -210,6 +245,51 @@ def commission_for(shares: float, price: float,
     return round(min(charge, ceiling), 4)
 
 
+def oca_group_name(order_ref: str, symbol: str, moment: datetime | None = None) -> str:
+    """The name every leg of one bracket goes out under.
+
+    Built the same way agent/broker.py builds it: the book's tag, the symbol and
+    a clock reading, so a group can be read back to the book and the name that
+    made it, and two brackets in the same name are never accidentally the same
+    group.
+
+    The one difference is which clock. The real one reads the wall clock, and a
+    replayed day runs in about two seconds of wall time, so wall clock seconds
+    would collide constantly and orders from different minutes of the trading day
+    would end up cancelling each other. So this reads the replay's own clock, and
+    only falls back to the wall clock when the replay has not started.
+    """
+    stamp = (moment or datetime.now(EASTERN)).strftime("%H%M%S")
+    return f"{str(order_ref).strip().upper()}-{str(symbol).strip().upper()}-{stamp}"
+
+
+def stop_limit_child(stop: dict) -> dict:
+    """The stop leg as a stop-limit, with its limit STOP_LIMIT_OFFSET_PCT away.
+
+    The same helper agent/broker.py uses, copied for the reason given up at
+    OCA_CANCEL_REMAINING. It takes the plain STP order the loop works out and
+    turns it into a STP LMT. auxPrice stays exactly where it is, because that is
+    the price that wakes the order up, and lmtPrice goes half a percent beyond it
+    in the direction the position is being closed: selling to close a long the
+    limit sits BELOW the trigger, buying to close a short it sits ABOVE.
+
+    An order that already carries a limit price is left alone, so a caller who
+    worked out their own is not overruled.
+    """
+    child = dict(stop or {})
+    trigger = _number(child.get("auxPrice"), _number(child.get("stopPrice")))
+    if trigger is None:
+        return child
+    child["orderType"] = "STP LMT"
+    child["auxPrice"] = round(float(trigger), 2)
+    if _number(child.get("lmtPrice")) is None:
+        selling = str(child.get("action") or "").strip().upper() == "SELL"
+        factor = (1.0 - STOP_LIMIT_OFFSET_PCT / 100.0) if selling else (
+            1.0 + STOP_LIMIT_OFFSET_PCT / 100.0)
+        child["lmtPrice"] = round(float(trigger) * factor, 2)
+    return child
+
+
 # ------------------------------------------------------------------ the records
 
 @dataclass
@@ -256,7 +336,7 @@ class Order:
     symbol: str
     action: str                       # BUY or SELL
     total_quantity: int
-    order_type: str                   # MKT, LMT or STP
+    order_type: str                   # MKT, LMT, STP or STP LMT
     limit_price: float | None = None
     stop_price: float | None = None
     tif: str = "DAY"
@@ -265,7 +345,20 @@ class Order:
     filled: int = 0
     remaining: int = 0
     avg_fill_price: float | None = None
+    #: When a stop or a stop-limit was set off, and None while it is still
+    #: waiting. A stop-limit reads this to know it has become a limit order.
     triggered_at: datetime | None = None
+    #: The one-cancels-the-other group. An empty name links to nothing, which is
+    #: how a plain order behaves. When one order in a group fills, the rest are
+    #: cancelled.
+    oca_group: str = ""
+    oca_type: int = 0
+    #: The order this one hangs off, when it is a bracket's child. A child cannot
+    #: fill until its parent has.
+    parent_id: int | None = None
+    #: False while the order is resting here unsent, the way IBKR holds an
+    #: untransmitted order in Gateway. It cannot fill until something transmits it.
+    transmitted: bool = True
     contract: dict = field(default_factory=dict)
     fills: list = field(default_factory=list)
     notes: list = field(default_factory=list)
@@ -292,7 +385,12 @@ class Order:
             "lmtPrice": self.limit_price,
             "auxPrice": self.stop_price,
             "tif": self.tif,
+            "ocaGroup": self.oca_group,
+            "parentId": self.parent_id,
+            "transmitted": self.transmitted,
             "status": self.status,
+            "triggered_at": None if self.triggered_at is None else self.triggered_at.isoformat(),
+            "triggered": self.triggered_at is not None,
             "filled": self.filled,
             "remaining": self.remaining,
             "avgFillPrice": None if self.avg_fill_price is None else _price(self.avg_fill_price),
@@ -784,7 +882,37 @@ class FakeBroker:
                 continue
             if order.placed_at is not None and moment < order.placed_at:
                 continue
+            if not self._can_fill_now(order):
+                continue
             self._try_fill(order, bar, moment)
+
+    def _can_fill_now(self, order: Order) -> bool:
+        """Is this order allowed to fill at all yet?
+
+        Two things hold an order back even when it is live and the price is
+        right, and both are how IBKR really behaves.
+
+        An untransmitted order has not been released to the market. IBKR keeps it
+        in Gateway, where nobody can trade against it, until something transmits
+        it.
+
+        A child hung off a parent does not exist at the market until the parent
+        fills. That is the point of a bracket: the stop starts protecting shares
+        only once there are shares to protect. It also closes a real hole, which
+        is that a stop live before its entry filled could fire on its own and
+        leave the replay holding a short position nobody asked for.
+
+        A parent that was cancelled or rejected without ever filling never wakes
+        its child, which is right: there is nothing to protect.
+        """
+        if not order.transmitted:
+            return False
+        if order.parent_id is None:
+            return True
+        parent = self.orders.get(order.parent_id)
+        if parent is None:
+            return False
+        return parent.filled > 0
 
     def _try_fill(self, order: Order, bar: dict, moment: datetime) -> None:
         open_price = _number(bar.get("open"))
@@ -794,6 +922,12 @@ class FakeBroker:
             return
 
         kind = order.order_type
+        if kind == "STP LMT":
+            # Its own method, because a stop-limit is two orders in a coat: a
+            # trigger, and then a limit order that may never get filled.
+            self._try_stop_limit(order, open_price, high, low, moment)
+            return
+
         # Whether a stop has been hit is read off triggered_at, not off the
         # status, because a stop that fills in pieces stops being "Triggered"
         # the moment the first piece goes through and the rest would then be
@@ -833,21 +967,76 @@ class FakeBroker:
             limit = order.limit_price
             if limit is None:
                 return
-            if order.is_buy:
-                if low > limit:
-                    return
-                price = open_price if open_price <= limit else limit
-                why = (f"limit buy at {limit}, the bar's low {low} reached it"
-                       + (f", and the bar opened at {open_price} which is better"
-                          if open_price <= limit else ""))
-            else:
-                if high < limit:
-                    return
-                price = open_price if open_price >= limit else limit
-                why = (f"limit sell at {limit}, the bar's high {high} reached it"
-                       + (f", and the bar opened at {open_price} which is better"
-                          if open_price >= limit else ""))
+            answer = self._limit_fill(order, limit, open_price, high, low)
+            if answer is None:
+                return
+            price, why = answer
             self._execute(order, price, moment, why)
+
+    def _limit_fill(self, order: Order, limit: float, open_price: float,
+                    high: float, low: float) -> tuple[float, str] | None:
+        """What a limit at this price would fill at on this bar, or None.
+
+        Shared by plain limit orders and by a stop-limit that has already been
+        triggered, because once a stop-limit wakes up it is a limit order and
+        nothing else.
+        """
+        if order.is_buy:
+            if low > limit:
+                return None
+            price = open_price if open_price <= limit else limit
+            why = (f"limit buy at {limit}, the bar's low {low} reached it"
+                   + (f", and the bar opened at {open_price} which is better"
+                      if open_price <= limit else ""))
+        else:
+            if high < limit:
+                return None
+            price = open_price if open_price >= limit else limit
+            why = (f"limit sell at {limit}, the bar's high {high} reached it"
+                   + (f", and the bar opened at {open_price} which is better"
+                      if open_price >= limit else ""))
+        return price, why
+
+    def _try_stop_limit(self, order: Order, open_price: float, high: float,
+                        low: float, moment: datetime) -> None:
+        """A stop-limit: dead until the trigger is touched, a limit order after.
+
+        auxPrice is the trigger, the price that wakes it up, and lmtPrice is the
+        worst price it will then accept. Selling to close a long the limit sits
+        below the trigger, buying to close a short it sits above, so there is a
+        little room to get filled and no more.
+
+        The danger this exists to model is the one a plain stop does not have. A
+        price that jumps straight past the limit leaves the order awake and
+        UNFILLED, and the position it was meant to protect is now unprotected. It
+        stays that way until somebody markets out of it, which is exactly what
+        the loop's sixty second backstop is for. So this deliberately does not
+        quietly fill: if the limit was never reached, nothing happens.
+        """
+        if order.stop_price is None or order.limit_price is None:
+            return
+
+        if order.triggered_at is None:
+            touched = ((high >= order.stop_price) if order.is_buy
+                       else (low <= order.stop_price))
+            if not touched:
+                return
+            order.status = TRIGGERED
+            order.triggered_at = moment
+            order.notes.append(
+                f"stop-limit trigger {order.stop_price} was touched at "
+                f"{moment.isoformat()}, bar range {low} to {high}. From here it is "
+                f"a limit order at {order.limit_price}")
+            # Like a plain stop, it does not get to fill on the bar that woke it.
+            return
+
+        answer = self._limit_fill(order, order.limit_price, open_price, high, low)
+        if answer is None:
+            return
+        price, why = answer
+        self._execute(order, price, moment,
+                      f"stop-limit triggered at {order.triggered_at.isoformat()}, "
+                      f"then {why}")
 
     def _execute(self, order: Order, price: float, moment: datetime, why: str) -> None:
         """Fill an order, in whole or in part, and update everything it touches."""
@@ -893,6 +1082,44 @@ class FakeBroker:
             order.notes.append(f"{order.filled} of {order.total_quantity} shares filled so far")
 
         self._apply_fill(fill)
+        # However this fill arrived, it takes the rest of its group off the
+        # market. Partial fills count, which is what IBKR's ocaType 1 does.
+        self._cancel_oca_group(order)
+
+    def _cancel_oca_group(self, order: Order) -> list[int]:
+        """One order in a group filled, so pull the rest of the group.
+
+        This is IBKR's ocaType 1, one cancels the other. An entry and the stop
+        that protects it go out in one group, so whichever of them fills takes
+        the other off the market. An order with no group name links to nothing,
+        which is how every plain order in this file behaves.
+
+        THE ONE JUDGEMENT CALL IN HERE. agent/broker.py puts the parent in the
+        same group as its children, so read literally an entry filling would
+        cancel the very stop that was placed to protect it, and a bracket would
+        be worse than useless. So a fill never cancels its own children: that
+        fill is the moment they wake up, not the moment they die. Everything else
+        in the group goes.
+        """
+        if not order.oca_group:
+            return []
+        cancelled = []
+        for other in self.orders.values():
+            if other.order_id == order.order_id:
+                continue
+            if other.oca_group != order.oca_group:
+                continue
+            if other.status not in LIVE_STATUSES:
+                continue
+            if other.parent_id == order.order_id:
+                continue
+            other.status = CANCELLED
+            other.remaining = 0
+            other.notes.append(
+                f"cancelled by the one-cancels-the-other group {order.oca_group}, "
+                f"because order {order.order_id} filled")
+            cancelled.append(other.order_id)
+        return cancelled
 
     def _apply_fill(self, fill: Fill) -> None:
         """Move the shares, the cash and the profit, at both levels."""
@@ -971,7 +1198,8 @@ class FakeBroker:
 
     # ---------------------------------------------------------- order interface
 
-    def place_order(self, contract: Any, order: Any, order_ref: str) -> dict:
+    def place_order(self, contract: Any, order: Any, order_ref: str,
+                    transmit: bool | None = None) -> dict:
         """Send one order. Nothing fills here, fills happen on the next bar.
 
         contract and order are IBKR's own plain dictionaries, the same ones
@@ -985,6 +1213,22 @@ class FakeBroker:
         order_ref is which book is sending it, and it is required. A fill that
         cannot be traced back to a book cannot be reconciled, and reconciliation
         is the whole reason this class keeps five sets of books.
+
+        Three fields on that order dictionary make a bracket out of loose orders,
+        and all three are read here:
+
+            ocaGroup   the one-cancels-the-other group. When one order in a group
+                       fills, the rest are cancelled. An empty name links nothing.
+            parentId   the order this one hangs off. A child cannot fill until
+                       its parent has.
+            transmit   whether the order has been released to the market. It is
+                       an argument here rather than a field on the order, because
+                       that is how agent/broker.py has to pass it: the MCP server
+                       overwrites the order's own transmit from its own argument.
+                       False means the order rests here and cannot fill until
+                       something transmits it, which is how a bracket's parent
+                       waits for its stop to be attached. The field on the order
+                       is read as a fallback when the argument is not given.
 
         Nothing fills at the moment an order is placed, on purpose. Real fills
         arrive on the next print, and advance_to is what produces the next print
@@ -1016,18 +1260,31 @@ class FakeBroker:
                 "IBKR does not trade fractions of a share on this path.")
 
         kind = str(fields.get("orderType") or "MKT").upper()
-        if kind not in ("MKT", "LMT", "STP"):
+        if kind not in ("MKT", "LMT", "STP", "STP LMT"):
             raise FakeBrokerError(
-                f"this broker models MKT, LMT and STP orders. It was asked for {kind!r}.")
+                f"this broker models MKT, LMT, STP and STP LMT orders. It was asked "
+                f"for {kind!r}.")
         limit = _number(fields.get("lmtPrice"))
         stop = _number(fields.get("auxPrice") or fields.get("stopPrice"))
         if kind == "LMT" and limit is None:
             raise FakeBrokerError("a limit order needs an lmtPrice")
         if kind == "STP" and stop is None:
             raise FakeBrokerError("a stop order needs an auxPrice, which is where the stop sits")
+        if kind == "STP LMT" and stop is None:
+            raise FakeBrokerError(
+                "a stop-limit order needs an auxPrice, which is the price that "
+                "triggers it")
+        if kind == "STP LMT" and limit is None:
+            raise FakeBrokerError(
+                "a stop-limit order needs an lmtPrice, which is the worst price it "
+                "will take once it has triggered")
 
         ref = str(order_ref or "").strip().upper()
         self.book(ref)          # creates the book and rejects an empty order_ref
+
+        parent_raw = _number(fields.get("parentId"))
+        if transmit is None:
+            transmit = bool(fields.get("transmit", True))
 
         new_order = Order(
             order_id=self._next_order_id,
@@ -1041,8 +1298,16 @@ class FakeBroker:
             tif=str(fields.get("tif") or "DAY").upper(),
             placed_at=self.now,
             remaining=shares,
+            oca_group=str(fields.get("ocaGroup") or ""),
+            oca_type=int(_number(fields.get("ocaType"), 0) or 0),
+            parent_id=None if parent_raw is None else int(parent_raw),
+            transmitted=bool(transmit),
             contract=contract_dict,
         )
+        if not new_order.transmitted:
+            new_order.notes.append(
+                "placed untransmitted, so it rests here and cannot fill until "
+                "something transmits it")
 
         if "reject_next_order" in self._faults:
             settings = self._faults.pop("reject_next_order")
@@ -1061,49 +1326,151 @@ class FakeBroker:
 
         self._next_order_id += 1
         self.orders[new_order.order_id] = new_order
+        if new_order.transmitted:
+            self._transmit(new_order)
         answer = new_order.as_dict()
         answer["fills"] = []
         answer["rejected"] = False
         return answer
 
+    def _transmit(self, order: Order) -> None:
+        """Release this order, its parent and its group to the market.
+
+        IBKR holds an untransmitted order inside Gateway where nothing can trade
+        against it. A bracket's last child is the one sent transmitted, and that
+        single call is what puts the parent and every child on the market
+        together, which is the only way an entry never reaches the market with
+        nothing protecting it.
+
+        Simplified on purpose: a real transmit is a message about one order id and
+        Gateway works out the rest of the family itself. Here the parent id and
+        the group name are the only two links that exist, so following both of
+        them is the whole of the behaviour that matters.
+        """
+        order.transmitted = True
+        family: list[Order] = []
+        if order.parent_id is not None:
+            parent = self.orders.get(order.parent_id)
+            if parent is not None:
+                family.append(parent)
+        if order.oca_group:
+            family.extend(other for other in self.orders.values()
+                          if other.oca_group == order.oca_group)
+        for other in family:
+            if other.transmitted:
+                continue
+            other.transmitted = True
+            other.notes.append(
+                f"transmitted along with order {order.order_id}, which is what puts "
+                "a whole bracket on the market at once")
+
     def bracket_order(self, contract: Any, entry: Any, stop: Any,
                       target: Any = None, order_ref: str = "") -> dict:
-        """An entry with its stop, and its target when it has one, all at once.
+        """An entry and the stop that protects it, as ONE bracket.
 
-        The same three legs agent/broker.py sends to IBKR, placed here through
-        place_order above so they fill against the recorded bars like anything
-        else. Two honest differences from the real thing, both of which make
-        life here harder rather than easier, which is the right direction:
+        The same thing agent/broker.py sends to IBKR, built here out of
+        place_order above so every leg fills against the recorded bars like
+        anything else:
 
-          - the children are live from the moment they are placed, rather than
-            waiting for the parent to fill. IBKR hangs them off the parent's id.
-          - the children are not one-cancels-the-other. At IBKR a fill on the
-            target pulls the stop. Here both rest until one fills and the loop
-            has to notice the position is flat.
+            parent   the entry, placed untransmitted, so it rests here until the
+                     child hung off it releases it.
+            stop     the same stop the caller asked for, turned into a
+                     stop-limit, carrying the parent's order id as parentId and
+                     sent transmitted, which is what puts the whole group on the
+                     market at once.
+            target   a third leg in the same group, and only when one was asked
+                     for. All three momentum books stopped taking a profit target
+                     on 2026-09-06, so for those this is always None.
 
-        Returns the parent's answer with a `legs` list on it, one entry per leg,
-        each carrying the order id and the order_ref it went out under.
+        Every leg carries the same ocaGroup with ocaType 1, so a fill on one
+        pulls the others, and the stop cannot fill before the entry has.
+
+        WHAT THIS NOW MODELS FAITHFULLY, and did not before 2026-09-06. The two
+        differences this docstring used to list honestly are both closed: the
+        legs are one-cancels-the-other, and the children wait for the parent
+        instead of being live from the moment they are placed. That second one
+        was not a cosmetic gap. A stop live before its entry filled could fire on
+        its own and leave the replay holding a short position nobody asked for.
+        The stop is also a stop-limit now rather than a plain stop, so it can
+        trigger and then fail to fill, which is the real risk of the real order.
+
+        WHAT IS STILL DIFFERENT. Three things, all small and all written down:
+
+          - fills are worked out a bar at a time, so a leg that would trigger and
+            fill inside one five minute bar costs a whole bar here instead.
+          - a fill never cancels its own children, even though the parent shares
+            their group. The reason is at _cancel_oca_group: read any other way,
+            an entry filling would cancel the stop placed to protect it.
+          - cancelling a parent by hand does not cancel its children. They simply
+            never become able to fill, because their parent never fills.
+
+        Returns the parent's answer with `legs` (one dict per leg: purpose,
+        order_id, order_ref, price, and limit_price on the stop leg), `bracketed`
+        (True only when the stop child really went on) and `oca_group`.
         """
-        legs: list[dict] = []
-        parent = self.place_order(contract, entry, order_ref)
-        legs.append({"purpose": "entry", "order_id": parent.get("orderId"),
-                     "order_ref": order_ref,
-                     "price": self._order_dict(entry).get("lmtPrice")})
+        contract_dict = self._contract_dict(contract)
+        symbol = str(contract_dict.get("symbol") or "")
+        ref = str(order_ref or "")
 
-        for purpose, leg in (("target", target), ("stop", stop)):
-            if leg is None:
-                continue
-            answer = self.place_order(contract, leg, order_ref)
-            fields = self._order_dict(leg)
-            legs.append({"purpose": purpose, "order_id": answer.get("orderId"),
-                         "order_ref": order_ref,
-                         "price": fields.get("lmtPrice") if purpose == "target"
-                         else fields.get("auxPrice")})
+        stop_fields = stop_limit_child(self._order_dict(stop)) if stop is not None else {}
+        if stop_fields.get("auxPrice") is None:
+            # Refused rather than half done. With no stop leg there is nothing to
+            # transmit the parent, so the entry would sit here forever and the
+            # caller would be told an order went out that never did.
+            raise FakeBrokerError(
+                "a bracket needs a stop price on its stop leg, and it was given "
+                f"{stop!r}. An entry with nothing protecting it is the exact hole "
+                "a bracket exists to close.")
 
-        parent = dict(parent)
-        parent["legs"] = legs
-        parent["bracketed"] = any(leg["purpose"] == "stop" for leg in legs)
-        return parent
+        group = oca_group_name(ref, symbol, self.now)
+
+        parent_fields = dict(self._order_dict(entry))
+        parent_fields["ocaGroup"] = group
+        parent_fields["ocaType"] = OCA_CANCEL_REMAINING
+        parent_answer = self.place_order(contract, parent_fields, order_ref,
+                                         transmit=False)
+        parent_id = parent_answer.get("orderId")
+        legs = [{"purpose": "entry", "order_id": parent_id, "order_ref": ref,
+                 "price": parent_fields.get("lmtPrice")}]
+
+        wanted: list[tuple[str, dict]] = []
+        target_fields = dict(self._order_dict(target)) if target is not None else {}
+        if target_fields.get("lmtPrice") is not None:
+            wanted.append(("target", target_fields))
+        wanted.append(("stop", stop_fields))
+
+        stop_went_on = False
+        for index, (purpose, fields) in enumerate(wanted):
+            fields["ocaGroup"] = group
+            fields["ocaType"] = OCA_CANCEL_REMAINING
+            fields["parentId"] = parent_id
+            # The LAST child is the one sent transmitted, and that one call
+            # releases the parent and every child together. The stop is always
+            # last, because a bracket that went out with a target and no stop
+            # would be worse than one that never went at all.
+            answer = self.place_order(contract, fields, order_ref,
+                                      transmit=index == len(wanted) - 1)
+            if purpose == "stop":
+                stop_went_on = not answer.get("rejected")
+            legs.append({
+                "purpose": purpose, "order_id": answer.get("orderId"),
+                "order_ref": ref,
+                "price": (fields.get("lmtPrice") if purpose == "target"
+                          else fields.get("auxPrice")),
+                "limit_price": fields.get("lmtPrice") if purpose == "stop" else None,
+                "error": answer.get("error"),
+            })
+
+        answer = dict(parent_answer)
+        # Read the parent back off the broker, because the child that transmitted
+        # the group changed it after that first answer was made.
+        stored = self.orders.get(parent_id)
+        if stored is not None:
+            answer.update(stored.as_dict())
+        answer["legs"] = legs
+        answer["oca_group"] = group
+        answer["bracketed"] = stop_went_on
+        return answer
 
     def cancel_order(self, order_id: int) -> dict:
         """Pull one order that has not filled yet."""
@@ -1151,7 +1518,8 @@ class FakeBroker:
         if isinstance(order, dict):
             return dict(order)
         fields = {}
-        for name in ("action", "totalQuantity", "orderType", "lmtPrice", "auxPrice", "tif"):
+        for name in ("action", "totalQuantity", "orderType", "lmtPrice", "auxPrice",
+                     "tif", "ocaGroup", "ocaType", "parentId", "transmit"):
             if hasattr(order, name):
                 fields[name] = getattr(order, name)
         if not fields:

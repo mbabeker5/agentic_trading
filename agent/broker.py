@@ -42,6 +42,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -56,6 +57,24 @@ LIVE_ENV_VAR = "AGENTIC_TRADING_LIVE_ORDERS"
 
 #: IBKR paper account ids all start with this. A live one does not.
 PAPER_ACCOUNT_PREFIX = "DU"
+
+#: IBKR's one-cancels-the-other type 1: when one order in the group fills, every
+#: other order in it is cancelled, and the remaining quantity is reduced with a
+#: block. That is what makes an entry and its stop one bracket rather than two
+#: orders that happen to be about the same shares.
+OCA_CANCEL_REMAINING = 1
+
+#: How far below the stop trigger the stop-limit's limit price sits, for a long,
+#: and above it for a short. Half a percent (Momentum v2, 2026-09-06).
+#:
+#: A plain stop becomes a market order the moment it is touched and fills
+#: wherever the book happens to be, which in a thin gap down is a long way from
+#: the stop. A stop-limit will not fill below this price. Half a percent is
+#: enough room for an ordinary fill and not enough to give the position away.
+#: The cost of a limit is that a price gapping straight through it leaves the
+#: order triggered and unfilled, which is what the loop's sixty second market
+#: backstop exists to catch.
+STOP_LIMIT_OFFSET_PCT = 0.5
 
 
 class BrokerError(RuntimeError):
@@ -128,14 +147,22 @@ class Broker(Protocol):
         stop was. A bracket leaves the stop resting at IBKR, where it works
         whether or not this code is running.
 
-        The three legs are plain IBKR order dictionaries, the same shape
-        place_order takes:
+        The legs are plain IBKR order dictionaries, the same shape place_order
+        takes:
 
             entry   the parent, a limit order in the direction of the trade
-            stop    a STP child on the other side, with auxPrice at the stop
-            target  a LMT child on the other side, or None when the pick has no
-                    usable target. The children are one-cancels-the-other, so a
-                    fill on either pulls the other.
+            stop    a child on the other side, with auxPrice at the stop. The
+                    real broker turns it into a stop-limit; see McpBroker's own
+                    bracket_order below for why.
+            target  a LMT child on the other side, or None. Momentum v2 (item
+                    A2, Mo 2026-09-06) took the profit target away from the
+                    three momentum books entirely, so it is None for them and a
+                    momentum bracket is a parent and a stop and nothing else.
+                    The insider and Congress books still pass one.
+
+        Every leg goes out in ONE one-cancels-the-other group and the children
+        hang off the parent's id, so a fill on any of them cancels the rest and
+        nothing reaches the market until the whole bracket is assembled.
 
         Every leg carries order_ref, because a child order nobody can trace back
         to a book cannot be reconciled.
@@ -312,100 +339,171 @@ class McpBroker:
 
     def bracket_order(self, contract: dict, entry: dict, stop: dict,
                       target: dict | None = None, order_ref: str = "") -> dict:
-        """Send a bracket: the entry, and the stop and target that protect it.
+        """Send an entry and the stop that protects it, as ONE native IBKR bracket.
 
-        The server's own tool is ibkr_bracket_order, and its shape decides this
-        one. It does not take three order dictionaries. It takes the entry's
-        action, quantity and limit price as separate arguments plus a
-        takeProfitPrice and a stopLossPrice, and it builds the three IBKR orders
-        itself: a limit parent, a limit take profit child and a stop loss child,
-        both children hung off the parent's id. Anything else that has to be on
-        every leg goes in orderOptions, which the server copies onto all three.
-        orderRef and account go there, so a child order is traceable to its book
-        exactly like the parent.
+        WHY THIS DOES NOT USE THE SERVER'S OWN ibkr_bracket_order TOOL. That tool
+        takes an entry action, a quantity, a limit price, a takeProfitPrice and a
+        stopLossPrice, and it builds the three IBKR orders itself. Its
+        takeProfitPrice is not optional, checked by reading the pinned server's
+        source on 2026-09-06 (the commit is in requirements-312.txt, and the
+        argument has no default in _ibkr_bracket_order_sync). Momentum v2 took
+        the profit target away entirely (item A2, Mo 2026-09-06), so a momentum
+        entry has no take profit price to give it and that tool cannot be used
+        at all.
 
-        Its takeProfitPrice is not optional, so a pick whose target was dropped
-        cannot use it. That case sends the parent and then the stop child as two
-        ordinary orders instead, which leaves the same stop resting at IBKR. The
-        loss is the one-cancels-the-other link, and with no target there is
-        nothing for the stop to be cancelled against, so nothing is lost.
+        So the bracket is built here out of the server's plain order tool, which
+        is what IBKR itself does underneath:
 
-        Checked against the pinned server in
-        /Users/mtalib/workspace_repos/personal_repo/agentic_trading/requirements-312.txt
-        on 2026-09-06 by reading its source. It has never been called: no order
-        may leave this machine, so this path is read, tested against the fake
-        broker, and locked.
+            parent   a limit order, sent with transmit=false so it rests in
+                     Gateway and does not go to the market on its own
+            child    a stop-limit on the other side, carrying parentId set to
+                     the parent's order id, sent with transmit=true, which is
+                     what releases BOTH orders to the market together
+
+        Both legs carry the same ocaGroup and ocaType=1, so a fill on one
+        cancels the other, and both carry the book's orderRef and the account.
+        Checked against the same pinned server: order_from_input passes every
+        field of ib_async's Order straight through, and parentId, ocaType and
+        ocaGroup are all fields of it, so nothing here needs the server to learn
+        a new trick. The one field the server does NOT read off the order
+        dictionary is transmit, which it overwrites from its own argument
+        (server.py line 2331), so transmit is passed as an argument on each call
+        and never inside the order.
+
+        THE STOP CHILD IS A STOP-LIMIT, NOT A PLAIN STOP. A plain stop becomes a
+        market order the moment it is touched, and in a thin gap down that fills
+        wherever the book happens to be. The stop-limit triggers at the stop and
+        then works a limit STOP_LIMIT_OFFSET_PCT below it for a long, above it
+        for a short, which is half a percent of room. That is enough for an
+        ordinary fill and not enough to give the position away.
+
+        The risk in a stop-limit is the other way round: a price that gaps
+        straight through the limit leaves the order triggered and unfilled, and
+        the position unprotected. That is what the loop's backstop is for. It
+        markets the position out when the stop has triggered and the child is
+        still unfilled sixty seconds later. See stop_backstop_due in
+        agent/loop.py.
+
+        target is accepted and ignored on any book that has no profit target,
+        which is all three momentum books. A book that still takes one, which is
+        the insider and Congress books, gets a third leg in the same OCA group.
+
+        Returns the same keys place_order does, describing the parent, plus:
+
+            legs        one dict per leg: purpose, order_id, price, order_ref
+            bracketed   True when the protective child really went out
+            oca_group   the group name both legs went out under
         """
         if not live_orders_enabled():
             raise _refuse(f"place a bracket in {contract.get('symbol', '?')}")
 
         ref = str(order_ref)
-        options: dict[str, Any] = {"orderRef": ref}
-        if self.account:
-            options["account"] = self.account
-        tif = str(entry.get("tif") or "DAY").upper()
-        if tif:
-            options["tif"] = tif
-
-        quantity = float(entry.get("totalQuantity") or entry.get("quantity") or 0)
-        limit_price = entry.get("lmtPrice")
+        symbol = str(contract.get("symbol") or "")
         stop_price = stop.get("auxPrice", stop.get("stopPrice"))
-        target_price = (target or {}).get("lmtPrice")
-
-        if limit_price is None or stop_price is None:
+        if entry.get("lmtPrice") is None or stop_price is None:
             raise BrokerError(
                 "a bracket needs a limit price on the entry and a stop price on the "
-                f"stop leg, and it was given {limit_price!r} and {stop_price!r}.")
+                f"stop leg, and it was given {entry.get('lmtPrice')!r} and "
+                f"{stop_price!r}.")
 
-        if target_price is None:
-            return self._stop_without_target(contract, entry, stop, ref)
+        group = oca_group_name(ref, symbol)
+        parent = dict(entry)
+        parent["ocaGroup"] = group
+        parent["ocaType"] = OCA_CANCEL_REMAINING
+
+        # The parent goes out untransmitted, so it sits in Gateway until the
+        # child is attached to it. An entry that reached the market with nothing
+        # protecting it is the exact hole this whole path exists to close.
+        parent_result = self._send(contract, parent, ref, transmit=False)
+        parent_id = parent_result.get("order_id")
+        if parent_id is None:
+            parent_result["bracketed"] = False
+            parent_result["legs"] = [
+                {"purpose": "entry", "order_id": None, "order_ref": ref,
+                 "price": entry.get("lmtPrice")}]
+            parent_result["error"] = _join(
+                parent_result.get("error"),
+                "the parent order came back with no order id, so no stop could be "
+                "hung off it and nothing was transmitted")
+            return parent_result
+
+        legs = [{"purpose": "entry", "order_id": parent_id, "order_ref": ref,
+                 "price": entry.get("lmtPrice")}]
+        children = self._child_legs(contract, stop, target, ref, group, parent_id)
+        legs.extend(children)
+
+        parent_result["legs"] = legs
+        parent_result["oca_group"] = group
+        parent_result["bracketed"] = any(
+            leg["purpose"] == "stop" and leg.get("order_id") is not None
+            for leg in legs)
+        if not parent_result["bracketed"]:
+            parent_result["error"] = _join(
+                parent_result.get("error"),
+                "the stop child did not go out, so the parent is still sitting "
+                "untransmitted in Gateway and no shares have been bought")
+        return parent_result
+
+    def _child_legs(self, contract: dict, stop: dict, target: dict | None,
+                    ref: str, group: str, parent_id: Any) -> list[dict]:
+        """The protective legs, hung off the parent and transmitted last.
+
+        The LAST child sent carries transmit=true, and that one call is what
+        releases the parent and every child to the market at once. So the order
+        of these matters: the stop is always last, because a bracket that went
+        out with a target and no stop would be worse than one that never went.
+        """
+        wanted: list[tuple[str, dict]] = []
+        if target is not None and target.get("lmtPrice") is not None:
+            wanted.append(("target", dict(target)))
+        wanted.append(("stop", stop_limit_child(stop)))
+
+        legs: list[dict] = []
+        for index, (purpose, order) in enumerate(wanted):
+            order["ocaGroup"] = group
+            order["ocaType"] = OCA_CANCEL_REMAINING
+            order["parentId"] = int(parent_id)
+            last = index == len(wanted) - 1
+            answer = self._send(contract, order, ref, transmit=last)
+            legs.append({
+                "purpose": purpose, "order_id": answer.get("order_id"),
+                "order_ref": ref,
+                "price": (order.get("lmtPrice") if purpose == "target"
+                          else order.get("auxPrice")),
+                "limit_price": order.get("lmtPrice") if purpose == "stop" else None,
+                "error": answer.get("error"),
+            })
+        return legs
+
+    def _send(self, contract: dict, order: dict, order_ref: str,
+              transmit: bool) -> dict:
+        """One order tool call, with the book's tag and the account written on.
+
+        transmit is an ARGUMENT rather than a field on the order because the
+        pinned server overwrites order.transmit from its own argument. Passing
+        it any other way looks like it works and does nothing.
+        """
+        payload = dict(order)
+        payload["orderRef"] = str(order_ref)
+        if self.account:
+            payload["account"] = self.account
 
         raw: Any = None
         error: str | None = None
         try:
-            raw = self.client.call("ibkr_bracket_order", {
+            raw = self.client.call("ibkr_place_order", {
                 "contract": contract,
-                "action": str(entry.get("action") or "").upper(),
-                "quantity": quantity,
-                "limitPrice": round(float(limit_price), 2),
-                "takeProfitPrice": round(float(target_price), 2),
-                "stopLossPrice": round(float(stop_price), 2),
+                "order": payload,
                 "confirm": True,
                 "dry_run": False,
-                "transmit": True,
-                "orderOptions": options,
+                "transmit": bool(transmit),
             })
         except mcp.McpError as exc:
+            # The known instant fill bug from docs/MCP_SERVER.md as often as it
+            # is a real failure, so it is recorded and then checked against what
+            # the broker actually holds.
             error = str(exc)
-
-        result = self._confirm(contract, entry, ref, raw, error)
-        ids = list((raw or {}).get("orderIds") or []) if isinstance(raw, dict) else []
-        result["bracketed"] = bool(ids) or result["confirmed_by"] != "neither"
-        result["legs"] = [
-            {"purpose": purpose, "order_id": ids[i] if i < len(ids) else None,
-             "order_ref": ref, "price": price}
-            for i, (purpose, price) in enumerate((
-                ("entry", round(float(limit_price), 2)),
-                ("target", round(float(target_price), 2)),
-                ("stop", round(float(stop_price), 2)))) ]
-        return result
-
-    def _stop_without_target(self, contract: dict, entry: dict, stop: dict,
-                             ref: str) -> dict:
-        """A pick with no target: the parent, then the stop, as two plain orders."""
-        parent = self.place_order(contract, entry, ref)
-        child = self.place_order(contract, stop, ref)
-        parent["bracketed"] = bool(child.get("sent"))
-        parent["legs"] = [
-            {"purpose": "entry", "order_id": parent.get("order_id"),
-             "order_ref": ref, "price": entry.get("lmtPrice")},
-            {"purpose": "stop", "order_id": child.get("order_id"),
-             "order_ref": ref, "price": stop.get("auxPrice")},
-        ]
-        if child.get("error"):
-            parent["error"] = _join(parent.get("error"),
-                                    f"the stop leg: {child['error']}")
-        return parent
+        return self._confirm(contract, payload, order_ref, raw, error)
 
     def cancel_order(self, order_id: Any) -> dict:
         if not live_orders_enabled():
@@ -444,6 +542,44 @@ class McpBroker:
 
 
 # ------------------------------------------------------------ small helpers
+
+def oca_group_name(order_ref: str, symbol: str) -> str:
+    """The name both legs of one bracket go out under.
+
+    It carries the book's tag and the symbol so a group seen in Gateway can be
+    read back to the book and the name that made it, and a clock reading so two
+    brackets in the same name on the same day are never accidentally the same
+    group. Kept short, because IBKR truncates a long one.
+    """
+    stamp = datetime.now().strftime("%H%M%S")
+    return f"{str(order_ref).strip().upper()}-{str(symbol).strip().upper()}-{stamp}"
+
+
+def stop_limit_child(stop: dict) -> dict:
+    """The stop leg as a stop-limit, with its limit STOP_LIMIT_OFFSET_PCT away.
+
+    Takes the plain STP order the loop works out and turns it into a STP LMT:
+    auxPrice stays where it is, because that is the price that triggers the
+    order, and lmtPrice is set half a percent beyond it in the direction the
+    position is being closed. Selling to close a long, the limit sits BELOW the
+    trigger. Buying to close a short, it sits ABOVE.
+
+    An order that already carries a limit price is left as it is, so a caller
+    that has worked out its own is not overruled.
+    """
+    child = dict(stop)
+    trigger = child.get("auxPrice", child.get("stopPrice"))
+    if trigger is None:
+        return child
+    child["orderType"] = "STP LMT"
+    child["auxPrice"] = round(float(trigger), 2)
+    if child.get("lmtPrice") is None:
+        selling = str(child.get("action") or "").strip().upper() == "SELL"
+        factor = (1.0 - STOP_LIMIT_OFFSET_PCT / 100.0) if selling else (
+            1.0 + STOP_LIMIT_OFFSET_PCT / 100.0)
+        child["lmtPrice"] = round(float(trigger) * factor, 2)
+    return child
+
 
 def _order_id_from(raw: Any) -> Any:
     """Dig the broker's order id out of whatever shape the reply came back in."""
