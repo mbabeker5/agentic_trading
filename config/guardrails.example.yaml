@@ -25,13 +25,40 @@ account:
 
 money:
   starting_equity: 100000     # what the paper account is reset to on day one
-  max_position_pct: 15        # no single stock may be more than this percent
-                              # of the book. 15 percent of 100k is 15k.
-  max_open_positions: 5       # at most this many stocks held at the same time
-  max_daily_loss_pct: 2       # lose this percent of the day's opening balance
-                              # and the agent stops opening new trades that day
-  max_order_notional: 15000   # no single buy order may be worth more than this
-                              # many dollars
+
+  # THE SIZE RULE (Momentum v2, item A6, Mo 2026-09-06). The momentum books no
+  # longer buy a fixed slice of the book. They risk a fixed amount and let the
+  # stop decide the share count: shares equals risk_per_trade_pct of the book
+  # divided by the distance from the entry price to the stop. A name with a wide
+  # stop gets fewer shares, a name with a tight stop gets more, and every
+  # position loses about the same when it is wrong. The two caps under it are
+  # the ceiling, because a very tight stop would otherwise buy an enormous
+  # position. The insider and Congress books do not use risk_per_trade_pct; they
+  # still size on max_position_pct alone, which is why it is written here for
+  # everybody and read only on the momentum pick path.
+  risk_per_trade_pct:         # EMPTY here on purpose, which switches the size
+                              # rule off for anything that does not ask for it.
+                              # The number, 0.25, lives in the two momentum
+                              # strategy files. The insider and Congress books
+                              # genuinely do size on max_position_pct alone,
+                              # because they hold for weeks and their stop is a
+                              # plain percentage rather than a volatility
+                              # measure, so there is no risk distance to divide
+                              # by that would mean anything.
+  max_position_pct: 10        # no single stock may be more than this percent
+                              # of the book. 10 percent of 100k is 10k.
+  max_open_positions: 10      # at most this many stocks held at the same time
+  max_daily_loss_pct: 1       # lose this percent of the day's opening balance
+                              # and the agent stops opening new trades that day.
+                              # THE DERIVATION (item A7): ten positions each
+                              # risking 0.25 percent is a natural worst case of
+                              # 2.5 percent in a day, so any cap above that
+                              # could never fire and would be decoration. One
+                              # percent binds after four full stop outs.
+  max_order_notional: 10000   # no single buy order may be worth more than this
+                              # many dollars, which is the same 10 percent
+  gross_exposure_pct_max: 100 # longs and shorts added together may never be
+                              # worth more than the book. No margin borrowing.
   tiny_capital_usd: 2000      # what a book in tiny mode is allowed to risk. A
                               # book on tiny sends real paper orders but sizes
                               # them against this pot instead of its full
@@ -39,16 +66,90 @@ money:
                               # watching. Ignored on dry_run and on full. See
                               # the mode field in config/books.yaml.
 
+  # THE LIMITS BEYOND THE DAY (item A8). Without these a book could lose one
+  # percent a day for ten days and no rule would ever notice. Any one of the
+  # three pauses the book for Mo to look at it, and none of them ever blocks a
+  # closing order.
+  max_weekly_loss_pct: 4      # in one calendar week
+  max_monthly_loss_pct: 6     # in one calendar month
+  max_consecutive_losing_days: 3
+                              # three losing days in a row, whatever the size,
+                              # because a run of small losses is the shape a
+                              # broken strategy makes
+
+  # THE CORRELATION CAPS (item A9). Five morning gappers move together far more
+  # than five unrelated names do, so a book full of one industry is really one
+  # bet made many times.
+  sector_gross_pct_max:       # EMPTY here on purpose, which switches the rule
+                              # off. It is a momentum rule, so the number, 25,
+                              # lives in the two momentum strategy files. When
+                              # it is set, no more than that share of the book's
+                              # gross exposure limit may sit in one industry,
+                              # and a name whose industry the broker could not
+                              # tell us is refused rather than assumed harmless.
+  account_symbol_pct_max: 15  # across ALL five books, not just one, no single
+                              # ticker may carry more than this percent of the
+                              # money the books hold between them. The one
+                              # ticker one book rule stops two books buying the
+                              # same name; this is the second layer under it.
+
 risk:
-  stop_loss_pct: 1.5          # every position gets a stop this percent below
-                              # the price we bought at
+  # THE STOP (item A1, Mo 2026-09-06). It is measured from how much the stock
+  # actually moves, not from a flat percentage. The average true range is the
+  # average size of one session's price swing over the last atr_days sessions,
+  # counting the gap from the previous close. The stop sits stop_atr_pct percent
+  # of that away from the entry price, so a stock whose average swing is 2
+  # dollars stops 20 cents away. That is about five times tighter than the 1.5
+  # percent stop it replaced, and a tight volatility based stop is the one thing
+  # every published version of this strategy has in common.
+  atr_days: 14                # how many completed sessions the average covers
+  stop_atr_pct:               # EMPTY here on purpose, which switches the
+                              # volatility stop off for anything that does not
+                              # ask for it. The number, 10, lives in the two
+                              # momentum strategy files, because the insider and
+                              # Congress books have no average true range rule
+                              # and their stop really is a plain percentage.
+  stop_outside_opening_range: true
+                              # and the stop may never sit inside the opening
+                              # range: for a long it is moved to at or below the
+                              # low of the first five minutes, for a short to at
+                              # or above the high. Inside the range is inside
+                              # the noise the trade is made of.
+
+  stop_loss_pct: 1.5          # THE FALLBACK ONLY, used when the average true
+                              # range for a name is not known. It should never
+                              # be reached on a momentum candidate, because the
+                              # volatility filter below needs the same number.
+                              # It exists so a position carried in from an older
+                              # state file still gets a stop rather than none.
+                              # The insider and Congress books, which have no
+                              # average true range rule, still use it as their
+                              # real stop and set their own wider numbers.
   use_opening_range_low_if_tighter: true
                               # if the low of the first five minutes is nearer
                               # to our entry price than the percent stop above,
                               # use that instead. Tighter stop, smaller loss.
+  use_profit_target: true     # true here, because the insider and Congress
+                              # books still take a target. The two momentum
+                              # strategy files set it to FALSE (item A2): a
+                              # momentum position now leaves by its stop or at
+                              # the close and nothing else, because two
+                              # independent studies found that putting a target
+                              # on this strategy destroys its edge. The few
+                              # trades that run a long way are what pay for all
+                              # the small losses.
 
 universe:
   price_floor: 5              # ignore anything trading below this many dollars
+
+  # THE VOLATILITY FILTER (item A3). Both tests have to hold. Fifty cents is a
+  # big daily swing on a 6 dollar stock and nothing at all on a 600 dollar one,
+  # which is why the same test is applied again in percentage terms. Without it
+  # the scan fills with quiet large caps whose five minute range is noise.
+  atr_days: 14                # the same 14 sessions the stop is measured over
+  min_atr_usd: 0.50           # the average daily swing in dollars
+  min_atr_pct_of_price: 1.5   # and the same swing as a percent of the price
+
   min_avg_dollar_volume: 20000000
                               # the liquidity floor (Mo, 2026-09-06). A name has
                               # to trade at least this many dollars a day on
@@ -61,18 +162,44 @@ universe:
                               # and better matched of the two. Working from
                               # research/liquidity_census/.
   dollar_volume_sessions: 30  # how many completed sessions that average covers
+  min_history_sessions: 30    # a name needs at least this many completed
+                              # sessions behind it (item A12). Mo considered and
+                              # REJECTED a rule barring anything listed in the
+                              # last 90 days. This does the same job honestly:
+                              # what matters is having enough history to measure
+                              # the liquidity floor and the average true range,
+                              # and a name without it fails those tests anyway.
   min_avg_volume: 1000000     # DEPRECATED, kept as an alias so an older file
                               # still loads. The momentum scanner ignores it and
                               # uses min_avg_dollar_volume instead. The insider
                               # and Congress sweeps still quote this share
                               # figure in the words they hand the model, which
                               # is why it is not deleted outright.
+
+  # THE HARD EXCLUSIONS (item A12), applied before the model ever sees a name.
+  # These are the promoter and binary-event traps the red team ranked as the
+  # largest single source of loss in a strategy that buys whatever gapped
+  # hardest.
+  exclude_spacs: true         # a blank cheque company is a coin flip on a deal
+  exclude_warrants_and_rights: true
+                              # both move several times as far as the share they
+                              # are written on, and both are thin
+  exclude_preferred: true     # preferred shares barely move and barely trade
+  require_us_primary_listing: true
+                              # which is what keeps out anything traded over the
+                              # counter and any foreign line
+  exclude_halted: true        # nothing is opened in a name that cannot be
+                              # traded right now. The live check is on the order
+                              # path in agent/guardrails.py, rule id halted,
+                              # reading IBKR's tick type 49.
+
   allow_options: false        # no options in month one
-  allow_shorts: false         # no betting on falls. Mo changed the strategy spec
-                              # on 2026-09-02 to propose shorting with mirrored
-                              # stops, but this switch stays false until the
-                              # mirrored stop and the gross exposure cap are
-                              # actually built. See agent/README_guardrails.md.
+  allow_shorts: false         # no betting on falls. Item A10, shorting, is the
+                              # one part of Momentum v2 STILL PENDING Mo's
+                              # decision, so this stays false. Everything a
+                              # short needs already exists in the code, so it is
+                              # one line to flip once he decides. See
+                              # agent/README_guardrails.md.
   max_borrow_fee_pct: 1.0     # a short is only worth it while the borrow costs
                               # less than this percent a year (Mo, 2026-09-06)
   borrow_availability_multiple: 10
@@ -97,40 +224,67 @@ scanner:
   # universe block above, are applied in our own code against real daily bars.
   # A filter we apply ourselves cannot be switched off by a subscription we do
   # not have. See agent/README_scanner.md.
-  rel_volume_min: 2.0         # a candidate must be trading at least this many
-                              # times its normal pace for the time of day,
-                              # measured at 09:35. At or above, not above.
+  #
+  # THERE IS NO FINVIZ BLOCK HERE ANY MORE (item D7). Mo decided not to buy
+  # Finviz Elite, so on 2026-09-06 the flag and the whole code path were deleted
+  # rather than left switched off. It did not go missing; do not add it back.
+  rank_by: rel_volume         # THE SELECTION RULE (item A4). The shortlist is
+                              # ordered by relative volume, highest first, and
+                              # the top names are taken. It used to be ordered
+                              # by the size of the gap multiplied by the volume.
+                              # The ranking by volume, not the size of the move,
+                              # is what carried the published result.
+  rel_volume_min: 2.0         # the floor, applied before the ranking. A
+                              # candidate must be trading at least this many
+                              # times its normal pace for the time of day. At or
+                              # above, not above.
+  rel_volume_window: "09:30-09:35"
+                              # the window it is measured on: the first five
+                              # minutes, not the whole morning
+  rel_volume_baseline_days: 14
+                              # and what it is measured against: the same five
+                              # minute window on each of the previous 14
+                              # sessions. agent/preopen.py pulls that history
+                              # before the open so the ranking is ready at 09:35.
   max_candidates: 20          # the shortlist handed to Claude is capped here
   exclude_leveraged_etfs: true  # no 2x or 3x or inverse products
 
-  finviz:
-    # An optional second opinion on what actually gapped. Finviz Elite has
-    # native gap and relative volume filters and a CSV export endpoint, so it
-    # would catch anything IBKR's lists miss. Mo has NOT bought it (39.50
-    # dollars a month), so this is off and nothing here signs up for anything.
-    # With enabled false the scanner writes one line in the log and makes no
-    # network call at all.
-    enabled: false
-    export_url: ""            # the whole Finviz export link, screener settings
-                              # and all. If it already carries its own auth=
-                              # token, nothing else is needed.
-    auth_token_key: FINVIZ_AUTH_TOKEN
-                              # otherwise the token is read from this key in the
-                              # secrets file below and appended to the link at
-                              # request time. It is never logged or written into
-                              # the shortlist.
-    secrets_file: finviz.env  # a file of KEY=value lines inside .secrets/, which
-                              # is gitignored. So the full path is
-                              # .secrets/finviz.env under the project folder.
-
 schedule:
   timezone: America/New_York  # every time below is New York time
-  scan_start: "09:30"         # market opens, scanner runs
+  preopen_start: "09:00"      # the pre-open run starts here: the gap scan and
+                              # the paced history pulls, so the data budget is
+                              # not spent in the five minutes when it is
+                              # scarcest. See docs/PREOPEN_FLOW.md.
+  preopen_history_done_by: "09:26"
+  preopen_subscribe_done_by: "09:29"
+  scan_start: "09:30"         # market opens, the opening range starts building
   pick_time: "09:35"          # Claude picks its names, entries may begin
-  entries_until: "11:00"      # no new positions opened after this
-  flatten_at: "15:55"         # sell everything still open
+  entries_until: "10:15"      # NO NEW POSITIONS AFTER THIS (item D3). It used
+                              # to be 11:00. Entries after 10:15 chase moves
+                              # that have already been made, and every entry the
+                              # cutoff blocks is written down, so month one
+                              # measures what the cutoff cost rather than
+                              # guessing at it.
+  flatten_at: "15:45"         # flattening BEGINS here (item A11), with limit
+                              # orders at the bid or the ask, because spreads
+                              # widen and depth collapses in the last few
+                              # minutes and a market order into that pays for it
+  flatten_market_at: "15:55"  # the backstop. Anything still open at this time
+                              # goes out at market, because being flat matters
+                              # more than the last few cents.
   market_close: "16:00"       # market shuts
-  loop_minutes: 5             # the agent wakes up this often during the day
+  loop_minutes: 5             # the ordinary cadence, out of hours and once the
+                              # morning is over
+  fast_poll_seconds:          # ALL THREE EMPTY here on purpose, which means the
+  fast_poll_from:             # cadence is loop_minutes and nothing else. The
+  fast_poll_until:            # fast window is a momentum rule (item A14): those
+                              # books look every 30 seconds between 09:35 and
+                              # 11:00 while they are holding something, because
+                              # a stop that tight needs sub-minute resolution
+                              # even with the stop resting at the broker. The
+                              # insider and Congress books hold for weeks and
+                              # look every thirty minutes, so a 30 second window
+                              # would be thirty pointless wake ups an hour.
   trade_only_regular_hours: true  # no pre-market or after-hours trading
   holidays: []                # days the US market is shut that are not weekends,
                               # written as [2026-11-26, 2026-12-25]. Empty today.

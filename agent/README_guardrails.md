@@ -27,14 +27,23 @@ and the tests are at
 and
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_books.py`.
 
-**The numbers in guardrails.yaml and in every strategy.yaml are proposals, not
-decisions.** They came straight out of the tables in
+**The two momentum strategy files are approved. The other two are still
+proposals.** All of the numbers came straight out of the tables in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md`,
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY_INSIDER.md`
 and
-`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY_CONGRESS.md`,
-and are waiting on Mo's approval as of 2026-09-06. Every strategy file says
-`status: provisional` at the top so nothing can quietly graduate itself.
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY_CONGRESS.md`.
+Mo approved the momentum numbers on 2026-09-06 as Momentum v2, so
+`strategies/momentum_hybrid/strategy.yaml` and
+`strategies/momentum_rules/strategy.yaml` say `status: approved` and carry a
+changelog beside them naming every item that changed. The insider and Congress
+files still say `status: provisional`, so nothing there can quietly graduate
+itself. One momentum item is still open: shorting is **pending Mo's decision**
+and stays switched off, which is the section at the bottom of this file.
+
+The item ids used throughout this file, A1, A6, D3 and so on, are the ones in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_hybrid/CHANGELOG.md`,
+so a rule here can always be traced back to the decision that made it.
 
 Two more files sit next door and work the same way, pure logic with no network:
 
@@ -66,36 +75,51 @@ often each one fired over a month.
 | `short_price_floor` | A book that shorts only shorts shares priced at or above its own floor, 10 dollars in the momentum books against the 5 dollar floor everything else uses. Cheap shares are the expensive ones to be short of. |
 | `shortable_required` | The easy to borrow rule. A short only goes out when all three of these hold: IBKR rates the name above 2.5 on its own 0 to 3 borrowing scale, which is what the broker calls easy to borrow; the borrow costs less than `universe.max_borrow_fee_pct` a year, 1 percent; and there are at least `universe.borrow_availability_multiple` times as many shares available to borrow as we mean to sell, 10 times. Whichever of the three failed gets its own sentence. A figure the broker did not report counts as a failure, because the expensive borrows are the ones nobody quotes. |
 | `gross_exposure_cap` | Longs and shorts added together, ignoring which way they point, may never be worth more than 100 percent of the book. That is the line that says the book never borrows to buy. |
-| `entries_per_day` | A book may only open so many brand new names in a day: 5 for the momentum books, 3 for insider, 2 for Congress. Adding to something already held does not count. |
-| `entry_window` | New positions may only be opened between the book's pick time and its cut-off on a weekday, 09:35 to 11:00 for the momentum books. The start counts, the end does not. |
+| `entries_per_day` | A book may only open so many brand new names in a day: 10 for the momentum books, 3 for insider, 2 for Congress. Adding to something already held does not count. |
+| `entry_window` | New positions may only be opened between the book's pick time and its cut-off on a weekday, 09:35 to 10:15 for the momentum books since Momentum v2 (item D3, was 11:00). The start counts, the end does not. |
 | `outside_market_hours` | Nothing but a closing order may be placed outside 09:30 to 16:00 New York time on a weekday. |
-| `flatten_time` | From 15:55 New York time only closing orders go through. |
-| `daily_loss_cap` | Once today's loss (closed and open added together) reaches 2 percent of the balance the day opened with, no new positions for the rest of the day. Getting out is still allowed, and the decision comes back with `daily_halt` set to true. |
-| `max_order_notional` | No single buy order may be worth more than the book's limit, 15,000 dollars in the momentum books. An entry with no limit price is refused too, because there is no way to know what it would cost. |
-| `max_position_pct` | No single stock may grow past 15 percent of the book (5 percent in the insider and Congress books). What we already hold and what is sitting unfilled on order both count towards that. |
-| `max_open_positions` | At most 5 stocks held at once in the momentum books, 10 in the other two. Buying more of something we already hold does not count as one more. |
+| `flatten_time` | From the book's `flatten_at`, which is 15:45 in the momentum books, only closing orders go through. |
+| `daily_loss_cap` | Once today's loss (closed and open added together) reaches the book's own cap on the balance the day opened with, no new positions for the rest of the day. That cap is 1 percent in the momentum books since Momentum v2 (item A7, was 2 percent) and 2 percent in the insider and Congress books. Getting out is still allowed, and the decision comes back with `daily_halt` set to true. |
+| `weekly_loss_cap` | The book is down 4 percent or more over the calendar week, so it is paused for Mo to look at. Entries only: nothing new is opened, and every closing order still goes through. |
+| `monthly_loss_cap` | The same idea over a calendar month, at 6 percent. Also a pause, also entries only. |
+| `losing_streak_pause` | The book has finished down three trading days in a row. Also a pause, also entries only. A run of small losses is the shape a broken strategy makes, and no daily, weekly or monthly cap catches it on its own. |
+| `sector_cap` | No more than 25 percent of the book's gross exposure limit in any one industry, which at the 100 percent gross cap is 25 percent of the book. A name whose industry the broker could not tell us is refused rather than counted as harmless. Entries only, so getting out is never blocked. |
+| `account_symbol_cap` | No more than 15 percent of what all five books are worth on any one ticker, counted across every book rather than inside one. Entries only. |
+| `max_order_notional` | No single buy order may be worth more than the book's limit, 10,000 dollars in the momentum books (item A6, was 15,000) and 5,000 in the other two. An entry with no limit price is refused too, because there is no way to know what it would cost. |
+| `max_position_pct` | No single stock may grow past 10 percent of the book (item A6, was 15 percent), or 5 percent in the insider and Congress books. What we already hold and what is sitting unfilled on order both count towards that. |
+| `max_open_positions` | At most 10 stocks held at once, in every book (item D1, the momentum books were 5). Buying more of something we already hold does not count as one more. |
 | `wrong_book` | Five books share one paper account, so every order says which book it came from. One tagged for another book is refused, and this is the only rule that refuses a closing order too, because selling another book's position is worse than a missed exit. |
 | `symbol_exclusive` | Two books may never hold, or have a working order in, the same ticker. IBKR nets positions by symbol inside the one shared account, so a second book in the same name would disappear into the first book's line and neither could be reconciled afterwards. Blocks any entry, and any other order that would open or increase a position, in a name another book already has. Getting out of this book's own position is never blocked. Ties go first come, first served. |
 | `halted` | Nothing goes out into a name that cannot be traded. While IBKR's halted tick says the name is halted only an exit or a flatten goes through. While it is sitting in a limit-up limit-down band, the step just before a volatility halt, no new position is opened. And if nobody could say whether the name is halted, no new position is opened either, because deciding to buy something without knowing whether it is even trading is the failure this rule exists to prevent. |
 
 A few things the code does besides refusing orders:
 
-- Works out where the stop loss goes: 1.5 percent below the entry price, or the
-  low of the first five minutes if that is nearer to entry, whichever gives the
-  smaller loss. The answer is always below the entry price. For a short it is
-  the mirror image, 1.5 percent above entry or the high of the first five
-  minutes if that is nearer, and always above the entry price.
+- Works out where the stop loss goes, `stop_price_for`. On a momentum book that
+  is 10 percent of the name's 14 day average true range away from the entry
+  price, pushed out to the edge of the opening range if it would otherwise land
+  inside it. On the insider and Congress books it is the old percentage rule,
+  8 percent and 10 percent below entry, or the low of the first five minutes if
+  that is nearer. Either way the answer is always on the safe side of entry, and
+  the mirror image holds for a short. There is a whole section on this below.
+- Works out how many shares to buy so that being wrong costs one trade's worth
+  of money, `shares_for_risk`. Also its own section below.
 - Works out where a trailing stop sits, once a position is far enough ahead to
   have switched one on. Nothing before that, and nothing at all for a book with
   no trailing rule in its settings.
 - Says when a position has run out of time: 30 trading days in the insider book,
   60 in the Congress book, counting weekdays and skipping weekends.
-- Works out the biggest whole number of shares we may buy, given the 15 percent
-  per stock limit, the 15,000 dollar order limit and the cash left over. It
-  always rounds down, so the number it hands back always passes the check above.
-- Answers the three clock questions the main loop asks all day: may we open
-  something now, is the market open, and is it time to sell everything. The last
-  one is always no for a book that holds overnight.
+- Works out the biggest whole number of shares we may buy, `max_shares_for`,
+  given the 10 percent per stock limit, the 10,000 dollar order limit and the
+  cash left over. It always rounds down, so the number it hands back always
+  passes the check above. This is the ceiling `shares_for_risk` is held to.
+- Answers the clock questions the main loop asks all day: may we open something
+  now, is the market open, is it time to start selling everything
+  (`must_flatten_now`, from 15:45), and is the market order backstop due
+  (`must_flatten_at_market_now`, from 15:55). The last two are always no for a
+  book that holds overnight.
+- Says how soon this book wants looking at again, in seconds, `next_tick_seconds`.
+  Thirty between 09:35 and 11:00 while a momentum book is holding something, five
+  minutes otherwise, thirty minutes for the insider and Congress books.
 
 Two more behaviours are worth knowing about. Live trading cannot start by
 accident: if the settings say `mode: live`, the file refuses to load at all
@@ -107,9 +131,161 @@ raises an error rather than being taken to mean New York.
 When an order is refused, the answer lists every rule it broke, not just the
 first one, and each one comes with a sentence in plain English. For example:
 
-> This order would put $16,000.00 into AAPL: $9,000.00 already held, $3,000.00
-> on order and $4,000.00 from this order. That is 16.0 percent of the
-> $100,000.00 account, and the limit is 15 percent ($15,000.00).
+> This order would put $11,000.00 into AAPL: $6,000.00 already held, $2,000.00
+> on order and $3,000.00 from this order. That is 11.0 percent of the
+> $100,000.00 account, and the limit is 10 percent ($10,000.00).
+
+## The size rule: how many shares
+
+Item A6, approved by Mo on 2026-09-06. This is the biggest change in Momentum
+v2 and everything else hangs off it.
+
+A momentum book risks 0.25 percent of its own equity on every trade, which is
+250 dollars on a 100,000 dollar book. The share count is that money divided
+by the distance from the entry price to the stop. A name with a wide stop gets
+fewer shares and a name with a tight stop gets more, so every position loses
+about the same amount when it is wrong. That is the whole point of it. Under the
+old rule, a flat 15 percent of the book in each name, one halted stock gapping
+20 percent overnight cost more than the entire daily loss cap.
+
+The function is `shares_for_risk`, and the setting is `money.risk_per_trade_pct`.
+
+The notional caps sit over the top of it as the ceiling, not beside it.
+`shares_for_risk` works out what the risk budget wants, then puts that number
+through `max_shares_for` and takes whichever is smaller, so the 10 percent per
+stock limit, the 10,000 dollar single order limit and the cash left over are all
+still absolute. A very tight stop would otherwise buy an enormous position,
+which is exactly the failure the pair of rules exists to prevent. Landing under
+the risk budget because a cap cut the order is fine. Landing over it is not.
+
+Worked through: a name with a 25 cent distance from entry to stop wants 250
+divided by 0.25, which is 1,000 shares. At 9.38 a share that is 9,380 dollars,
+inside the 10,000 dollar cap, so 1,000 shares is what goes out. Had the entry
+been 15 dollars, 1,000 shares would be 15,000 dollars, the cap would have cut it
+to 666 shares, and the trade would have risked 166.50 dollars instead of 250.
+
+**The insider and Congress books have no `risk_per_trade_pct` at all**, and it is
+left empty in the shared `config/guardrails.yaml` too. `shares_for_risk` hands
+those books straight to `max_shares_for`, so they size the old way, on the
+5 percent per stock limit and the 5,000 dollar order limit, and nothing about
+them changed. The same happens for any call whose stop is not on the right side
+of the entry price, because there is no risk distance to divide by and refusing
+to size at all would be worse than sizing the old way.
+
+## The stop: an average true range, and the edge of the opening range
+
+Item A1, approved by Mo on 2026-09-06. `stop_price_for` now takes an `atr`
+argument, the name's 14 day average true range, which is the average size of one
+session's price swing over the last 14 sessions counting the gap from the
+previous close.
+
+With an average true range in hand, and `risk.stop_atr_pct` set, the stop sits
+that percent of the average true range away from the entry price. At the momentum
+books' 10 percent, a stock whose average daily swing is 2 dollars stops 20 cents
+away. That is roughly five times tighter than the 1.5 percent stop it replaced,
+and a tight volatility-based stop is the one thing every published version of
+this strategy has in common.
+
+Then `risk.stop_outside_opening_range` has its say. The stop may never sit inside
+the first five minutes' range, so whenever it would, it is pushed out: down to the
+range low for a long, up to the range high for a short. Inside the range is inside
+the noise the trade is made of, and a stop there would be taken out by the setup
+itself.
+
+**On a real gapper the range is wide, so the range edge is usually what actually
+decides the stop.** A stock that has just jumped 12 percent on news does not
+trade in a 20 cent band in its first five minutes. So the average true range
+number often loses, the range low wins, and the stop ends up further from entry
+than 10 percent of the average true range would have put it. That sounds like it
+should cost more money, and it does not, because of the rule above it: a wider
+stop means a bigger distance to divide by, which means fewer shares. The risk
+stays 250 dollars either way. It just buys less stock.
+
+**Without an average true range the old percentage stop stands in.** Pass no
+`atr`, or run a book with no `risk.stop_atr_pct`, and `stop_price_for` behaves
+exactly as it always did: `risk.stop_loss_pct` from entry, or the opening range
+level if that is nearer. That is the real stop for the insider and Congress
+books, at 8 and 10 percent. On a momentum book the 1.5 percent left in the
+strategy file is a fallback and nothing more. It should never be reached, because
+a name has to clear the volatility filter to be a candidate at all and that filter
+needs the same number. It exists so a position carried in from an older state file
+still gets a stop rather than none.
+
+## The five limits added with Momentum v2
+
+Item A8 brought three, item A9 brought two. All five refuse entries only. **Not
+one of them can ever block an order that closes a position**, which is the same
+promise every size limit in this file makes: blocking the way out of a trade is
+the worst thing this code could do.
+
+**`weekly_loss_cap`.** The book is down 4 percent or more over the calendar week,
+measured against what it was worth when the market opened today, which is the
+same base the daily cap uses. It refuses every entry and pauses the book for Mo
+to look at. It refuses no exit, stop or flatten. Without a rule beyond the day, a
+book could lose one percent a day for a fortnight and nothing would ever notice.
+
+**`monthly_loss_cap`.** The same idea over a calendar month, at 6 percent. Same
+answer: entries refused, book paused, exits untouched.
+
+**`losing_streak_pause`.** The book has finished down three trading days in a
+row. It does not care how much was lost. A run of small losses is the shape a
+broken strategy makes, and no daily, weekly or monthly cap catches it on its own.
+Same answer again: entries refused, book paused, exits untouched.
+
+The three numbers behind them do not come from the broker. The loop works them
+out from the book's own state files, one per book per day in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/`, using its
+`loss_history` function: this calendar week, this calendar month, and the run of
+losing days behind today. It hands all three over on the AccountState as
+`week_pnl`, `month_pnl` and `consecutive_losing_days`. The guardrails own the
+limits, the loop owns the arithmetic, and a caller that says nothing gets zeros,
+which means nothing to see.
+
+**`sector_cap`.** No more than 25 percent of the book's gross exposure limit in
+any one industry. At the 100 percent gross cap that is 25 percent of the book,
+which on a 100,000 dollar book is 25,000 dollars, or two and a half positions.
+Ten
+morning gappers in the same industry are one bet made ten times, not ten bets,
+and this is the rule that says so.
+
+A name whose industry the broker could not name is refused, not waved through.
+That is deliberate, and it is the same answer an unknown halt status gets, for
+the same reason: a limit that cannot be measured is not a limit, and
+reading a missing answer as "fine" is how a rule quietly stops working. Getting
+out of such a name is never blocked. The industry comes off the shortlist row,
+where `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/scanner.py`
+writes what IBKR's contract details said, and the scanner already names in its
+own log every shortlisted name that came back without one.
+
+**`account_symbol_cap`.** No more than 15 percent of what all five books are
+worth on any single ticker, counted across every book rather than inside one.
+The one ticker one book rule already stops two books buying the same name; this
+is the second layer under it, and it also catches one book piling into a single
+ticker. When the loop did not hand in the account wide figure, this book's own
+equity stands in instead. That is the smaller number, so the cap comes out
+tighter rather than looser, which is the safe direction to be wrong in. Unlike
+the sector cap, this one is set in the shared `config/guardrails.yaml`, so all
+five books carry it.
+
+## Two more things Momentum v2 changed here
+
+**There is no profit target on a momentum book.** `use_profit_target` is `false`
+in both momentum strategy files, which covers books A, B and E (item A2). A
+position leaves by its stop or at the close and by nothing else, because two
+independent studies found that a target destroys this strategy's edge: the few
+trades that run a long way are what pay for all the small losses. It is `true`
+everywhere else, so the insider and Congress books still take targets, and it is
+`true` in the shared settings file for that reason.
+
+**The close is two stages now** (item A11). `must_flatten_now` says yes from
+`flatten_at`, which is 15:45 in the momentum books, and from that moment the
+loop closes positions with limit orders sitting at the bid or the ask.
+`must_flatten_at_market_now` is the new one, and it says yes from
+`flatten_market_at`, 15:55, which is when anything still open goes out at market
+as the backstop. That second function is the one the loop actually asks, to pick
+between the two stages. Both are always false for a book that holds overnight. Spreads widen and depth thins in the last few
+minutes, so a market order into that pays for the hurry. But being flat matters
+more than the last few cents, and that is what the backstop is for.
 
 ## The five books
 
@@ -158,14 +334,17 @@ they worked before books existed. `g.book_id` says which book it is and
 
 Three differences between books are worth knowing about:
 
-- **Books C and D hold overnight.** `flat_by_close` is false for them, so
-  `must_flatten_now` never says yes and the 15:55 sell-everything rule does not
-  apply. They are still barred from opening anything new after 15:50, which is
-  the `entry_window` rule doing its normal job.
-- **Books A, B and E may short.** They are the only ones with
-  `allow_shorts: true`, and shorting brings three extra checks with it: the
-  mirrored stop above the entry price, the 10 dollar floor, and the borrow
-  confirmation from IBKR.
+- **Books C and D hold overnight.** `flat_by_close` is false for them, so neither
+  `must_flatten_now` nor `must_flatten_at_market_now` ever says yes, and the
+  two stage close at 15:45 and 15:55 does not apply. They are still barred from
+  opening anything new after 15:50, which is the `entry_window` rule doing its
+  normal job.
+- **No book shorts today.** The momentum books are the ones the machinery was
+  built for, and every check a short needs is written and tested: the mirrored
+  stop above the entry price, the 10 dollar floor, and the three part borrow
+  confirmation from IBKR. But `allow_shorts` is `false` in all four strategy
+  files, because item A10 is **pending Mo's decision** rather than settled. A
+  short is refused today with rule id `no_shorts`. See the section at the bottom.
 - **Every book is in `dry_run` mode today, and promotion is a hand edit.** See
   the next section.
 
@@ -182,7 +361,8 @@ A book's `mode` in `config/books.yaml` is one of three words.
 `BookConfig.effective_capital()` is the one place that answers "how much money
 does this book actually have today", and `load_book_guardrails()` uses it to set
 `money.starting_equity`. So a book on `tiny` really is held to 2,000 dollars all
-the way down: its 15 percent per position cap becomes 300 dollars, not 15,000.
+the way down: its 10 percent per position cap becomes 200 dollars, not 10,000,
+and the 0.25 percent it risks on a trade becomes 5 dollars, not 250.
 `BookConfig.sends_orders` is the short way to ask whether anything reaches the
 broker, and it is false on `dry_run`.
 
@@ -216,21 +396,26 @@ Three things trip people up:
 
 1. Percentages are written as whole numbers. Ten percent is `10`, not `0.10`.
    Anything at or below 0, or above 100, is rejected with a message saying so.
-2. Times need quotation marks. Write `"11:00"`, not `11:00`. Without them the
+2. Times need quotation marks. Write `"10:15"`, not `10:15`. Without them the
    yaml format turns a time into a number, and the file refuses to load with a
    message telling you to put the quotation marks back.
 3. The times have to run forwards: `scan_start`, then `pick_time`, then
-   `entries_until`, then `flatten_at`, then `market_close`. Out of order and the
-   file will not load.
+   `entries_until`, then `flatten_at`, then `flatten_market_at` for a book that
+   has one, then `market_close`. Out of order and the file will not load. The
+   fast polling window has the same rule to itself: `fast_poll_from` has to come
+   before `fast_poll_until`, and either both are set or neither is.
 
 If you get a setting wrong, nothing silently misbehaves: the agent stops on
 startup and tells you which setting in which file is the problem and what a
 valid value looks like.
 
 Some names look like limits but are not checked on individual orders:
-`universe.price_floor`, `universe.min_avg_dollar_volume` and everything under
+`universe.price_floor`, `universe.min_avg_dollar_volume`, the volatility filter
+`universe.min_atr_usd` and `universe.min_atr_pct_of_price` (item A3), the hard
+exclusions such as `universe.exclude_spacs` (item A12), and everything under
 `scanner:` shape the morning shortlist instead, so they belong to the scanner
-rather than to this file.
+rather than to this file. The one exclusion that is also an order check is
+halting, which is live at the moment of the order as rule `halted`.
 
 ## How to run the tests
 
@@ -247,11 +432,12 @@ Or in one line from anywhere:
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python -m pytest -q
 ```
 
-You want to see something ending in `492 passed`. It takes under a second, and
-no account or internet connection is needed. Run it after changing any number in
-any of the yaml files: several tests read the real settings, the real register
+You want to see something ending in `1292 passed`. It takes about half a minute,
+and no account or internet connection is needed. Run it after changing any number
+in any of the yaml files: several tests read the real settings, the real register
 of books and all four strategy files, so they will tell you straight away if a
-change broke something.
+change broke something. The Momentum v2 rules have a test file of their own,
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_momentum_v2.py`.
 
 To see the individual test names as they run, swap `-q` for `-v`. To run one
 group, name it:
@@ -380,10 +566,11 @@ Written down here so they can be argued with rather than discovered later.
 - Market hours run from `scan_start` to `market_close`. There is no separate
   setting for the market open, and in the proposed numbers `scan_start` is
   09:30, so it does the job. 09:30 counts as open, 16:00 counts as shut.
-- Landing exactly on a limit is allowed, except for the loss cap. An order worth
-  exactly 15,000 dollars goes through, and so does a short at exactly the 10
-  dollar floor. A loss of exactly 2 percent counts as hit and stops new trades,
-  because that is what a cap is for.
+- Landing exactly on a limit is allowed, except for the loss caps. An order worth
+  exactly 10,000 dollars goes through, and so does a short at exactly the 10
+  dollar floor. A loss of exactly the book's daily cap counts as hit and stops
+  new trades, and so does exactly the weekly or monthly one, because that is what
+  a cap is for.
 - Weekends are handled, holidays are not. Saturday and Sunday are refused, but
   this file has never heard of Thanksgiving, so it would think the market is
   open that day. Something upstream needs a holiday calendar before any of this
@@ -407,11 +594,12 @@ Five more, added on 2026-09-06 with the books:
   is true in the two books that short and absent everywhere else. A book that
   never shorts does not need to carry the rule, and the shared settings file
   keeps working exactly as it did.
-- The momentum books have no trailing stop numbers. `docs/STRATEGY.md` offers "a
-  target or a trailing rule" and sets no numbers for either, and the book is
-  flat by 15:55 anyway, so both settings are left empty rather than invented.
-  Write a pair of numbers into the strategy file and the trailing stop switches
-  itself on.
+- The momentum books have no trailing stop numbers, and since Momentum v2 they
+  have no profit target either. Item A2 removed the target outright, and with no
+  target and a stop this tight there is nothing a trailing rule could add before
+  the 15:45 flatten, so both settings are left empty rather than invented. Write
+  a pair of numbers into the strategy file and the trailing stop switches itself
+  on.
 
 Five more, added on 2026-09-06 with Mo's decisions on liquidity, borrowing,
 modes and day trades:
@@ -458,6 +646,32 @@ Two more, added on 2026-09-06 with the review team's two blocking findings:
   quietly stops setting the fields, this rule stops protecting anything, which
   is the one weak spot in it and is written down here rather than hidden.
 
+Three more, added on 2026-09-06 with Momentum v2:
+
+- **The sector cap depends on IBKR reporting an industry, and a name with no
+  industry simply cannot be entered.** The rule counts money per industry, so a
+  name it cannot file under one is refused rather than counted as harmless. That
+  is the same answer an unknown halt status gets and it errs the safe way, but it
+  does mean the broker's contract details can quietly cost us a trade. It will
+  not be quiet in practice: the scanner names every shortlisted symbol that came
+  back without an industry in its own log, and the refusal writes a `sector_cap`
+  row with a sentence saying nobody told the check which industry the name is in.
+  Getting out of such a name is never blocked.
+- **The account wide symbol cap has a fallback, and it is the safe direction.**
+  The rule counts a ticker across all five books, and the loop supplies the two
+  figures it needs: what the five are worth together and what each of them holds
+  in each name. It reads all five book files once a tick, in `read_account_wide`,
+  because five books each reading five files would be twenty five reads. A
+  caller that does not supply them, which is any test that builds an
+  `AccountState` by hand, gets this book's own equity instead. That is the
+  smaller number and so the tighter cap: being too strict is the right direction
+  for a limit to be wrong in.
+- **The three loss limits pause, they do not halt.** Weekly, monthly and streak
+  all refuse entries and leave every exit alone, and none of them clears itself.
+  A paused book stays paused until Mo has looked at it, which is the point: the
+  thing the rule is reporting is that something needs a human, not that today
+  went badly.
+
 ## Shorting, and where it stands now
 
 The strategy spec was changed on 2026-09-02 to propose shorting with mirrored
@@ -466,8 +680,11 @@ because turning the switch on before the machinery existed would have half
 worked, which is the worst of the three options. The machinery now exists, built
 on 2026-09-06:
 
-- `stop_price_for` takes a side. For a short it returns a stop 1.5 percent above
-  the entry price, or the high of the opening five minutes if that is nearer.
+- `stop_price_for` takes a side, and every stop rule is mirrored for a short. It
+  returns a stop 10 percent of the average true range above the entry price,
+  pushed up to the opening range high if it would otherwise sit inside the range,
+  and it falls back to `risk.stop_loss_pct` above entry when no average true
+  range is known. The answer is always above the entry price.
 - The gross exposure cap measures longs and shorts added together against the
   book, and refuses an entry that would push the total past 100 percent.
 - The 10 dollar floor for shorts and the borrow confirmation from IBKR are both
@@ -476,16 +693,20 @@ on 2026-09-06:
   easy to borrow rule in the table above: the broker's own borrowing level, what
   the borrow costs, and how many shares are actually there to borrow.
 
-So `allow_shorts: true` now lives in the two momentum strategy files,
+So the machinery is finished and the switch is still off. `allow_shorts: false`
+sits in both momentum strategy files,
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_hybrid/strategy.yaml`
 and
-`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_rules/strategy.yaml`.
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_rules/strategy.yaml`,
+as well as in `config/guardrails.yaml`, which is the shared floor every book
+starts from. The insider and Congress books are long only for a different reason:
+insider and Congress selling are not usable signals.
 
-`config/guardrails.yaml` still says `allow_shorts: false` and stays that way. It
-is the shared floor every book starts from, and the two books that short say so
-themselves. The insider and Congress books are long only, because insider and
-Congress selling are not usable signals.
+**Item A10 is pending Mo's decision, not a decided deferral.** The reason it is
+still open is the short sale restriction under Rule 201. It triggers on a 10
+percent fall and then forbids shorting at or below the bid for two days, and a
+gap down name on heavy volume is exactly that population, so a "break below the
+opening range low" short may not be fillable the way the strategy describes it.
 
-The numbers are still provisional, like everything else here. What has changed
-is that switching them on is now a decision about the strategy rather than a
-gap in the code.
+Everything the code needs already exists, so this is one line to flip once Mo
+decides. Until then a short is refused with rule id `no_shorts`.

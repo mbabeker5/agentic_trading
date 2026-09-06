@@ -1,10 +1,25 @@
 """Tests for the scanner's number filters, run on made up bars.
 
 The scanner itself talks to IB Gateway, but the arithmetic it does with the bars
-Gateway hands back does not, and that arithmetic is where Mo's two decisions of
-2026-09-06 live: the liquidity floor of 20 million dollars of average daily
-trading over 30 sessions, and the relative volume floor of 2 times normal
-measured at 09:35.
+Gateway hands back does not, and that arithmetic is where Mo's decisions live:
+the liquidity floor of 20 million dollars of average daily trading over 30
+sessions, the relative volume floor of 2 times normal measured at 09:35, and the
+Momentum v2 changes approved on 2026-09-06.
+
+Momentum v2 added four things these tests cover:
+
+    A3   a volatility floor, a 14 day average true range above 50 cents and
+         above 1.5 percent of the price
+    A4   the shortlist ranked by relative volume alone, heaviest first, with a
+         rank number on every row
+    A5   long or short taken from the sign of the 9:30 to 9:35 candle, and no
+         trade at all on a flat one
+    A12  hard exclusions: SPACs, warrants, rights, preferred shares, anything
+         not on a US venue, anything halted, and anything without 30 completed
+         sessions of history
+
+and took one thing away: the Finviz cross-check (decision D7), which is gone
+from the scanner entirely and has a test below making sure it stays gone.
 
 So these tests build bars by hand and check the sums. Nothing here connects to
 Gateway, needs the market to be open, or needs a data subscription.
@@ -23,19 +38,33 @@ import pytest
 import yaml
 
 from agent.scanner import (
+    DEFAULT_ATR_DAYS,
     DEFAULT_DOLLAR_VOLUME_SESSIONS,
+    DEFAULT_MIN_ATR_PCT_OF_PRICE,
+    DEFAULT_MIN_ATR_USD,
     DEFAULT_MIN_AVG_DOLLAR_VOLUME,
+    DEFAULT_MIN_HISTORY_SESSIONS,
+    DEFAULT_REL_VOLUME_BASELINE_DAYS,
+    DEFAULT_REL_VOLUME_WINDOW,
     MIN_DAILY_BARS_FOR_AVERAGE,
     REL_VOLUME_ANCHOR_LABEL,
     REL_VOLUME_ANCHOR_MINUTES,
     SESSION_MINUTES,
     Thresholds,
     average_dollar_volume,
+    average_true_range,
     bar_dollar_volume,
+    direction_from_candle,
     expected_volume_by,
+    halt_flag_from_details,
     human_dollars,
     load_thresholds,
+    preferred_reason,
     relative_volume,
+    right_reason,
+    spac_reason,
+    true_range,
+    warrant_reason,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +179,165 @@ def test_unreadable_bars_are_skipped_rather_than_counted_as_zero():
 def test_asking_for_no_sessions_at_all_is_refused():
     with pytest.raises(ValueError, match="at least one"):
         average_dollar_volume(sessions(30, 50.0, 500_000), 0)
+
+
+# ---------------------------------------------------------------------------
+# The average true range, which is the volatility floor (change A3)
+# ---------------------------------------------------------------------------
+
+
+def range_bar(close: float, high: float, low: float) -> FakeBar:
+    """One session with a high and a low worth measuring."""
+    return FakeBar(date=date(2026, 7, 1), close=close, volume=500_000.0,
+                   high=high, low=low)
+
+
+def steady_sessions(count: int, close: float, spread: float) -> list[FakeBar]:
+    """`count` sessions that all close at the same price and range `spread`."""
+    return [
+        range_bar(close, close + spread / 2, close - spread / 2)
+        for _ in range(count)
+    ]
+
+
+def test_one_quiet_session_ranges_from_its_low_to_its_high():
+    """No gap, so the plain high minus low is the biggest of the three."""
+    bar = range_bar(close=50.0, high=51.0, low=49.5)
+    assert true_range(bar, previous_close=50.0) == pytest.approx(1.5)
+
+
+def test_a_gap_up_counts_from_yesterdays_close_not_from_todays_low():
+    """This is the term a naive high minus low misses.
+
+    Yesterday closed at 20. Today opened at 24 and traded between 24 and 25, so
+    the high to low range is only 1 dollar, but anyone holding it overnight
+    lived through a 5 dollar move. The true range is that 5.
+    """
+    bar = range_bar(close=24.5, high=25.0, low=24.0)
+    assert true_range(bar, previous_close=20.0) == pytest.approx(5.0)
+
+
+def test_a_gap_down_counts_the_same_way():
+    """Closed at 30, opened at 26 and traded 25.5 to 26.5. The move is 4.5."""
+    bar = range_bar(close=26.0, high=26.5, low=25.5)
+    assert true_range(bar, previous_close=30.0) == pytest.approx(4.5)
+
+
+def test_a_session_with_no_previous_close_has_no_true_range():
+    assert true_range(range_bar(50.0, 51.0, 49.0), None) is None
+
+
+def test_a_bar_with_no_high_or_low_has_no_true_range():
+    assert true_range(FakeBar(date(2026, 7, 1), 50.0, 500_000), 50.0) is None
+
+
+def test_fourteen_flat_sessions_average_to_their_own_range():
+    """Every session ranges 1 dollar and closes flat, so the ATR is 1 dollar."""
+    atr, used = average_true_range(steady_sessions(20, 50.0, 1.0), 14)
+    assert atr == pytest.approx(1.0)
+    assert used == 14
+
+
+def test_the_first_bar_is_only_there_to_be_the_previous_close():
+    """Fifteen bars give fourteen true ranges, because the first has no yesterday."""
+    atr, used = average_true_range(steady_sessions(15, 50.0, 2.0), 14)
+    assert atr == pytest.approx(2.0)
+    assert used == 14
+
+    atr, used = average_true_range(steady_sessions(14, 50.0, 2.0), 14)
+    assert atr is None, "fourteen bars is only thirteen true ranges"
+    assert used == 13
+
+
+def test_the_gap_term_pulls_the_average_up():
+    """Thirteen quiet sessions and then one that gapped.
+
+    Twelve true ranges of 1 dollar and one of 5 dollars, over 13 sessions, is an
+    average of about 1.31 dollars. A high minus low average would have said 1.
+    """
+    bars = steady_sessions(13, 20.0, 1.0)
+    bars.append(range_bar(close=24.5, high=25.0, low=24.0))
+    atr, used = average_true_range(bars, 13)
+    assert used == 13
+    assert atr == pytest.approx((12 * 1.0 + 5.0) / 13)
+
+
+def test_only_the_most_recent_days_count_towards_the_atr():
+    calm = steady_sessions(30, 50.0, 0.2)
+    wild = steady_sessions(14, 50.0, 3.0)
+    atr, used = average_true_range(calm + wild, 14)
+    assert atr == pytest.approx(3.0)
+    assert used == 14
+
+
+def test_a_name_with_too_little_history_gets_no_atr_at_all():
+    atr, used = average_true_range(steady_sessions(8, 50.0, 1.0), 14)
+    assert atr is None
+    assert used == 7
+
+
+def test_asking_for_no_atr_days_at_all_is_refused():
+    with pytest.raises(ValueError, match="at least one"):
+        average_true_range(steady_sessions(20, 50.0, 1.0), 0)
+
+
+def test_the_atr_defaults_are_the_approved_numbers():
+    assert DEFAULT_ATR_DAYS == 14
+    assert DEFAULT_MIN_ATR_USD == 0.50
+    assert DEFAULT_MIN_ATR_PCT_OF_PRICE == 1.5
+
+
+def passes_volatility_floor(bars: list[FakeBar], price: float) -> bool:
+    """The same two part test the scanner applies, on its own so it can be read."""
+    atr, _ = average_true_range(bars, DEFAULT_ATR_DAYS)
+    if atr is None:
+        return False
+    return atr >= DEFAULT_MIN_ATR_USD and (atr / price * 100.0) >= (
+        DEFAULT_MIN_ATR_PCT_OF_PRICE
+    )
+
+
+def test_a_name_that_moves_enough_in_both_ways_clears_the_volatility_floor():
+    """A 40 dollar stock that ranges a dollar a day is 2.5 percent. Fine."""
+    assert passes_volatility_floor(steady_sessions(20, 40.0, 1.0), 40.0) is True
+
+
+def test_a_penny_of_daily_range_fails_the_fifty_cent_half():
+    """A 3 dollar stock ranging 20 cents is 6.7 percent of its price, which
+    clears the percentage half, and is still far too small to trade."""
+    bars = steady_sessions(20, 3.0, 0.20)
+    atr, _ = average_true_range(bars, DEFAULT_ATR_DAYS)
+    assert atr == pytest.approx(0.20)
+    assert atr / 3.0 * 100.0 > DEFAULT_MIN_ATR_PCT_OF_PRICE
+    assert passes_volatility_floor(bars, 3.0) is False
+
+
+def test_a_quiet_large_cap_fails_the_percentage_half():
+    """A 400 dollar stock ranging 2 dollars is 5 times the 50 cent floor in
+    dollars and only half a percent of its price, which is noise."""
+    bars = steady_sessions(20, 400.0, 2.0)
+    atr, _ = average_true_range(bars, DEFAULT_ATR_DAYS)
+    assert atr == pytest.approx(2.0)
+    assert atr > DEFAULT_MIN_ATR_USD
+    assert passes_volatility_floor(bars, 400.0) is False
+
+
+def test_a_name_with_no_atr_at_all_fails_the_floor():
+    """Not measurable means not traded, which is the safe answer."""
+    assert passes_volatility_floor(steady_sessions(5, 40.0, 2.0), 40.0) is False
+
+
+def test_landing_exactly_on_either_half_is_allowed():
+    """At or above, not above, which is what the numbers in the spec mean."""
+    # 50 cents of range on the nose, on a 20 dollar stock, so 2.5 percent.
+    on_the_dollar_line = steady_sessions(20, 20.0, 0.50)
+    assert average_true_range(on_the_dollar_line, 14)[0] == pytest.approx(0.50)
+    assert passes_volatility_floor(on_the_dollar_line, 20.0) is True
+
+    # 1.5 percent on the nose, on a 100 dollar stock, so 1.50 of range.
+    on_the_percentage_line = steady_sessions(20, 100.0, 1.50)
+    assert average_true_range(on_the_percentage_line, 14)[0] == pytest.approx(1.50)
+    assert passes_volatility_floor(on_the_percentage_line, 100.0) is True
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +531,109 @@ def test_the_thresholds_written_into_the_output_name_the_anchor():
 
 
 # ---------------------------------------------------------------------------
+# The Momentum v2 settings: the volatility floor and the hard exclusions
+# ---------------------------------------------------------------------------
+
+
+def test_the_momentum_v2_defaults_are_the_approved_numbers():
+    thresholds = Thresholds()
+    assert thresholds.atr_days == 14
+    assert thresholds.min_atr_usd == 0.50
+    assert thresholds.min_atr_pct_of_price == 1.5
+    assert thresholds.min_history_sessions == 30
+    assert thresholds.exclude_spacs is True
+    assert thresholds.exclude_warrants_and_rights is True
+    assert thresholds.exclude_preferred is True
+    assert thresholds.require_us_primary_listing is True
+    assert thresholds.exclude_halted is True
+
+
+def test_the_relative_volume_window_is_recorded_even_though_it_is_not_used_here():
+    """The real 9:30 to 9:35 measurement is agent/preopen.py's job.
+
+    These two are carried for the record, so a shortlist says what window the
+    strategy is actually about, even when this scanner had to fall back to
+    measuring the same idea from daily bars.
+    """
+    thresholds = Thresholds()
+    assert thresholds.rel_volume_window == DEFAULT_REL_VOLUME_WINDOW == "09:30-09:35"
+    assert thresholds.rel_volume_baseline_days == DEFAULT_REL_VOLUME_BASELINE_DAYS == 14
+    written = thresholds.as_dict()
+    assert written["rel_volume_window"] == "09:30-09:35"
+    assert written["rel_volume_baseline_days"] == 14
+
+
+def test_every_momentum_v2_number_reaches_the_written_output():
+    """A run has to be readable back afterwards, so all of them are published."""
+    written = Thresholds().as_dict()
+    for key, expected in (
+        ("atr_days", 14),
+        ("min_atr_usd", 0.50),
+        ("min_atr_pct_of_price", 1.5),
+        ("min_history_sessions", 30),
+        ("exclude_spacs", True),
+        ("exclude_warrants_and_rights", True),
+        ("exclude_preferred", True),
+        ("require_us_primary_listing", True),
+        ("exclude_halted", True),
+    ):
+        assert written[key] == expected, key
+
+
+def test_the_settings_file_can_move_the_volatility_floor(tmp_path: Path):
+    data = yaml.safe_load(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+    data["universe"]["atr_days"] = 21
+    data["universe"]["min_atr_usd"] = 0.75
+    data["universe"]["min_atr_pct_of_price"] = 2.0
+    data["universe"]["min_history_sessions"] = 40
+    path = tmp_path / "volatile.yaml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    thresholds = load_thresholds(path)
+    assert thresholds.atr_days == 21
+    assert thresholds.min_atr_usd == 0.75
+    assert thresholds.min_atr_pct_of_price == 2.0
+    assert thresholds.min_history_sessions == 40
+
+
+def test_a_settings_file_with_no_volatility_keys_falls_back_to_the_defaults(
+    tmp_path: Path,
+):
+    """The shipped file may not carry these yet, and that must not break a run."""
+    data = yaml.safe_load(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+    for key in ("atr_days", "min_atr_usd", "min_atr_pct_of_price",
+                "min_history_sessions", "exclude_spacs",
+                "exclude_warrants_and_rights", "exclude_preferred",
+                "require_us_primary_listing", "exclude_halted"):
+        data["universe"].pop(key, None)
+    path = tmp_path / "bare.yaml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    thresholds = load_thresholds(path)
+    assert thresholds.atr_days == DEFAULT_ATR_DAYS
+    assert thresholds.min_atr_usd == DEFAULT_MIN_ATR_USD
+    assert thresholds.min_atr_pct_of_price == DEFAULT_MIN_ATR_PCT_OF_PRICE
+    assert thresholds.min_history_sessions == DEFAULT_MIN_HISTORY_SESSIONS
+    assert thresholds.exclude_spacs is True
+    assert thresholds.require_us_primary_listing is True
+
+
+def test_a_switch_written_out_in_words_is_read_as_words(tmp_path: Path):
+    """bool("no") is True in Python, which would turn a switch back on."""
+    data = yaml.safe_load(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+    data["universe"]["exclude_spacs"] = "no"
+    data["universe"]["exclude_preferred"] = "off"
+    data["universe"]["exclude_halted"] = "yes"
+    path = tmp_path / "words.yaml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    thresholds = load_thresholds(path)
+    assert thresholds.exclude_spacs is False
+    assert thresholds.exclude_preferred is False
+    assert thresholds.exclude_halted is True
+
+
+# ---------------------------------------------------------------------------
 # The words a person reads
 # ---------------------------------------------------------------------------
 
@@ -417,7 +708,6 @@ from agent.scanner import (  # noqa: E402
     DIRECTION_LONG,
     DIRECTION_SHORT,
     ENRICHMENT_CAP,
-    FINVIZ_FLAG,
     FORBIDDEN_SCAN_CODES,
     HISTORY_REQUEST_BUDGET,
     SCAN_CODES,
@@ -425,9 +715,7 @@ from agent.scanner import (  # noqa: E402
     SCANNER_REQUESTS_PER_RUN,
     TOTAL_REQUEST_RATION,
     Candidate,
-    FinvizSettings,
     OpeningMomentumScanner,
-    parse_finviz_csv,
 )
 
 EASTERN = ZoneInfo("America/New_York")
@@ -500,10 +788,21 @@ class FakeContract:
 
 
 class FakeContractDetails:
-    def __init__(self, contract, long_name="Example Corp", stock_type="COMMON"):
+    """The three industry fields are here because IBKR really does send them.
+
+    It does not always fill all three in, which is the whole reason the scanner
+    tries them in order, so every one of them can be set to "" in a test.
+    """
+
+    def __init__(self, contract, long_name="Example Corp", stock_type="COMMON",
+                 industry="Technology", category="Computers",
+                 subcategory="Computer Software"):
         self.contract = contract
         self.longName = long_name
         self.stockType = stock_type
+        self.industry = industry
+        self.category = category
+        self.subcategory = subcategory
 
 
 class FakeRow:
@@ -789,28 +1088,48 @@ def today_eastern():
 
 
 def daily_history(today_close: float, today_volume: float = 20_000.0,
-                  normal_close: float = 50.0, normal_volume: float = 500_000.0):
+                  normal_close: float = 50.0, normal_volume: float = 500_000.0,
+                  normal_range: float = 1.0):
     """Thirty quiet sessions and then today.
 
     Thirty at 50 dollars on 500,000 shares is 25 million dollars a day, which
     clears the 20 million floor. 20,000 shares by 09:35 against a 500,000 share
     daily average is about 3.1 times the normal pace, which clears the 2 times
-    floor. So every name built this way passes on liquidity and volume, and the
-    only thing left for the test to be about is direction.
+    floor. Thirty completed sessions is exactly the history the hard exclusions
+    ask for. Each of those sessions ranges a dollar, so the average true range
+    is 1 dollar, which is over the 50 cent floor and over 1.5 percent of every
+    price used below. So every name built this way passes on liquidity, volume,
+    history and volatility, and the only thing left for a test to be about is
+    direction.
     """
     start = today_eastern() - timedelta(days=60)
     bars = [FakeBar(date=start + timedelta(days=n), close=normal_close,
-                    volume=normal_volume) for n in range(30)]
+                    volume=normal_volume,
+                    high=normal_close + normal_range / 2,
+                    low=normal_close - normal_range / 2) for n in range(30)]
     bars.append(FakeBar(date=today_eastern(), close=today_close,
                         volume=today_volume, high=today_close,
                         low=today_close * 0.98))
     return bars
 
 
-def opening_bars(price: float):
+def opening_bars(price: float, candle: str = "up"):
+    """Today's 9:30 to 9:35 candle, made to close up, down or flat.
+
+    The sign of this candle is what decides long or short under change A5, so a
+    test that cares about direction sets it here rather than leaving the open at
+    whatever the dataclass defaults to.
+    """
     open_time = datetime.now(EASTERN).replace(hour=9, minute=30, second=0, microsecond=0)
-    return [FakeBar(date=open_time, close=price, volume=5_000.0,
-                    high=price * 1.01, low=price * 0.99)]
+    if candle == "up":
+        open_price = price * 0.99
+    elif candle == "down":
+        open_price = price * 1.01
+    else:
+        open_price = price
+    return [FakeBar(date=open_time, open=open_price, close=price, volume=5_000.0,
+                    high=max(open_price, price) * 1.002,
+                    low=min(open_price, price) * 0.998)]
 
 
 UNION_ROWS = {
@@ -829,8 +1148,14 @@ UNION_BARS = {
     "LIAR": daily_history(45.0),     # on the gainers list but actually down
 }
 
-UNION_INTRADAY = {symbol: opening_bars(bars[-1].close)
-                  for symbol, bars in UNION_BARS.items()}
+# The opening candle points the same way the day's move does, so these fixtures
+# say the same thing twice and a test about the union is not accidentally a test
+# about the candle rule. The candle tests below set it deliberately.
+UNION_INTRADAY = {
+    symbol: opening_bars(bars[-1].close,
+                         "up" if bars[-1].close > 50.0 else "down")
+    for symbol, bars in UNION_BARS.items()
+}
 
 
 def union_ib(**kwargs):
@@ -981,87 +1306,624 @@ def test_the_run_counts_what_it_spent(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The Finviz cross-check, which is off
+# The volatility floor inside a real run (change A3)
 # ---------------------------------------------------------------------------
 
 
-def test_finviz_is_off_in_the_shipped_settings_file():
-    thresholds = load_thresholds(SHIPPED_CONFIG)
-    assert thresholds.finviz.enabled is False
-    assert thresholds.finviz.auth_token_key == "FINVIZ_AUTH_TOKEN"
-    assert thresholds.finviz.secrets_file == "finviz.env"
-    assert thresholds.as_dict()["finviz_enabled"] is False
+def volatility_history(price: float, daily_range: float, normal_volume: float,
+                       with_ranges: bool = True):
+    """Thirty completed sessions at one price and one daily range, then today.
+
+    with_ranges False leaves the highs and lows off the completed bars, which is
+    what a name looks like when its range cannot be worked out at all.
+    """
+    start = today_eastern() - timedelta(days=60)
+    bars = []
+    for n in range(30):
+        if with_ranges:
+            bars.append(FakeBar(date=start + timedelta(days=n), close=price,
+                                volume=normal_volume,
+                                high=price + daily_range / 2,
+                                low=price - daily_range / 2))
+        else:
+            bars.append(FakeBar(date=start + timedelta(days=n), close=price,
+                                volume=normal_volume))
+    today_close = price * 1.05
+    bars.append(FakeBar(date=today_eastern(), close=today_close,
+                        volume=normal_volume * 0.05, high=today_close, low=price))
+    return bars
 
 
-def test_with_finviz_off_nothing_touches_the_network(monkeypatch):
-    """Off means off: one line in the log and no request at all."""
-    def explode(*args, **kwargs):
-        raise AssertionError("the scanner reached for the network with Finviz off")
+VOLATILITY_ROWS = {
+    "TOP_PERC_GAIN": [("GOOD", 201), ("THIN", 202), ("QUIET", 203), ("NOATR", 204)],
+    "TOP_PERC_LOSE": [],
+    "HOT_BY_VOLUME": [],
+    "HIGH_STVOLUME_5MIN": [],
+}
 
-    monkeypatch.setattr(scanner_module.urllib.request, "urlopen", explode)
+VOLATILITY_BARS = {
+    # 40 dollars, 1.20 of daily range, so 1.20 dollars and about 2.9 percent.
+    "GOOD": volatility_history(40.0, 1.20, 600_000),
+    # 10 dollars, 30 cents of daily range. 2.9 percent of its price, which
+    # clears the percentage half, and under the 50 cent floor, which does not.
+    "THIN": volatility_history(10.0, 0.30, 2_500_000),
+    # 400 dollars, 2 dollars of daily range. Four times the 50 cent floor in
+    # dollars, and half a percent of its price, which is noise.
+    "QUIET": volatility_history(400.0, 2.00, 60_000),
+    # No highs or lows at all, so there is no range to measure.
+    "NOATR": volatility_history(40.0, 1.20, 600_000, with_ranges=False),
+}
 
+VOLATILITY_INTRADAY = {"GOOD": opening_bars(42.0, "up")}
+
+
+def volatility_ib():
+    return FakeIB(rows_by_code=VOLATILITY_ROWS, daily_bars=VOLATILITY_BARS,
+                  intraday_bars=VOLATILITY_INTRADAY)
+
+
+def test_the_volatility_floor_keeps_only_the_name_that_clears_both_halves(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, volatility_ib(), out) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+    counts = written["counts"]
+
+    assert counts["passed_dollar_volume"] == 4, (
+        "all four are liquid enough, so the volatility filter is the only thing "
+        "separating them")
+    assert counts["passed_volatility"] == 1
+    assert [c["symbol"] for c in written["candidates"]] == ["GOOD"]
+
+
+def test_the_written_row_says_what_the_range_actually_was(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, volatility_ib(), out) == 0
+    row = json.loads(out.read_text(encoding="utf-8"))["candidates"][0]
+
+    assert row["atr"] == pytest.approx(1.20)
+    assert row["atr_days_used"] == 14
+    assert row["atr_pct_of_price"] == pytest.approx(1.20 / 42.0 * 100.0, abs=0.01)
+    assert any("dollars in a normal session" in reason for reason in row["reasons"])
+    assert any("percent of its price" in reason for reason in row["reasons"])
+
+
+def test_a_name_without_enough_history_never_reaches_the_filters(monkeypatch, tmp_path):
+    """The rule that replaced the listing age rule Mo rejected.
+
+    Twenty completed sessions is a perfectly liquid, perfectly volatile name. It
+    still comes off the list, because 30 sessions is what it takes to measure it.
+    """
+    bars = volatility_history(40.0, 1.20, 600_000)[-21:]
+    assert len([b for b in bars if b.date != today_eastern()]) == 20
+
+    ib = FakeIB(
+        rows_by_code={"TOP_PERC_GAIN": [("YOUNG", 301)], "TOP_PERC_LOSE": [],
+                      "HOT_BY_VOLUME": [], "HIGH_STVOLUME_5MIN": []},
+        daily_bars={"YOUNG": bars},
+    )
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, ib, out) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+
+    assert written["counts"]["daily_bars_ok"] == 1
+    assert written["counts"]["passed_history"] == 0
+    assert written["candidates"] == []
+
+
+# ---------------------------------------------------------------------------
+# The shortlist is ranked by relative volume, not by the size of the move (A4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_score_is_now_simply_the_relative_volume():
+    scanner = make_scanner(FakeIB())
+    busy = Candidate(symbol="X", con_id=1, gain_pct=2.0, rel_volume=9.4)
+    assert scanner.compute_score(busy) == pytest.approx(9.4)
+
+    # The size of the move no longer enters into it at all.
+    same_volume_bigger_move = Candidate(symbol="Y", con_id=2, gain_pct=25.0,
+                                        rel_volume=9.4)
+    assert scanner.compute_score(same_volume_bigger_move) == pytest.approx(9.4)
+
+
+def test_a_name_with_no_relative_volume_scores_nothing():
+    scanner = make_scanner(FakeIB())
+    assert scanner.compute_score(Candidate(symbol="X", con_id=1)) == 0.0
+
+
+RANK_ROWS = {
+    "TOP_PERC_GAIN": [("MOVER", 401), ("MIDDLE", 402), ("HEAVY", 403)],
+    "TOP_PERC_LOSE": [],
+    "HOT_BY_VOLUME": [],
+    "HIGH_STVOLUME_5MIN": [],
+}
+
+# All three are up on the day and all three clear every floor. The only thing
+# that separates them is how much has traded, and how far they have moved.
+RANK_BARS = {
+    "HEAVY": daily_history(51.0, today_volume=60_000),    # up 2 percent, busiest
+    "MIDDLE": daily_history(52.5, today_volume=30_000),   # up 5 percent
+    "MOVER": daily_history(60.0, today_volume=20_000),    # up 20 percent, quietest
+}
+
+RANK_INTRADAY = {symbol: opening_bars(bars[-1].close, "up")
+                 for symbol, bars in RANK_BARS.items()}
+
+
+def rank_ib():
+    return FakeIB(rows_by_code=RANK_ROWS, daily_bars=RANK_BARS,
+                  intraday_bars=RANK_INTRADAY)
+
+
+def test_the_busiest_name_ranks_first_even_though_it_moved_least(monkeypatch, tmp_path):
+    """This is change A4 in one test.
+
+    MOVER is up 20 percent and HEAVY is up 2 percent, so the old score would
+    have put MOVER at the top. The published edge ranks by relative volume, and
+    HEAVY is trading three times as heavily as MOVER, so it goes first now.
+    """
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, rank_ib(), out) == 0
+    rows = json.loads(out.read_text(encoding="utf-8"))["candidates"]
+
+    assert [row["symbol"] for row in rows] == ["HEAVY", "MIDDLE", "MOVER"]
+    assert [row["rank"] for row in rows] == [1, 2, 3]
+    assert rows[0]["rel_volume"] > rows[1]["rel_volume"] > rows[2]["rel_volume"]
+    assert rows[0]["gain_pct"] < rows[2]["gain_pct"], (
+        "the name that moved most is last, which is the whole point of A4")
+
+
+def test_the_score_written_into_the_file_is_the_relative_volume(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, rank_ib(), out) == 0
+    for row in json.loads(out.read_text(encoding="utf-8"))["candidates"]:
+        assert row["score"] == row["rel_volume"]
+
+
+def test_the_shortlist_is_cut_to_the_top_few_by_relative_volume(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(
+        monkeypatch, rank_ib(), out, extra=()) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+    assert written["counts"]["final"] == 3
+
+    # Now with room for one name only, the busiest one is the one kept.
+    ib = rank_ib()
+    scanner = make_scanner(ib, max_candidates=1)
+    monkeypatch.setattr(
+        scanner_module.OpeningMomentumScanner, "measure_session_progress",
+        _fixed_session_progress)
+    result = asyncio.run(scanner.run("SPY"))
+    assert [c["symbol"] for c in result["candidates"]] == ["HEAVY"]
+    assert result["candidates"][0]["rank"] == 1
+
+
+def test_the_relative_volume_window_reaches_the_written_thresholds(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, rank_ib(), out) == 0
+    thresholds = json.loads(out.read_text(encoding="utf-8"))["thresholds"]
+    assert thresholds["rel_volume_window"] == "09:30-09:35"
+    assert thresholds["rel_volume_baseline_days"] == 14
+    assert thresholds["rel_volume_min"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Direction comes from the 9:30 to 9:35 candle (change A5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_candle_that_closed_above_its_open_is_a_long():
+    assert direction_from_candle(10.0, 10.4) == DIRECTION_LONG
+
+
+def test_a_candle_that_closed_below_its_open_is_a_short():
+    assert direction_from_candle(10.0, 9.6) == DIRECTION_SHORT
+
+
+def test_a_flat_candle_is_no_trade_at_all():
+    """Not a shrug. The strategy says do not trade it, so None means dropped."""
+    assert direction_from_candle(10.0, 10.0) is None
+
+
+def test_a_candle_we_do_not_have_decides_nothing():
+    assert direction_from_candle(None, 10.0) is None
+    assert direction_from_candle(10.0, None) is None
+    assert direction_from_candle("junk", 10.0) is None
+
+
+CANDLE_ROWS = {
+    "TOP_PERC_GAIN": [("RISE", 501), ("FADE", 502), ("FLAT", 503)],
+    "TOP_PERC_LOSE": [],
+    "HOT_BY_VOLUME": [],
+    "HIGH_STVOLUME_5MIN": [],
+}
+
+# All three gapped up 10 percent overnight and all three came off the gainers
+# list, so the old rule would have called all three long. What separates them is
+# what the first five minutes actually did.
+CANDLE_BARS = {symbol: daily_history(55.0) for symbol in ("RISE", "FADE", "FLAT")}
+CANDLE_INTRADAY = {
+    "RISE": opening_bars(55.0, "up"),
+    "FADE": opening_bars(55.0, "down"),
+    "FLAT": opening_bars(55.0, "flat"),
+}
+
+
+def candle_ib():
+    return FakeIB(rows_by_code=CANDLE_ROWS, daily_bars=CANDLE_BARS,
+                  intraday_bars=CANDLE_INTRADAY)
+
+
+def test_the_opening_candle_overrules_the_scan_list_and_the_days_move(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, candle_ib(), out) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+    by_symbol = {row["symbol"]: row for row in written["candidates"]}
+
+    assert by_symbol["RISE"]["direction"] == DIRECTION_LONG
+    assert by_symbol["FADE"]["direction"] == DIRECTION_SHORT, (
+        "it gapped up and came off the gainers list, but the first five minutes "
+        "faded, and the candle is what decides")
+    assert by_symbol["FADE"]["side"] == DIRECTION_SHORT
+    assert written["counts"]["final_long"] == 1
+    assert written["counts"]["final_short"] == 1
+
+
+def test_a_flat_opening_candle_drops_the_name_and_says_so(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, candle_ib(), out) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+
+    assert "FLAT" not in {row["symbol"] for row in written["candidates"]}
+    assert written["counts"]["passed_direction_agrees"] == 3
+    assert written["counts"]["passed_direction_candle"] == 2
+    assert written["counts"]["final"] == 2
+    assert any("FLAT" in warning and "same price" in warning
+               for warning in written["warnings"])
+
+
+def test_the_written_row_carries_the_candle_it_was_judged_on(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, candle_ib(), out) == 0
+    by_symbol = {row["symbol"]: row
+                 for row in json.loads(out.read_text(encoding="utf-8"))["candidates"]}
+
+    rise = by_symbol["RISE"]
+    assert rise["opening_range_open"] < rise["opening_range_close"]
+    fade = by_symbol["FADE"]
+    assert fade["opening_range_open"] > fade["opening_range_close"]
+
+
+def test_a_name_with_no_opening_candle_keeps_the_direction_it_already_had(
+    monkeypatch, tmp_path
+):
+    """The scan list and the day's move stay as the fallback.
+
+    Delayed data at 9:35 has no 9:30 bar yet, which is exactly this case, and a
+    name should not be thrown away for it.
+    """
+    ib = FakeIB(rows_by_code=CANDLE_ROWS, daily_bars=CANDLE_BARS, intraday_bars={})
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, ib, out) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+
+    assert written["counts"]["passed_direction_candle"] == 3
+    for row in written["candidates"]:
+        assert row["direction"] == DIRECTION_LONG
+        assert row["opening_range_open"] is None
+
+
+# ---------------------------------------------------------------------------
+# The hard exclusions (change A12)
+# ---------------------------------------------------------------------------
+
+ORDINARY = ("AAPL", "APPLE INC", "COMMON")
+
+
+def test_an_ordinary_company_survives_all_four_exclusion_tests():
+    """The one that matters most. None of these may fire on a real business."""
+    for check in (spac_reason, warrant_reason, right_reason, preferred_reason):
+        assert check(*ORDINARY) is None, check.__name__
+
+
+def test_a_spac_is_recognised_by_its_name():
+    assert spac_reason("PONO", "PONO CAPITAL ACQUISITION CORP", "COMMON")
+    assert spac_reason("AACT", "ARES ACQUISITION HOLDINGS II", "COMMON")
+    assert spac_reason("XYZ", "XYZ SPAC LTD", "COMMON")
+
+
+def test_a_company_that_merely_says_space_is_not_a_spac():
+    """SPAC is matched as a whole word, so SPACE and SPACEX are left alone."""
+    assert spac_reason("SPCE", "VIRGIN GALACTIC SPACE HOLDINGS", "COMMON") is None
+    assert spac_reason("RKLB", "ROCKET LAB SPACE SYSTEMS", "COMMON") is None
+
+
+def test_a_warrant_is_recognised_three_different_ways():
+    assert warrant_reason("ABCDW", "SOMETHING CORP", "COMMON"), "the NASDAQ fifth letter"
+    assert warrant_reason("ABCD", "SOMETHING CORP WARRANT", "COMMON"), "the name"
+    assert warrant_reason("ABCD", "SOMETHING CORP", "WAR"), "IBKR's own stock type"
+    assert warrant_reason("BRK.WS", "SOMETHING CORP", "COMMON"), "the NYSE suffix"
+    assert warrant_reason("ABC+", "SOMETHING CORP", "COMMON"), "the plus suffix"
+
+
+def test_an_ordinary_ticker_ending_in_w_is_not_read_as_a_warrant():
+    """A judgement call, and the same one the rights rule makes.
+
+    A bare trailing W only means a warrant in the NASDAQ convention of a fifth
+    letter on a four letter root. Reading it on any ticker would throw out these
+    three real companies every single morning.
+    """
+    assert warrant_reason("LOW", "LOWES COMPANIES INC", "COMMON") is None
+    assert warrant_reason("DOW", "DOW INC", "COMMON") is None
+    assert warrant_reason("GLW", "CORNING INC", "COMMON") is None
+    assert warrant_reason("SNOW", "SNOWFLAKE INC", "COMMON") is None
+
+
+def test_a_rights_line_needs_the_name_to_say_so_as_well_as_the_ticker():
+    assert right_reason("ABCR", "SOMETHING CORP RIGHTS", "COMMON")
+    assert right_reason("ABC.RT", "SOMETHING CORP RIGHT", "COMMON")
+
+
+def test_an_ordinary_ticker_ending_in_r_is_left_alone():
+    """Dropping on the letter alone would throw out real businesses."""
+    assert right_reason("PLTR", "PALANTIR TECHNOLOGIES INC", "COMMON") is None
+    assert right_reason("BLDR", "BUILDERS FIRSTSOURCE INC", "COMMON") is None
+    assert right_reason("CLX", "THE CLOROX COMPANY", "COMMON") is None
+
+
+def test_a_preferred_share_is_recognised_by_name_ticker_or_type():
+    assert preferred_reason("ABC", "SOMETHING CORP PREFERRED SERIES A", "COMMON")
+    assert preferred_reason("ABC", "SOMETHING CORP PFD SER B", "COMMON")
+    assert preferred_reason("BAC.PRK", "BANK OF AMERICA CORP", "COMMON")
+    assert preferred_reason("BAC-PRB", "BANK OF AMERICA CORP", "COMMON")
+    assert preferred_reason("ABC", "SOMETHING CORP", "PREFERRED")
+
+
+def test_a_company_whose_ticker_merely_starts_with_pr_is_left_alone():
+    """Plain PR inside a ticker would catch Prudential, so a separator is needed."""
+    assert preferred_reason("PRU", "PRUDENTIAL FINANCIAL INC", "COMMON") is None
+    assert preferred_reason("PG", "PROCTER AND GAMBLE CO", "COMMON") is None
+
+
+def excluded(scanner, symbol, long_name, stock_type="COMMON"):
+    candidate = Candidate(symbol=symbol, con_id=1, long_name=long_name,
+                          stock_type=stock_type)
+    return scanner.exclusion_verdict(candidate)
+
+
+def test_the_verdict_gathers_all_four_tests_behind_one_answer():
+    scanner = make_scanner(FakeIB())
+    assert excluded(scanner, "AAPL", "APPLE INC") is None
+    assert excluded(scanner, "PONO", "PONO CAPITAL ACQUISITION CORP")
+    assert excluded(scanner, "ABCDW", "SOMETHING CORP")
+    assert excluded(scanner, "ABCR", "SOMETHING CORP RIGHTS")
+    assert excluded(scanner, "BAC.PRK", "BANK OF AMERICA CORP")
+
+
+def test_each_exclusion_can_be_switched_off_on_its_own():
+    scanner = make_scanner(FakeIB(), exclude_spacs=False)
+    assert excluded(scanner, "PONO", "PONO CAPITAL ACQUISITION CORP") is None
+    assert excluded(scanner, "ABCDW", "SOMETHING CORP"), "the others still fire"
+
+    scanner = make_scanner(FakeIB(), exclude_warrants_and_rights=False)
+    assert excluded(scanner, "ABCDW", "SOMETHING CORP") is None
+    assert excluded(scanner, "ABCR", "SOMETHING CORP RIGHTS") is None
+
+    scanner = make_scanner(FakeIB(), exclude_preferred=False)
+    assert excluded(scanner, "BAC.PRK", "BANK OF AMERICA CORP") is None
+
+
+def test_a_halted_name_is_dropped_when_ibkr_actually_says_so():
+    scanner = make_scanner(FakeIB())
+    scanner.halt_flags["HALT"] = True
+    assert excluded(scanner, "HALT", "SOMETHING CORP") == "IBKR reported it as halted"
+
+    scanner.halt_flags["HALT"] = False
+    assert excluded(scanner, "HALT", "SOMETHING CORP") is None
+
+
+def test_contract_details_are_read_for_a_halt_flag_without_inventing_one():
+    class NoFlag:
+        contract = None
+
+    class WithFlag:
+        contract = None
+
+        def __init__(self, value):
+            self.halted = value
+
+    assert halt_flag_from_details(NoFlag()) is None, "no field means not known"
+    assert halt_flag_from_details(WithFlag(0)) is False
+    assert halt_flag_from_details(WithFlag(1)) is True
+    assert halt_flag_from_details(WithFlag(2)) is True
+    assert halt_flag_from_details(WithFlag(True)) is True
+
+
+def test_the_run_says_plainly_that_it_could_not_check_for_a_halt(monkeypatch, tmp_path):
+    """IBKR's contract details carry no halt flag on this account.
+
+    So the run must say so rather than implying it looked and found nothing, and
+    it must point at the check that really runs, on the order path.
+    """
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, union_ib(), out) == 0
+    warnings = json.loads(out.read_text(encoding="utf-8"))["warnings"]
+
+    halt_note = next(w for w in warnings if "halt check could not be made" in w)
+    assert "guardrails.py" in halt_note
+    assert "tick type 49" in halt_note
+
+
+def test_a_name_on_a_foreign_venue_is_dropped_as_not_a_us_listing():
+    """The US listing test is what keeps OTC and non-US lines out."""
     ib = FakeIB()
     scanner = make_scanner(ib)
-    assert scanner.thresholds.finviz.enabled is False
-    asyncio.run(scanner.collect_candidates())
-
-    assert scanner.finviz_report["symbols_added"] == 0
-    assert scanner.finviz_report["symbols"] == []
-    assert "off" in scanner.finviz_report["note"]
-    assert not any(code == FINVIZ_FLAG for code, _ in ib.requested)
+    assert scanner.thresholds.require_us_primary_listing is True
+    assert "NYSE" in scanner_module.ALLOWED_PRIMARY_EXCHANGES
+    assert "PINK" not in scanner_module.ALLOWED_PRIMARY_EXCHANGES
+    assert "OTC" not in scanner_module.ALLOWED_PRIMARY_EXCHANGES
+    assert "LSE" not in scanner_module.ALLOWED_PRIMARY_EXCHANGES
 
 
-def test_with_finviz_off_no_candidate_is_flagged_by_it(monkeypatch, tmp_path):
+def test_there_is_no_listing_age_rule_anywhere_in_the_scanner():
+    """Mo rejected it. History requirements replaced it, and this pins that.
+
+    A name is judged on whether it has enough sessions to be measured, which is
+    min_history_sessions and the ATR window, not on how recently it listed.
+    """
+    source = (PROJECT_ROOT / "agent" / "scanner.py").read_text(encoding="utf-8")
+    for phrase in ("days_since_listing", "listing_age", "min_listing_days"):
+        assert phrase not in source, phrase
+    assert Thresholds().min_history_sessions == 30
+
+
+# ---------------------------------------------------------------------------
+# The Finviz cross-check is gone and must stay gone (decision D7)
+# ---------------------------------------------------------------------------
+
+
+def test_nothing_in_the_scanner_reaches_for_finviz_any_more():
+    """Mo decided not to buy Finviz Elite, so the whole path came out.
+
+    The word is allowed to survive in exactly one place: the note near the top
+    of the file explaining that the path was deleted on purpose, so nobody adds
+    it back thinking its absence was an oversight. Anywhere else, in any line of
+    real code, means the path has crept back in.
+    """
+    path = PROJECT_ROOT / "agent" / "scanner.py"
+    mentions = [
+        (number, line)
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if "finviz" in line.lower()
+    ]
+    for number, line in mentions:
+        assert line.lstrip().startswith("#"), (
+            f"line {number} of {path} is code that mentions Finviz: {line.strip()}")
+        assert number < 100, (
+            f"line {number} of {path} mentions Finviz outside the removal note")
+    assert mentions, "the note explaining why it was removed should still be there"
+
+
+def test_the_scanner_no_longer_has_any_finviz_machinery():
+    for name in ("FinvizSettings", "parse_finviz_csv", "read_env_file",
+                 "FINVIZ_FLAG", "SECRETS_DIR"):
+        assert not hasattr(scanner_module, name), name
+    for name in ("add_finviz_symbols", "fetch_finviz_symbols"):
+        assert not hasattr(OpeningMomentumScanner, name), name
+    assert "finviz_enabled" not in Thresholds().as_dict()
+
+
+def test_no_finviz_block_is_written_into_the_shortlist(monkeypatch, tmp_path):
     out = tmp_path / "shortlist.json"
     assert run_scanner_cli(monkeypatch, union_ib(), out) == 0
     written = json.loads(out.read_text(encoding="utf-8"))
 
-    assert written["finviz"]["enabled"] is False
-    assert written["finviz"]["symbols_added"] == 0
+    assert "finviz" not in written
     for row in written["candidates"]:
-        assert FINVIZ_FLAG not in row["flagged_by"]
+        assert "finviz" not in row["flagged_by"]
+    assert "finviz" not in scanner_module.SCAN_CODE_LABELS
 
 
-def test_finviz_symbols_join_the_union_when_it_is_switched_on(monkeypatch):
-    scanner = make_scanner(union_ib())
-    scanner.thresholds.finviz = FinvizSettings(
-        enabled=True, export_url="https://elite.finviz.com/export.ashx?v=111&auth=x")
-    monkeypatch.setattr(
-        scanner, "fetch_finviz_symbols",
-        lambda settings: (["UPUP", "NEWNAME"], "read 2 tickers from Finviz"))
-
-    candidates = asyncio.run(scanner.collect_candidates())
-    by_symbol = {c.symbol: c for c in candidates}
-
-    assert FINVIZ_FLAG in by_symbol["UPUP"].flagged_by, "an existing name is tagged, not duplicated"
-    assert by_symbol["UPUP"].flagged_by == ["TOP_PERC_GAIN", FINVIZ_FLAG]
-    assert by_symbol["NEWNAME"].flagged_by == [FINVIZ_FLAG]
-    assert by_symbol["NEWNAME"].con_id == 0, "Finviz gives a ticker, not a contract id"
-    assert scanner.finviz_report["symbols_added"] == 1
-    assert len([c for c in candidates if c.symbol == "UPUP"]) == 1
+# ---------------------------------------------------------------------------
+# The industry each name is in, which the sector cap reads (change A9)
+# ---------------------------------------------------------------------------
+#
+# The sector cap lives in
+# /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py
+# and it refuses an entry outright when nobody can say what industry a name is
+# in. This scanner is the only place in the project that already asks IBKR for
+# contract details, so this is where that fact comes from.
 
 
-def test_finviz_says_so_plainly_when_it_is_on_but_not_configured():
-    scanner = make_scanner(FakeIB())
-    settings = FinvizSettings(enabled=True, export_url="")
-    symbols, note = scanner.fetch_finviz_symbols(settings)
-    assert symbols == []
-    assert "no export_url" in note
+class SectorIB(FakeIB):
+    """A Gateway that answers contract details with the industry fields a test
+    wants, and behaves exactly like FakeIB in every other way."""
+
+    def __init__(self, rows_by_code=None, daily_bars=None, intraday_bars=None,
+                 **detail_kwargs):
+        super().__init__(rows_by_code=rows_by_code, daily_bars=daily_bars,
+                         intraday_bars=intraday_bars)
+        self.detail_kwargs = detail_kwargs
+
+    async def reqContractDetailsAsync(self, contract):
+        return [FakeContractDetails(
+            FakeContract(contract.symbol, contract.conId or 1), **self.detail_kwargs)]
 
 
-def test_a_finviz_export_is_read_for_its_ticker_column():
-    body = ("No.,Ticker,Company,Sector,Price,Change,Volume\r\n"
-            "1,NVDA,NVIDIA Corp,Technology,120.50,4.20%,180000000\r\n"
-            "2,AMD,Advanced Micro Devices,Technology,160.10,3.10%,90000000\r\n"
-            "3,NVDA,NVIDIA Corp,Technology,120.50,4.20%,180000000\r\n")
-    assert parse_finviz_csv(body) == ["NVDA", "AMD"]
+def looked_up_with(**detail_kwargs) -> Candidate:
+    """One contract details lookup, with no scan and no bars around it."""
+    scanner = make_scanner(SectorIB(**detail_kwargs))
+    candidate = Candidate(symbol="X", con_id=1)
+    asyncio.run(scanner.load_contract_details(candidate))
+    return candidate
 
 
-def test_a_finviz_export_with_no_ticker_column_gives_nothing():
-    assert parse_finviz_csv("No.,Company,Price\r\n1,NVIDIA Corp,120.50\r\n") == []
-    assert parse_finviz_csv("") == []
+def test_the_industry_comes_from_ibkrs_industry_field_first():
+    candidate = looked_up_with(industry="Technology", category="Computers",
+                               subcategory="Computer Software")
+    assert candidate.sector == "Technology"
+    assert candidate.category == "Computers"
+    assert candidate.subcategory == "Computer Software"
 
 
-def test_rubbish_in_the_ticker_column_is_dropped_rather_than_guessed_at():
-    body = "Ticker\r\nNVDA\r\n,\r\n   \r\nnot a ticker\r\nBRK.B\r\n"
-    assert parse_finviz_csv(body) == ["NVDA", "BRK.B"]
+def test_the_industry_falls_back_to_the_category():
+    """IBKR does not always fill all three in."""
+    candidate = looked_up_with(industry="", category="Computers",
+                               subcategory="Computer Software")
+    assert candidate.sector == "Computers"
+
+
+def test_the_industry_falls_back_to_the_subcategory_last():
+    candidate = looked_up_with(industry="", category="",
+                               subcategory="Computer Software")
+    assert candidate.sector == "Computer Software"
+
+
+def test_an_industry_nobody_named_comes_out_as_an_empty_string_not_none():
+    """The sector cap has to have one kind of thing to read."""
+    candidate = looked_up_with(industry="", category="", subcategory="")
+    assert candidate.sector == ""
+    assert candidate.sector is not None
+    assert candidate.as_dict()["sector"] == ""
+    assert candidate.as_dict()["category"] == ""
+    assert candidate.as_dict()["subcategory"] == ""
+
+
+def test_whitespace_around_an_industry_is_trimmed_off():
+    assert looked_up_with(industry="  Technology  ").sector == "Technology"
+
+
+def test_every_written_row_carries_its_industry(monkeypatch, tmp_path):
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, union_ib(), out) == 0
+    rows = json.loads(out.read_text(encoding="utf-8"))["candidates"]
+
+    assert rows, "nothing was shortlisted, so this test proved nothing"
+    for row in rows:
+        assert "sector" in row
+        assert "category" in row
+        assert "subcategory" in row
+        assert row["sector"] == "Technology"
+    assert any("Technology industry" in reason for reason in rows[0]["reasons"])
+
+
+def test_a_shortlisted_name_with_no_industry_is_named_in_the_warnings(
+    monkeypatch, tmp_path
+):
+    """Those names cannot be entered, so somebody should see why."""
+    ib = SectorIB(rows_by_code=UNION_ROWS, daily_bars=UNION_BARS,
+                  intraday_bars=UNION_INTRADAY,
+                  industry="", category="", subcategory="")
+    out = tmp_path / "shortlist.json"
+    assert run_scanner_cli(monkeypatch, ib, out) == 0
+    written = json.loads(out.read_text(encoding="utf-8"))
+
+    note = next(w for w in written["warnings"] if "No industry from IBKR" in w)
+    assert "guardrails.py" in note
+    assert "UPUP" in note
+    for row in written["candidates"]:
+        assert row["sector"] == ""

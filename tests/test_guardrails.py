@@ -13,7 +13,7 @@ Run them with:
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 
 import pytest
@@ -212,7 +212,7 @@ MID_MORNING = et(2, 9, 40)
 # ---------------------------------------------------------------------------
 
 
-def test_shipped_config_loads_with_the_proposed_numbers():
+def test_shipped_config_loads_with_the_numbers_mo_approved():
     loaded = load_guardrails(SHIPPED_CONFIG)
 
     assert loaded.account.mode == "paper"
@@ -221,14 +221,55 @@ def test_shipped_config_loads_with_the_proposed_numbers():
     assert loaded.account.gateway_port_live == 4001
     assert loaded.account.gateway_port == 4002
 
+    # Momentum v2, approved by Mo on 2026-09-06. The items in brackets are the
+    # ones used in research/momentum_spec_critique_2026-09-06.md and in both
+    # strategy changelogs.
     assert loaded.money.starting_equity == 100000
-    assert loaded.money.max_position_pct == 15
-    assert loaded.money.max_open_positions == 5
-    assert loaded.money.max_daily_loss_pct == 2
-    assert loaded.money.max_order_notional == 15000
+    assert loaded.money.max_position_pct == 10            # A6
+    assert loaded.money.max_open_positions == 10          # D1
+    assert loaded.money.max_daily_loss_pct == 1           # A7
+    assert loaded.money.max_order_notional == 10000
+    assert loaded.money.risk_per_trade_pct is None, (
+        "the size rule is a momentum rule, so the shared file leaves it empty "
+        "and the number, 0.25, lives in the two momentum strategy files")
+    assert loaded.money.max_weekly_loss_pct == 4          # A8
+    assert loaded.money.max_monthly_loss_pct == 6         # A8
+    assert loaded.money.max_consecutive_losing_days == 3  # A8
+    assert loaded.money.account_symbol_pct_max == 15      # A9
+    assert loaded.money.sector_gross_pct_max is None, (
+        "the sector cap is a momentum rule, so the shared file leaves it empty "
+        "and the number lives in the two momentum strategy files")
 
+    assert loaded.risk.atr_days == 14
+    assert loaded.risk.stop_atr_pct is None, (
+        "the volatility stop is a momentum rule too, and the insider and "
+        "Congress books really do stop on a plain percentage")
     assert loaded.risk.stop_loss_pct == 1.5
     assert loaded.risk.use_opening_range_low_if_tighter is True
+    assert loaded.risk.use_profit_target is True, (
+        "true here because the two filing books still take a target. The "
+        "momentum files set it false, which is item A2")
+
+    assert loaded.universe.min_atr_usd == 0.50            # A3
+    assert loaded.universe.min_atr_pct_of_price == 1.5    # A3
+    assert loaded.universe.min_history_sessions == 30     # A12
+    assert loaded.universe.exclude_spacs is True          # A12
+    assert loaded.universe.exclude_warrants_and_rights is True
+    assert loaded.universe.exclude_preferred is True
+    assert loaded.universe.require_us_primary_listing is True
+    assert loaded.universe.exclude_halted is True
+
+    assert loaded.scanner.rank_by == "rel_volume"         # A4
+    assert loaded.scanner.rel_volume_window == "09:30-09:35"
+    assert loaded.scanner.rel_volume_baseline_days == 14
+
+    assert loaded.schedule.entries_until == time(10, 15)  # D3
+    assert loaded.schedule.flatten_at == time(15, 45)     # A11
+    assert loaded.schedule.flatten_market_at == time(15, 55)
+    assert loaded.schedule.fast_poll_seconds is None, (
+        "the 30 second window is a momentum rule too, and the insider and "
+        "Congress books really do look only every thirty minutes")
+    assert loaded.schedule.preopen_start == time(9, 0)
 
     assert loaded.universe.price_floor == 5
     assert loaded.universe.min_avg_volume == 1000000
@@ -246,8 +287,8 @@ def test_shipped_config_loads_with_the_proposed_numbers():
     assert loaded.schedule.timezone == "America/New_York"
     assert loaded.schedule.scan_start.strftime("%H:%M") == "09:30"
     assert loaded.schedule.pick_time.strftime("%H:%M") == "09:35"
-    assert loaded.schedule.entries_until.strftime("%H:%M") == "11:00"
-    assert loaded.schedule.flatten_at.strftime("%H:%M") == "15:55"
+    assert loaded.schedule.entries_until.strftime("%H:%M") == "10:15"
+    assert loaded.schedule.flatten_at.strftime("%H:%M") == "15:45"
     assert loaded.schedule.market_close.strftime("%H:%M") == "16:00"
     assert loaded.schedule.loop_minutes == 5
     assert loaded.schedule.trade_only_regular_hours is True
@@ -270,31 +311,51 @@ def test_shipped_and_example_configs_hold_the_same_values():
 
 
 def test_base_config_in_this_test_file_matches_the_shipped_one(tmp_path: Path):
-    """If someone edits the yaml, this test says the test fixtures went stale.
+    """If someone edits the yaml, this test says which fixtures went stale.
 
-    Two numbers are deliberately different, and both are pinned by name below so
-    a further change to either one still fails here. Mo raised the position cap
-    to 15 percent on 2026-09-06 and the single order cap with it, while the
-    fixture in this file stays on the older 10 percent and 10,000 dollars. That
-    is on purpose: the size arithmetic in the tests further down is written
-    against those rounder numbers, and rewriting a dozen tests to chase a
-    setting would make them harder to read rather than more correct. The 15
-    percent cap that actually ships is tested in tests/test_books.py.
+    BASE_CONFIG at the top of this file is a deliberately plain settings file,
+    not a copy of the shipped one. The arithmetic in the size tests below is
+    written against its round numbers, and rewriting a dozen tests every time a
+    strategy setting moves would make them harder to read rather than more
+    correct. So the two are allowed to differ, and every difference is pinned by
+    name here, which means a NEW difference nobody meant still fails this test.
+
+    Momentum v2, approved by Mo on 2026-09-06, is what most of these
+    differences now are. The shipped numbers themselves are checked in
+    test_shipped_config_loads_with_the_numbers_mo_approved above and in
+    tests/test_books.py.
     """
     shipped = load_guardrails(SHIPPED_CONFIG)
     from_tests = load_with(tmp_path)
 
-    assert shipped.money.max_position_pct == 15
-    assert shipped.money.max_order_notional == 15000
-    assert from_tests.money.max_position_pct == 10
-    assert from_tests.money.max_order_notional == 10000
+    # Deliberately different, one line each.
+    assert (shipped.money.max_open_positions, from_tests.money.max_open_positions) \
+        == (10, 5)
+    assert (shipped.money.max_daily_loss_pct, from_tests.money.max_daily_loss_pct) \
+        == (1, 2)
+    assert shipped.schedule.entries_until == time(10, 15)
+    assert from_tests.schedule.entries_until == time(11, 0)
+    assert shipped.schedule.flatten_at == time(15, 45)
+    assert from_tests.schedule.flatten_at == time(15, 55)
+    assert shipped.money.max_weekly_loss_pct == 4
+    assert from_tests.money.max_weekly_loss_pct is None
+    assert shipped.universe.min_atr_usd == 0.50
+    assert from_tests.universe.min_atr_usd is None
 
+    # And the parts that do have to agree.
+    assert from_tests.money.max_position_pct == shipped.money.max_position_pct == 10
+    assert from_tests.money.max_order_notional == shipped.money.max_order_notional
     assert from_tests.money.starting_equity == shipped.money.starting_equity
-    assert from_tests.money.max_open_positions == shipped.money.max_open_positions
-    assert from_tests.money.max_daily_loss_pct == shipped.money.max_daily_loss_pct
     assert from_tests.money.gross_exposure_pct_max == shipped.money.gross_exposure_pct_max
-    assert from_tests.schedule == shipped.schedule
-    assert from_tests.universe == shipped.universe
+    assert from_tests.risk.stop_loss_pct == shipped.risk.stop_loss_pct
+    assert from_tests.schedule.timezone == shipped.schedule.timezone
+    assert from_tests.schedule.scan_start == shipped.schedule.scan_start
+    assert from_tests.schedule.pick_time == shipped.schedule.pick_time
+    assert from_tests.schedule.market_close == shipped.schedule.market_close
+    assert from_tests.schedule.loop_minutes == shipped.schedule.loop_minutes
+    assert from_tests.universe.price_floor == shipped.universe.price_floor
+    assert from_tests.universe.allow_shorts == shipped.universe.allow_shorts
+    assert from_tests.universe.allowed_sec_types == shipped.universe.allowed_sec_types
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ from agent.guardrails import (
     load_book,
     load_book_guardrails,
     load_books,
+    must_flatten_at_market_now,
     must_flatten_now,
     stop_price_for,
     time_stop_due,
@@ -107,6 +108,12 @@ def book_state(
     pending_order_notional: float = 0.0,
     realized_pnl_today: float = 0.0,
     unrealized_pnl: float = 0.0,
+    week_pnl: float = 0.0,
+    month_pnl: float = 0.0,
+    consecutive_losing_days: int = 0,
+    sector_exposure: dict | None = None,
+    account_equity: float | None = None,
+    symbol_exposure_all_books: dict | None = None,
 ) -> AccountState:
     """A snapshot of one book, with everything else left quiet."""
     return AccountState(
@@ -122,6 +129,12 @@ def book_state(
         book_id=book_id,
         gross_exposure=gross_exposure,
         entries_opened_today=entries_opened_today,
+        week_pnl=week_pnl,
+        month_pnl=month_pnl,
+        consecutive_losing_days=consecutive_losing_days,
+        sector_exposure=sector_exposure,
+        account_equity=account_equity,
+        symbol_exposure_all_books=symbol_exposure_all_books,
     )
 
 
@@ -132,6 +145,13 @@ def buy(
     limit_price: float | None = 50.0,
     **kwargs,
 ) -> OrderIntent:
+    """An ordinary buy, carrying an industry so the sector cap has one to count.
+
+    Momentum v2 (item A9, Mo 2026-09-06) refuses an entry whose industry nobody
+    could name, so every order here carries one by default. A test about the
+    sector cap itself passes sector=None, or an industry of its own.
+    """
+    kwargs.setdefault("sector", "Technology")
     return OrderIntent(
         symbol=symbol,
         side="BUY",
@@ -159,6 +179,7 @@ def short(
     shares to be had. A test that wants one of the three to fail passes just
     that one, so it is obvious which leg of the rule is being tested.
     """
+    kwargs.setdefault("sector", "Technology")
     return OrderIntent(
         symbol=symbol,
         side="SELL",
@@ -386,7 +407,7 @@ def test_a_full_book_is_sized_against_its_whole_capital(tmp_path: Path):
 
 
 def test_a_tiny_book_is_actually_held_to_the_smaller_pot_on_an_order(tmp_path: Path):
-    """The 15 percent cap now means 300 dollars, not 15,000."""
+    """The 10 percent cap now means 200 dollars of the pot, not 10,000."""
     books_path = temp_project(
         tmp_path,
         book_changes={
@@ -398,10 +419,10 @@ def test_a_tiny_book_is_actually_held_to_the_smaller_pot_on_an_order(tmp_path: P
     g = load_book_guardrails(books_path, "A")
     state = book_state("A", equity=2000.0)
 
-    fine = check_order(g, state, buy("A", qty=6, limit_price=50.0))
+    fine = check_order(g, state, buy("A", qty=4, limit_price=50.0))
     assert fine.allowed is True, fine.reasons
 
-    too_big = check_order(g, state, buy("A", qty=7, limit_price=50.0))
+    too_big = check_order(g, state, buy("A", qty=5, limit_price=50.0))
     assert too_big.allowed is False
     assert "max_position_pct" in too_big.rule_ids
 
@@ -458,7 +479,10 @@ def test_every_book_loads_its_strategy_and_keeps_the_shared_account(book_id: str
     assert g.schedule.timezone == "America/New_York"
     assert g.money.starting_equity == 100000
     assert g.strategy is not None
-    assert g.strategy.status == "provisional", "the numbers are not approved yet"
+    wanted = "approved" if book_id in MOMENTUM_BOOKS else "provisional"
+    assert g.strategy.status == wanted, (
+        "the momentum books were signed off as Momentum v2 on 2026-09-06, and the "
+        "insider and Congress books are still waiting on Mo")
     assert g.kill_switch.file == "output/STOP"
 
 
@@ -475,23 +499,55 @@ def test_every_strategy_folder_has_a_yaml_and_a_prompt(name: str):
     assert prompt.strip(), f"strategies/{name}/prompt.md is empty"
 
 
+#: The two Mo signed off on 2026-09-06 as Momentum v2. The other two are still
+#: proposals waiting on him, and each says so at the top of its own file.
+APPROVED_STRATEGIES = ("momentum_hybrid", "momentum_rules")
+
+
 @pytest.mark.parametrize("name", ["momentum_hybrid", "momentum_rules", "insider", "congress"])
-def test_every_strategy_file_says_it_is_provisional(name: str):
+def test_every_strategy_file_says_whether_mo_has_signed_it_off(name: str):
     text = (STRATEGIES / name / "strategy.yaml").read_text(encoding="utf-8")
     assert text.lstrip().startswith("#")
-    assert "PROVISIONAL" in text.split("strategy:")[0]
-    assert "status: provisional" in text
+    header = text.split("strategy:")[0]
+    if name in APPROVED_STRATEGIES:
+        assert "MOMENTUM V2, approved by Mo on 2026-09-06" in header
+        assert "status: approved" in text
+    else:
+        assert "PROVISIONAL" in header
+        assert "status: provisional" in text
 
 
 @pytest.mark.parametrize("book_id", MOMENTUM_BOOKS)
 def test_the_momentum_books_match_their_spec(book_id: str):
     g = load_book_guardrails(BOOKS_YAML, book_id)
-    assert g.money.max_position_pct == 15
-    assert g.money.max_open_positions == 5
-    assert g.money.max_daily_loss_pct == 2
+    assert g.money.max_position_pct == 10, "item A6, the notional cap"
+    assert g.money.max_open_positions == 10, "item D1"
+    assert g.money.max_daily_loss_pct == 1, "item A7, re-derived so it binds"
+    assert g.money.max_order_notional == 10000
     assert g.money.gross_exposure_pct_max == 100
-    assert g.risk.stop_loss_pct == 1.5
+    assert g.money.risk_per_trade_pct == 0.25, "item A6, the size rule"
+    assert g.money.max_weekly_loss_pct == 4, "item A8"
+    assert g.money.max_monthly_loss_pct == 6, "item A8"
+    assert g.money.max_consecutive_losing_days == 3, "item A8"
+    assert g.money.sector_gross_pct_max == 25, "item A9"
+    assert g.money.account_symbol_pct_max == 15, "item A9"
+    assert g.risk.stop_atr_pct == 10, "item A1, the volatility stop"
+    assert g.risk.atr_days == 14
+    assert g.risk.stop_outside_opening_range is True, "item A1"
+    assert g.risk.use_profit_target is False, "item A2, no target at all"
+    assert g.risk.stop_loss_pct == 1.5, "kept only as the fallback when no ATR"
     assert g.risk.use_opening_range_low_if_tighter is True
+    assert g.universe.min_atr_usd == 0.50, "item A3"
+    assert g.universe.min_atr_pct_of_price == 1.5, "item A3"
+    assert g.universe.min_history_sessions == 30, "item A12, and no listing age rule"
+    assert g.universe.exclude_spacs is True, "item A12"
+    assert g.universe.exclude_warrants_and_rights is True, "item A12"
+    assert g.universe.exclude_preferred is True, "item A12"
+    assert g.universe.require_us_primary_listing is True, "item A12, no OTC"
+    assert g.universe.exclude_halted is True, "item A12"
+    assert g.scanner.rank_by == "rel_volume", "item A4"
+    assert g.scanner.rel_volume_window == "09:30-09:35", "item A4"
+    assert g.scanner.rel_volume_baseline_days == 14, "item A4"
     assert g.universe.price_floor == 5
     assert g.universe.min_avg_dollar_volume == 20_000_000
     assert g.universe.dollar_volume_sessions == 30
@@ -505,10 +561,15 @@ def test_the_momentum_books_match_their_spec(book_id: str):
     assert g.pdt.max_day_trades_per_5_days == 3
     assert g.pdt.assumed_live_equity_min_usd == 25000
     assert g.schedule.pick_time.strftime("%H:%M") == "09:35"
-    assert g.schedule.entries_until.strftime("%H:%M") == "11:00"
-    assert g.schedule.flatten_at.strftime("%H:%M") == "15:55"
+    assert g.schedule.entries_until.strftime("%H:%M") == "10:15", "item D3"
+    assert g.schedule.flatten_at.strftime("%H:%M") == "15:45", "item A11, limits"
+    assert g.schedule.flatten_market_at.strftime("%H:%M") == "15:55", "item A11"
     assert g.schedule.loop_minutes == 5
-    assert g.schedule.entries_per_day_max == 5
+    assert g.schedule.fast_poll_seconds == 30, "item A14"
+    assert g.schedule.fast_poll_from.strftime("%H:%M") == "09:35", "item A14"
+    assert g.schedule.fast_poll_until.strftime("%H:%M") == "11:00", "item A14"
+    assert g.schedule.preopen_start.strftime("%H:%M") == "09:00"
+    assert g.schedule.entries_per_day_max == 10, "item D1"
     assert g.strategy.holds_overnight is False
     assert g.strategy.flat_by_close is True
 
@@ -586,7 +647,7 @@ def test_a_book_only_writes_down_what_it_changes(tmp_path: Path):
         tmp_path, strategy_changes={"money": {"max_position_pct": None}}
     )
     g = load_book_guardrails(books_path, "A")
-    assert g.money.max_position_pct == 15  # from config/guardrails.yaml
+    assert g.money.max_position_pct == 10  # from config/guardrails.yaml
 
 
 def test_the_deprecated_share_volume_floor_is_still_accepted(tmp_path: Path):
@@ -661,23 +722,23 @@ def test_the_shared_settings_still_load_on_their_own_with_no_book():
 
 
 # ---------------------------------------------------------------------------
-# The 15 percent cap on one position
+# The 10 percent cap on one position (Momentum v2, item A6)
 # ---------------------------------------------------------------------------
 
 
-def test_a_position_at_exactly_fifteen_percent_of_the_book_is_allowed(
+def test_a_position_at_exactly_ten_percent_of_the_book_is_allowed(
     momentum: Guardrails,
 ):
-    """300 shares at 50 dollars is 15,000, which is exactly the cap."""
+    """200 shares at 50 dollars is 10,000, which is exactly the cap."""
     decision = check_order(
-        momentum, book_state("A"), buy("A", qty=300, limit_price=50.0)
+        momentum, book_state("A"), buy("A", qty=200, limit_price=50.0)
     )
     assert decision.allowed is True, decision.reasons
 
 
-def test_a_position_over_fifteen_percent_of_the_book_is_blocked(momentum: Guardrails):
+def test_a_position_over_ten_percent_of_the_book_is_blocked(momentum: Guardrails):
     decision = check_order(
-        momentum, book_state("A"), buy("A", qty=301, limit_price=50.0)
+        momentum, book_state("A"), buy("A", qty=201, limit_price=50.0)
     )
     assert decision.allowed is False
     assert "max_position_pct" in decision.rule_ids
@@ -702,14 +763,16 @@ def test_the_insider_book_keeps_its_own_smaller_five_percent_cap(insider: Guardr
 # ---------------------------------------------------------------------------
 
 
-def test_gross_exposure_at_seventy_four_percent_is_allowed(momentum: Guardrails):
-    """59,000 already at work plus a 15,000 order is 74,000 of a 100,000 book."""
+def test_gross_exposure_at_sixty_nine_percent_is_allowed(momentum: Guardrails):
+    """59,000 already at work plus a 10,000 order is 69,000 of a 100,000 book."""
     state = book_state(
-        "A", positions={"MSFT": position("MSFT", 590, 100.0)}
+        "A", positions={"MSFT": position("MSFT", 590, 100.0)},
+        sector_exposure={"Technology": 59000.0},
     )
     assert state.gross_exposure_now() == 59000.0
     decision = check_order(
-        momentum, state, buy("A", symbol="AAPL", qty=300, limit_price=50.0)
+        momentum, state, buy("A", symbol="AAPL", qty=200, limit_price=50.0,
+                             sector="Health Care")
     )
     assert decision.allowed is True, decision.reasons
 
@@ -1294,13 +1357,20 @@ def test_a_book_that_holds_overnight_is_never_flattened(book_id: str):
 
 
 @pytest.mark.parametrize("book_id", MOMENTUM_BOOKS)
-def test_a_momentum_book_is_still_sold_off_at_five_to_four(book_id: str):
+def test_a_momentum_book_starts_flattening_at_a_quarter_to_four(book_id: str):
     g = load_book_guardrails(BOOKS_YAML, book_id)
     assert g.flat_by_close is True
-    assert must_flatten_now(g, et(2, 15, 54)) is False
-    assert must_flatten_now(g, et(2, 15, 55)) is True
+    # Item A11: flattening BEGINS at 15:45 with limit orders, and anything left
+    # at 15:55 goes out at market. Both windows shut at the close.
+    assert must_flatten_now(g, et(2, 15, 44)) is False
+    assert must_flatten_now(g, et(2, 15, 45)) is True
     assert must_flatten_now(g, et(2, 15, 59)) is True
     assert must_flatten_now(g, et(2, 16, 0)) is False
+
+    assert must_flatten_at_market_now(g, et(2, 15, 54)) is False
+    assert must_flatten_at_market_now(g, et(2, 15, 55)) is True
+    assert must_flatten_at_market_now(g, et(2, 15, 59)) is True
+    assert must_flatten_at_market_now(g, et(2, 16, 0)) is False
 
 
 def test_an_overnight_book_still_opens_nothing_new_after_its_entry_window(
@@ -1391,7 +1461,8 @@ def test_a_book_id_is_read_the_same_however_it_is_typed_on_an_order(
     momentum: Guardrails,
 ):
     intent = OrderIntent(
-        symbol="AAPL", side="BUY", qty=10, limit_price=50.0, book_id=" a "
+        symbol="AAPL", side="BUY", qty=10, limit_price=50.0, book_id=" a ",
+        sector="Technology",
     )
     assert intent.book_id == "A"
     assert check_order(momentum, book_state(" a "), intent).allowed is True

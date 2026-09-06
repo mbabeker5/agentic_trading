@@ -189,7 +189,31 @@ def test_a_long_stop_tighter_than_the_rules_is_kept():
     levels = loop.protective_levels(guard, entry=100.0, short=False,
                                     model_stop=99.4, model_target=104.0)
     assert levels.stop == 99.4
-    assert levels.notes == []
+    # Item A2: this book takes no profit target, so the one that came in is
+    # dropped and the reason is written down rather than swallowed.
+    assert levels.target == 0.0
+    assert any("no profit target at all" in note for note in levels.notes)
+
+
+def test_a_momentum_book_drops_every_target_it_is_given():
+    """Item A2, approved by Mo on 2026-09-06. A position leaves on its stop or at
+    the close, and a target on the right side of entry is dropped exactly like
+    one on the wrong side."""
+    guard = guard_for("A")
+    assert guard.risk.use_profit_target is False
+    levels = loop.protective_levels(guard, entry=100.0, short=False,
+                                    model_stop=99.4, model_target=110.0)
+    assert levels.target == 0.0
+    assert any("no profit target at all" in note for note in levels.notes)
+
+
+def test_a_book_that_still_takes_a_target_keeps_a_good_one():
+    """The insider book has not changed, so its target survives untouched."""
+    guard = guard_for("C")
+    assert guard.risk.use_profit_target is True
+    levels = loop.protective_levels(guard, entry=100.0, short=False,
+                                    model_stop=95.0, model_target=110.0)
+    assert levels.target == 110.0
 
 
 def test_a_short_stop_wider_than_the_rules_is_pulled_back():
@@ -234,7 +258,8 @@ def test_a_short_stop_below_entry_is_rejected():
 
 
 def test_a_target_on_the_wrong_side_is_dropped_and_the_stop_survives():
-    guard = guard_for("A")
+    """On a book that still takes targets. The momentum books drop them all."""
+    guard = guard_for("C")
     levels = loop.protective_levels(guard, entry=100.0, short=False,
                                     model_stop=99.0, model_target=97.0)
     assert levels.reject is None
@@ -277,7 +302,7 @@ def test_a_fill_takes_its_stop_and_target_from_the_trigger_record(sandbox):
     held = state.position("AAPL")
     assert held is not None
     assert held.stop == 98.5
-    assert held.target == 103.0
+    assert held.target == 0.0, "item A2, this book takes no profit target"
     assert held.entry == 100.0
     assert held.side == "long"
 
@@ -309,7 +334,7 @@ def test_a_short_fill_gets_a_stop_above_the_price_it_sold_at(sandbox):
     assert held.qty == -100
     assert held.stop == 101.0
     assert held.stop > held.entry
-    assert held.target == 96.0
+    assert held.target == 0.0, "item A2, this book takes no profit target"
 
 
 def test_a_fill_with_a_nonsense_stop_still_gets_the_rule_stop(sandbox):
@@ -351,7 +376,7 @@ def test_the_stop_survives_a_round_trip_through_the_book_file(sandbox):
 
     reloaded = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000, root=sandbox)
     assert reloaded.position("AAPL").stop == 98.5
-    assert reloaded.position("AAPL").target == 103.0
+    assert reloaded.position("AAPL").target == 0.0
 
 
 def test_adding_to_a_position_does_not_wipe_its_stop(sandbox):
@@ -708,7 +733,8 @@ def test_the_fade_fires_on_exactly_the_count_the_yaml_names():
     position.trailing_high_or_low = 100.0
     trigger, why = loop.exit_reason_for(position, plan(), guard_for("A"), TUESDAY,
                                         100.4, vwap=101.0, closes_through_vwap=2)
-    assert trigger == "fade"
+    assert trigger == "fade_observed", (
+        "item D2: in month one a fade is written down and closes nothing")
     assert "2 five minute closes in a row" in why
     assert "calls a fade at 2" in why
 
@@ -815,18 +841,29 @@ def decisions_about(state, symbol="AAPL"):
             if str(row.get("symbol") or "") == symbol]
 
 
-def test_a_model_fade_closes_the_position(sandbox, monkeypatch):
+def test_a_model_fade_is_written_down_and_closes_nothing(sandbox, monkeypatch):
+    """Item D2, approved by Mo on 2026-09-06.
+
+    In month one a fade is an observation. The row goes into the ledger with the
+    model's own words on it, and the position is held, so at the end of the month
+    Mo can read what every fade would have cost or saved. Set
+    risk.vwap_fade_action to `exit` in the book's strategy.yaml and the old
+    behaviour comes back in one edit.
+    """
     state, _ = manage_once(sandbox, monkeypatch, [
         {"symbol": "AAPL", "action": "fade",
          "rationale": "two bars of nothing on dying volume"}])
 
     closing = [row for row in decisions_about(state)
                if "would place SELL" in str(row["decision"])]
-    assert closing, "the model's fade did not close anything"
-    assert "would place SELL 100 AAPL" in closing[-1]["decision"]
-    assert "purpose: exit" in closing[-1]["decision"]
-    assert "called the momentum gone" in closing[-1]["decision"]
-    assert "dying volume" in closing[-1]["decision"]
+    assert closing == [], "a fade must not close anything in month one"
+
+    observed = [row for row in decisions_about(state)
+                if "fade observed" in str(row["decision"])]
+    assert observed, "the fade was not written down"
+    assert "called the momentum gone" in observed[-1]["rationale"]
+    assert "dying volume" in observed[-1]["rationale"]
+    assert state.position("AAPL") is not None, "the position should still be held"
 
 
 def test_a_model_exit_closes_the_position(sandbox, monkeypatch):

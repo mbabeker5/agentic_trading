@@ -111,13 +111,24 @@ except Exception as exc:                    # noqa: BLE001
     pdt_mod = None                          # type: ignore[assignment]
     PDT_ERROR = f"{type(exc).__name__}: {exc}"
 
+# The pre-open run, which gathers what the 09:35 pick needs before the market is
+# even open. Optional in exactly the same way as the two above: a missing one
+# costs the pre-open work and nothing else, because every number it gathers has
+# a slower fallback on the day. See docs/PREOPEN_FLOW.md.
+try:
+    import preopen as preopen_mod           # noqa: E402
+    PREOPEN_ERROR: str | None = None
+except Exception as exc:                    # noqa: BLE001
+    preopen_mod = None                      # type: ignore[assignment]
+    PREOPEN_ERROR = f"{type(exc).__name__}: {exc}"
+
 LIVE_ENV_VAR = "AGENTIC_TRADING_LIVE_ORDERS"
 PAPER_ACCOUNT_PREFIX = "DU"
 LIVE_MODES = ("tiny", "full")
 
 # Which phase a book is in. One word each, because they end up in log lines.
-IDLE, SWEEP, SCAN, PICK, MANAGE, FLATTEN, CLOSED = (
-    "idle", "sweep", "scan", "pick", "manage", "flatten", "closed")
+IDLE, SWEEP, SCAN, PICK, MANAGE, FLATTEN, CLOSED, PREOPEN = (
+    "idle", "sweep", "scan", "pick", "manage", "flatten", "closed", "preopen")
 
 MOMENTUM, INSIDER, CONGRESS = "momentum", "insider", "congress"
 
@@ -262,6 +273,9 @@ class BookPlan:
     shortlist_prefix: str = "shortlist"
     runs_scanner: bool = False
     vwap_fade_closes: int = 0
+    vwap_fade_acts: bool = False
+    flatten_market_at: clock_time | None = None
+    preopen_start: clock_time | None = None
 
 
 def family_for(book: gr.BookConfig) -> str:
@@ -276,6 +290,25 @@ def family_for(book: gr.BookConfig) -> str:
 
 def _clock(text: Any) -> clock_time:
     return datetime.strptime(str(text).strip(), "%H:%M").time()
+
+
+def vwap_fade_acts_for(book: gr.BookConfig) -> bool:
+    """Does a VWAP fade actually close a position, or is it only written down?
+
+    Momentum v2, item D2, approved by Mo on 2026-09-06. In month one it is
+    written down and acted on never. The fade rule comes from a different
+    published strategy and grafting it on as an exit was never tested, so month
+    one measures the pick and records what the fade would have cost or saved.
+
+    risk.vwap_fade_action in the book's own strategy.yaml is the switch:
+    log_only, which is what the momentum books say today, or exit, which puts
+    the old behaviour back in one edit.
+    """
+    try:
+        params, _ = decide_mod.load_params(project_root() / str(book.strategy_dir))
+        return str(params.get("vwap_fade_action") or "exit").strip().lower() == "exit"
+    except Exception:                            # noqa: BLE001
+        return True
 
 
 def vwap_fade_closes_for(book: gr.BookConfig) -> int:
@@ -330,6 +363,9 @@ def plan_for(book: gr.BookConfig, guard: gr.Guardrails) -> BookPlan:
         shortlist_prefix=prefix,
         runs_scanner=(family == MOMENTUM),
         vwap_fade_closes=(vwap_fade_closes_for(book) if family == MOMENTUM else 0),
+        vwap_fade_acts=(vwap_fade_acts_for(book) if family == MOMENTUM else True),
+        flatten_market_at=schedule.flatten_market_at,
+        preopen_start=(schedule.preopen_start if family == MOMENTUM else None),
     )
 
 
@@ -390,6 +426,10 @@ def phase_for(now: datetime, plan: BookPlan, *, pick_done: bool = False,
     if slot is not None:
         return SWEEP, f"the {slot} sweep for this book has not run yet today"
 
+    if plan.runs_scanner and plan.preopen_start is not None \
+            and plan.preopen_start <= moment < plan.scan_start:
+        return PREOPEN, (f"the pre-open run works from {plan.preopen_start:%H:%M} so "
+                         "the ranking is ready at the open")
     if plan.runs_scanner and moment < plan.scan_start:
         return IDLE, f"the market opens at {plan.scan_start:%H:%M}"
     if plan.runs_scanner and moment < plan.pick_time:
@@ -730,6 +770,90 @@ def snapshot_price(row: dict | None) -> float | None:
     return None
 
 
+# ------------------------------------------- what happened before today
+
+@dataclass(frozen=True)
+class LossHistory:
+    """This book's recent record, for the limits beyond the day (item A8).
+
+    week_pnl and month_pnl are money, not percentages: what the book has made or
+    lost so far this calendar week and this calendar month, today included.
+    losing_days is how many trading days IN A ROW it has finished down, counting
+    backwards from the last completed day. Today is not counted, because today
+    is not finished.
+    """
+
+    week_pnl: float = 0.0
+    month_pnl: float = 0.0
+    losing_days: int = 0
+
+
+def _day_of(path: Path) -> date_type | None:
+    """The date out of a state file name, or None when it does not carry one."""
+    try:
+        return datetime.strptime(path.stem.split("_")[-1], "%Y-%m-%d").date()
+    except (ValueError, IndexError):
+        return None
+
+
+def read_day_results(order_ref: str, today: date_type,
+                     root: Path | None = None) -> list[tuple[date_type, float]]:
+    """What this book realised on each day it has a state file for, oldest first.
+
+    One file per book per day is the only record of a book's own money, because
+    the shared account nets all five together and cannot answer "how did book A
+    do". Realised profit and loss is what is read: a book that is flat at the
+    close, which the momentum books always are, has nothing else left over.
+    """
+    folder = (root / "output") if root is not None else output_dir()
+    out: list[tuple[date_type, float]] = []
+    for path in sorted(folder.glob(f"state_{order_ref}_*.json")):
+        day = _day_of(path)
+        if day is None or day > today:
+            continue
+        try:
+            stored = json.loads(path.read_text())
+        except Exception:                        # noqa: BLE001
+            continue
+        if isinstance(stored, dict):
+            out.append((day, _number(stored.get("realized_pnl_today"))))
+    return out
+
+
+def loss_history(order_ref: str, today: date_type, today_pnl: float = 0.0,
+                 root: Path | None = None) -> LossHistory:
+    """This week, this month, and the run of losing days behind them. Item A8.
+
+    Momentum v2, approved by Mo on 2026-09-06. Without a rule beyond the day a
+    book could lose one percent every day for a fortnight and nothing would ever
+    notice, so the loop works these three numbers out from the book's own state
+    files and hands them to the guardrails, which own the actual limits.
+
+    The week runs Monday to Sunday and the month is a calendar month, because
+    those are the weeks and months a person means. Today's own figure is passed
+    in rather than read off disk, since the file for today is written at the end
+    of the tick and would otherwise always be one tick stale.
+    """
+    week_start = today - timedelta(days=today.weekday())
+    week = today_pnl
+    month = today_pnl
+    earlier = [(day, pnl) for day, pnl in read_day_results(order_ref, today, root)
+               if day != today]
+    for day, pnl in earlier:
+        if day >= week_start:
+            week += pnl
+        if (day.year, day.month) == (today.year, today.month):
+            month += pnl
+
+    streak = 0
+    for _, pnl in reversed(earlier):
+        if pnl < 0:
+            streak += 1
+        else:
+            break
+    return LossHistory(round(week, 2), round(month, 2), streak)
+
+
 # ------------------------------------------------------------------- the tick
 
 class BookTick:
@@ -749,6 +873,12 @@ class BookTick:
         self.notes: list[str] = []
         self.model_cost = 0.0
         self.phase = IDLE
+        # How long until this book wants looking at again, in seconds. Thirty
+        # between 09:35 and 11:00 while it is holding something, five minutes
+        # otherwise (item A14, Mo 2026-09-06). run_book fills it in at the end
+        # of the tick and main() writes the smallest across every book into
+        # output/next_tick_seconds for the wrapper to read.
+        self.next_tick_seconds = 300
 
     @property
     def tag(self) -> str:
@@ -1013,11 +1143,18 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
                                     fill_id=str(result.get("order_id") or "") or None)
             except Exception as exc:         # noqa: BLE001
                 tick.note(f"the day trade counter would not record the fill: {exc}")
+        # Item A15: every fill carries the facts the decision was made on, so
+        # slippage, risk and selection can be read back at the end of the month.
+        facts = trade_facts(state, intent.symbol, guard)
         ledger_writer.log_trade(
             {"symbol": intent.symbol, "side": intent.side, "qty": filled,
              "price": price, "notional": round(filled * price, 2),
-             "order_ref": guard.order_ref, "purpose": intent.purpose},
+             "order_ref": guard.order_ref, "purpose": intent.purpose,
+             "strategy_signal": facts.get("candle") or "",
+             "notes": facts_line(facts)},
             book_id=tick.book.book_id, model=tick.book.model or "none",
+            decision_price=facts.get("decision_price"),
+            decision_time=facts.get("decision_time"),
             dry_run=not tick.write_ledger)
     elif result.get("working"):
         order_id = str(result.get("order_id") or f"pending-{intent.symbol}")
@@ -1098,6 +1235,59 @@ def do_sweep(tick: BookTick, state: bs.BookState, plan: BookPlan, slot: str) -> 
         state.shortlist_path = str(path)
         state.shortlist_read_at = tick.now.isoformat()
     tick.record(state, "", f"the {slot} sweep ran", f"{message}. {read_message}")
+
+
+def do_preopen(tick: BookTick, state: bs.BookState,
+               broker: broker_mod.Broker) -> None:
+    """Hand this minute of the morning to the pre-open run.
+
+    From 09:00 the momentum books have work to do before the market opens: a
+    gap scan every few minutes, and each new name's history pulled at no more
+    than four requests a minute. The pacing is the whole point. IB Gateway
+    allows about 60 historical requests in any 10 minutes, so spending that
+    budget between 09:00 and 09:26 means it is NOT being spent in the five
+    minutes around the open, where it is scarcest and where the pick is made.
+
+    Books A, B and E share one pre-open run exactly as they share one scanner
+    run. It is idempotent within a minute: whichever ticks first does the work
+    and the other two find it already done in the state file on disk.
+
+    Everything it does is a read. It never sends an order, and there is a test
+    that reads its source and fails if it ever reaches for one.
+
+    A missing or broken agent/preopen.py costs the pre-open work and nothing
+    else. The day still runs: the scanner works the same numbers out from daily
+    bars at 09:35 instead, which is slower and spends the budget at the worst
+    moment, which is exactly why the pre-open run exists.
+    """
+    if preopen_mod is None:
+        tick.note(f"agent/preopen.py is not loaded ({PREOPEN_ERROR}), so nothing was "
+                  "gathered before the open. The scanner works it out at 09:35 "
+                  "instead, which is slower and spends the data budget at the worst "
+                  "moment of the day.")
+        return
+    try:
+        answer = preopen_mod.step(tick.now, broker) or {}
+    except Exception as exc:                 # noqa: BLE001
+        tick.note(f"the pre-open run raised {type(exc).__name__}: {exc}. The day "
+                  "carries on and the scanner works the numbers out at 09:35.")
+        tick.rule("preopen_failed",
+                  f"the pre-open run raised {type(exc).__name__}: {exc}",
+                  "the pre-open work was skipped, and the 09:35 scanner still runs")
+        return
+
+    phase = str(answer.get("phase") or "")
+    did = str(answer.get("did") or answer.get("note") or "nothing this minute")
+    candidates = answer.get("candidates")
+    tick.say(f"Pre-open ({phase or 'working'}): {did}"
+             + (f", {len(candidates)} candidate(s) tracked"
+                if isinstance(candidates, (list, dict)) else ""))
+    for message in (answer.get("notes") or []):
+        tick.note(f"pre-open: {message}")
+    # What the pre-open run learned lives in its own file for the day, under
+    # output/preopen_state_YYYY-MM-DD.json, rather than in the book file. It is
+    # shared by all three momentum books, so it does not belong to any one of
+    # them. See docs/PREOPEN_FLOW.md.
 
 
 def do_scan(tick: BookTick, state: bs.BookState, plan: BookPlan) -> None:
@@ -1384,22 +1574,16 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
         tick.record(state, symbol, "no entry order", blocked)
         return
     if not gr.entries_allowed_now(guard, tick.now):
-        tick.note(f"{symbol}: it is outside {plan.pick_time:%H:%M} to "
-                  f"{plan.entries_until:%H:%M}, so the pick is written down and no "
-                  "entry order is worked out")
+        note_late_entry(tick, state, plan, symbol, "the pick was written down and no "
+                                                   "entry order was worked out")
         return
     if entry <= 0:
         tick.note(f"{symbol}: the pick carries no usable entry price, so there is "
                   "nothing to size")
         return
 
-    quantity = int(pick.get("qty_hint") or 0)
-    allowed_shares = gr.max_shares_for(guard, account_state, symbol, entry)
-    if quantity <= 0 or allowed_shares < quantity:
-        if quantity > allowed_shares:
-            tick.note(f"{symbol}: cut from {quantity} shares to {allowed_shares}, "
-                      "because the money rules say so and the model does not")
-        quantity = allowed_shares
+    quantity = size_for(tick, guard, account_state, symbol, entry, stop,
+                        int(pick.get("qty_hint") or 0))
     if quantity <= 0:
         tick.say(f"  {symbol}: the money rules allow zero shares at {entry:.2f}")
         tick.record(state, symbol, "no entry order",
@@ -1407,20 +1591,147 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
         return
 
     borrow = _borrow_answer(state, symbol)
-    intent = _entry_intent(symbol, short, quantity, entry, tick.book.book_id, borrow)
-    extra = f"stop {stop:.2f}, target {target:.2f}"
+    intent = _entry_intent(symbol, short, quantity, entry, tick.book.book_id, borrow,
+                           sector=sector_for(state, symbol))
+
+    # Written before the order is considered, not after, because a fill can come
+    # back inside consider() and the ledger row for it reads these facts.
+    state.triggered[symbol] = {
+        "at": tick.now.isoformat(), "price": entry, "allowed": False,
+        "sent": False, "mode": tick.book.mode, "side": "short" if short else "long",
+        "stop": stop, "target": target, "qty": int(quantity), "reason": reason,
+    }
+
+    extra = f"stop {stop:.2f}"
+    if target > 0:
+        extra += f", target {target:.2f}"
+    else:
+        extra += ", no target, this book leaves on its stop or at the close"
+    facts = facts_line(trade_facts(state, symbol, guard))
+    if facts:
+        extra += f" [{facts}]"
     if short:
         extra += f", borrow: {borrow.note}"
     decision = consider(tick, state, guard, account_state, intent, broker, guards,
                         extra=extra, model=result.model, cost=None,
                         prompt_hash=result.prompt_hash, stop=stop, target=target)
-    state.triggered[symbol] = {
-        "at": tick.now.isoformat(), "price": entry, "allowed": decision.allowed,
-        "sent": False, "mode": tick.book.mode, "side": "short" if short else "long",
-        "stop": stop, "target": target, "qty": int(quantity), "reason": reason,
-    }
+    state.triggered[symbol]["allowed"] = decision.allowed
     if decision.daily_halt:
         state.halt("a guardrail asked for a halt for the rest of the day")
+
+
+def trade_facts(state: bs.BookState, symbol: str,
+                guard: gr.Guardrails | None = None) -> dict:
+    """The eight facts item A15 asks for on every decision and every fill.
+
+    Momentum v2, approved by Mo on 2026-09-06. Without these, luck and judgment
+    cannot be told apart at the end of the month: two books can show the same
+    profit while one of them was taking twice the risk for it.
+
+        decision_price   what the pick was made at, so the ledger can work out
+                         the slippage against the price actually paid. The
+                         Trades tab fills the slippage in itself from this and
+                         the fill price.
+        atr              the 14 day average true range, which is what the stop
+                         was measured from
+        rel_volume       how many times its normal pace the name was trading at
+        rank             its place in that morning's relative volume ranking
+        candle           the first five minute candle, written as its open and
+                         close, because its sign is the direction rule
+        risk_usd         how much money this trade was set up to lose
+        sector           the industry, which the sector cap counts against
+
+    Everything comes off the shortlist row and the trigger record, both of which
+    are written before the decision, so nothing here is worked out after the
+    fact.
+    """
+    row = shortlist_row(state, symbol)
+    raw = state.triggered.get(symbol) if isinstance(state.triggered, dict) else None
+    trigger = raw if isinstance(raw, dict) else {}
+
+    decision_price = _number(trigger.get("price")) or None
+    stop = _number(trigger.get("stop"))
+    quantity = _number(trigger.get("qty"))
+    risk_usd = None
+    if decision_price and stop > 0 and quantity > 0:
+        risk_usd = round(abs(decision_price - stop) * quantity, 2)
+
+    opened = _number(row.get("opening_range_open")) or None
+    closed = _number(row.get("opening_range_close")) or None
+    candle = None
+    if opened is not None and closed is not None:
+        way = "up" if closed > opened else ("down" if closed < opened else "flat")
+        candle = f"{opened:.2f} to {closed:.2f} ({way})"
+
+    return {
+        "decision_price": decision_price,
+        "decision_time": trigger.get("at") or None,
+        "atr": _number(row.get("atr")) or None,
+        "rel_volume": _number(row.get("rel_volume")) or None,
+        "rank": row.get("rank"),
+        "candle": candle,
+        "risk_usd": risk_usd,
+        "sector": sector_for(state, symbol),
+    }
+
+
+def facts_line(facts: dict) -> str:
+    """The A15 facts as one short readable phrase for a Notes cell or a reason."""
+    parts = []
+    if facts.get("rank") is not None:
+        parts.append(f"rank {facts['rank']}")
+    if facts.get("rel_volume"):
+        parts.append(f"relative volume {facts['rel_volume']:.2f}x")
+    if facts.get("atr"):
+        parts.append(f"atr {facts['atr']:.2f}")
+    if facts.get("candle"):
+        parts.append(f"opening candle {facts['candle']}")
+    if facts.get("risk_usd"):
+        parts.append(f"risking {facts['risk_usd']:,.2f} dollars")
+    if facts.get("sector"):
+        parts.append(f"sector {facts['sector']}")
+    if facts.get("decision_price"):
+        parts.append(f"decided at {facts['decision_price']:.2f}")
+    return ", ".join(parts)
+
+
+def size_for(tick: BookTick, guard: gr.Guardrails, account_state, symbol: str,
+             entry: float, stop: float, model_hint: int = 0) -> int:
+    """How many shares to buy, and a written note whenever something cut it.
+
+    Momentum v2, item A6, approved by Mo on 2026-09-06. The book risks a fixed
+    slice of itself on every trade and lets the stop decide the share count:
+    0.25 percent of book equity divided by the distance from the entry price to
+    the stop. So a name with a wide stop gets fewer shares and one with a tight
+    stop gets more, and every position loses about the same when it is wrong.
+    The notional caps are still the ceiling over the top of it, because a very
+    tight stop would otherwise buy an enormous position.
+
+    A book with no risk_per_trade_pct, which is the insider and Congress books,
+    gets the old answer: whatever the notional caps allow.
+
+    Whatever the model asked for in qty_hint is only ever a ceiling, never a
+    floor. The momentum prompt no longer asks for one at all.
+    """
+    if _number(stop) > 0 and guard.money.risk_per_trade_pct:
+        shares = gr.shares_for_risk(guard, account_state, symbol, entry, stop)
+        risked = abs(entry - stop) * shares
+        tick.note(f"{symbol}: {shares} shares, which risks {risked:,.2f} dollars at a "
+                  f"stop {abs(entry - stop):.2f} away, being "
+                  f"{_plain_pct(guard.money.risk_per_trade_pct)} percent of the book")
+    else:
+        shares = gr.max_shares_for(guard, account_state, symbol, entry)
+
+    if model_hint > 0 and model_hint < shares:
+        tick.note(f"{symbol}: cut from {shares} shares to {model_hint}, because the "
+                  "answer asked for fewer and a smaller position is always allowed")
+        shares = model_hint
+    return int(max(0, shares))
+
+
+def _plain_pct(value: float) -> str:
+    """A percentage a person can read, so 0.25 stays 0.25 and 4.0 reads as 4."""
+    return f"{value:g}"
 
 
 def _borrow_answer(state: bs.BookState, symbol: str) -> broker_mod.BorrowTerms:
@@ -1446,16 +1757,22 @@ def _borrow_answer(state: bs.BookState, symbol: str) -> broker_mod.BorrowTerms:
 
 
 def _entry_intent(symbol: str, short: bool, quantity: int, price: float,
-                  book_id: str, borrow: broker_mod.BorrowTerms) -> gr.OrderIntent:
+                  book_id: str, borrow: broker_mod.BorrowTerms,
+                  sector: str | None = None) -> gr.OrderIntent:
     """One entry order, with the borrow terms on it when it is a short.
 
     A long carries none of them, because nothing is being borrowed. A short
     carries all four exactly as the broker reported them, unknowns included, and
     an unknown is what the guardrails refuse on.
+
+    sector is the industry the sector cap counts against (Momentum v2, item A9).
+    It is passed on exactly as the scanner reported it, None included, because
+    None is what that rule refuses on for the same reason.
     """
     return gr.OrderIntent(
         symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
         limit_price=round(price, 2), purpose="entry", book_id=book_id,
+        sector=sector,
         shortable=bool(borrow.shortable) if short else False,
         shortable_level=borrow.level if short else None,
         borrow_fee_pct_annual=borrow.fee_pct_annual if short else None,
@@ -1476,20 +1793,57 @@ class Levels:
     reject: str | None = None
 
 
-def _opening_range(state: bs.BookState, symbol: str) -> tuple[float | None, float | None]:
-    """The low and high of the first five minutes for one name, off the shortlist."""
+def shortlist_row(state: bs.BookState, symbol: str) -> dict:
+    """One name's row off this book's shortlist, or an empty dict."""
     for row in state.shortlist:
         if isinstance(row, dict) and str(row.get("symbol") or "").upper() == symbol:
-            low = _number(row.get("opening_range_low")) or None
-            high = _number(row.get("opening_range_high")) or None
-            return low, high
-    return None, None
+            return row
+    return {}
+
+
+def _opening_range(state: bs.BookState, symbol: str) -> tuple[float | None, float | None]:
+    """The low and high of the first five minutes for one name, off the shortlist."""
+    row = shortlist_row(state, symbol)
+    low = _number(row.get("opening_range_low")) or None
+    high = _number(row.get("opening_range_high")) or None
+    return low, high
+
+
+def atr_for(state: bs.BookState, symbol: str) -> float | None:
+    """The 14 day average true range for one name, off the shortlist row.
+
+    Momentum v2, item A1 (Mo, 2026-09-06). The scanner works it out from the
+    daily bars it already has and writes it onto the row, so the loop never has
+    to spend a data request on it. None means the scanner could not work one
+    out, and then the stop falls back to the plain percentage, which is what
+    stop_price_for in agent/guardrails.py does with a None.
+    """
+    return _number(shortlist_row(state, symbol).get("atr")) or None
+
+
+def sector_for(state: bs.BookState, symbol: str) -> str | None:
+    """Which industry one name is in, off the shortlist row.
+
+    Momentum v2, item A9. The scanner reads it from IBKR's contract details
+    (the industry field, falling back to category and then subcategory) and
+    writes it onto the row. None means the broker did not say, and the sector
+    cap in agent/guardrails.py refuses an entry rather than assuming it is
+    harmless. Which is the whole point: a cap that cannot be measured is not a
+    cap.
+    """
+    row = shortlist_row(state, symbol)
+    for key in ("sector", "industry", "category"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return None
 
 
 def protective_levels(guard: gr.Guardrails, *, entry: float, short: bool,
                       model_stop: float, model_target: float,
                       opening_range_low: float | None = None,
-                      opening_range_high: float | None = None) -> Levels:
+                      opening_range_high: float | None = None,
+                      atr: float | None = None) -> Levels:
     """The stop and the target a position is opened with, after the rules have had them.
 
     The model proposes both. It may move a stop nearer to the entry price and it
@@ -1515,7 +1869,7 @@ def protective_levels(guard: gr.Guardrails, *, entry: float, short: bool,
     side = "SELL" if short else "BUY"
     try:
         rule_stop = gr.stop_price_for(guard, entry, opening_range_low, side,
-                                      opening_range_high)
+                                      opening_range_high, atr=atr)
     except gr.GuardrailError as exc:
         return Levels(reject=f"the rule stop could not be worked out: {exc}")
 
@@ -1538,7 +1892,19 @@ def protective_levels(guard: gr.Guardrails, *, entry: float, short: bool,
         stop = clamped
 
     target = _number(model_target)
-    if target > 0 and ((not short and target <= entry) or (short and target >= entry)):
+    if not guard.risk.use_profit_target:
+        # Momentum v2, item A2, approved by Mo on 2026-09-06. This book has no
+        # profit target at all: a position leaves by its stop or at the close and
+        # by nothing else. Two independent studies found that a target destroys
+        # this strategy's edge, because the few trades that run a long way are
+        # what pay for all the small losses. A target that arrives anyway, from a
+        # model that did not read its prompt, is dropped and written down.
+        if target > 0:
+            notes.append(
+                f"the target {target:.2f} was dropped: this book takes no profit "
+                "target at all, and a position leaves on its stop or at the close")
+        target = 0.0
+    elif target > 0 and ((not short and target <= entry) or (short and target >= entry)):
         notes.append(
             f"the target {target:.2f} is on the wrong side of the entry {entry:.2f} for "
             f"a {'short' if short else 'long'}, so it is dropped and this position runs "
@@ -1571,16 +1937,18 @@ def fill_levels(state: bs.BookState, symbol: str, short: bool, price: float,
                        "levels are used unchecked"])
 
     low, high = _opening_range(state, symbol)
+    atr = atr_for(state, symbol)
     levels = protective_levels(guard, entry=price, short=short, model_stop=model_stop,
                                model_target=model_target, opening_range_low=low,
-                               opening_range_high=high)
+                               opening_range_high=high, atr=atr)
     if not levels.reject:
         return levels
 
     # The shares are already ours, so refusing is not on the table. Fall back to
     # the rule stop, which is always on the right side of the fill price.
     try:
-        rule = gr.stop_price_for(guard, price, low, "SELL" if short else "BUY", high)
+        rule = gr.stop_price_for(guard, price, low, "SELL" if short else "BUY", high,
+                                 atr=atr)
     except gr.GuardrailError as exc:
         return Levels(0.0, 0.0, [f"{levels.reject}, and the rule stop failed too: {exc}"])
     return Levels(rule, 0.0,
@@ -1688,9 +2056,16 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
     if plan.family == MOMENTUM and vwap and plan.vwap_fade_closes:
         if closes_through_vwap >= plan.vwap_fade_closes:
             bars = "close" if closes_through_vwap == 1 else "closes in a row"
-            return "fade", (f"momentum faded, {closes_through_vwap} five minute {bars} "
-                            f"back through the day's vwap {vwap:.2f}, and this book "
-                            f"calls a fade at {plan.vwap_fade_closes}")
+            why = (f"momentum faded, {closes_through_vwap} five minute {bars} "
+                   f"back through the day's vwap {vwap:.2f}, and this book "
+                   f"calls a fade at {plan.vwap_fade_closes}")
+            if plan.vwap_fade_acts:
+                return "fade", why
+            # Momentum v2, item D2 (Mo, 2026-09-06). In month one the fade is a
+            # logged observation and closes nothing. The caller writes the line
+            # and holds the position, so at the end of the month Mo can read
+            # what every fade would have cost or saved.
+            return "fade_observed", why
     return None, ""
 
 
@@ -1887,18 +2262,42 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
         model_says = str(view.get("action") or "").lower()
         model_reason = str(view.get("rationale") or "")
 
-        # "fade" is an answer, not a shrug. The manage prompt offers hold, fade
-        # and exit, and says in as many words that code treats a fade as a
-        # reason to close now, so a fade that was written down and then ignored
-        # would be the prompt lying to the model. Both close the position with
-        # purpose exit; what differs is the reason written into the record.
-        if trigger is None and model_says in ("exit", "fade"):
-            trigger = f"model_{model_says}"
-            what = ("asked to close it now" if model_says == "exit"
-                    else "called the momentum gone")
-            why = (f"the model {what}: {model_reason or 'no reason given'}")
+        # THE FADE IS AN OBSERVATION IN MONTH ONE, item D2 (Mo, 2026-09-06).
+        # Both the rule fade and a fade the model called are written into the
+        # ledger as fade_observed and close nothing at all. The fade comes from
+        # a different published strategy and was never tested here, so month one
+        # measures the pick and records what every fade would have cost or
+        # saved. An "exit" from the model still closes the position, which is
+        # what the manage prompt now says in as many words.
+        #
+        # Set risk.vwap_fade_action to `exit` in a book's strategy.yaml and the
+        # old behaviour comes straight back, for the rule and for the model
+        # together.
+        if trigger is None and model_says == "exit":
+            trigger = "model_exit"
+            why = f"the model asked to close it now: {model_reason or 'no reason given'}"
+        elif trigger is None and model_says == "fade":
+            if plan.vwap_fade_acts:
+                trigger = "model_fade"
+                why = ("the model called the momentum gone: "
+                       f"{model_reason or 'no reason given'}")
+            else:
+                trigger = "fade_observed"
+                why = ("the model called the momentum gone: "
+                       f"{model_reason or 'no reason given'}")
         elif trigger is not None and model_reason:
             why = f"{why}. The model said {model_says or 'nothing'}: {model_reason}"
+
+        if trigger == "fade_observed":
+            # Written down, acted on never. The position is held.
+            tick.say(f"  {symbol}: a fade would have closed this, and in month one "
+                     "it only gets written down")
+            tick.rule("vwap_fade_observed", f"{symbol}: {why}",
+                      "logged only, the position was held (item D2, month one)")
+            tick.record(state, symbol, "fade observed, position held", why,
+                        model=result.model if result else None, cost=None,
+                        prompt_hash=result.prompt_hash if result else "")
+            continue
 
         if trigger is None:
             tick.say(f"  holding {symbol}, no rule has fired")
@@ -1937,6 +2336,31 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
     _fire_waiting_entries(tick, state, plan, guard, broker, account_state, guards)
 
 
+def positions_now(state: bs.BookState) -> dict:
+    """What this book holds right now, keyed by symbol."""
+    return state.all_positions()
+
+
+def note_late_entry(tick: BookTick, state: bs.BookState, plan: BookPlan,
+                    symbol: str, detail: str) -> None:
+    """Write down one entry the 10:15 cutoff stopped, item D3.
+
+    Mo moved the cutoff from 11:00 to 10:15 on 2026-09-06 because entries after
+    10:15 chase moves that have already been made. Every entry it blocks is
+    written into the ledger under the rule id entries_cutoff, so at the end of
+    the month the cutoff can be measured rather than argued about: if the names
+    it turned away all went on to run, the cutoff cost money and should move
+    back.
+    """
+    reason = (f"{symbol}: new entries stopped at {plan.entries_until:%H:%M} New York "
+              f"time and it is {tick.now:%H:%M}, so {detail}")
+    tick.note(reason)
+    tick.rule("entries_cutoff", reason,
+              "no entry order was worked out, and this row is what measures what the "
+              "cutoff cost")
+    tick.record(state, symbol, "no entry, past the cutoff", reason)
+
+
 def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
                           guard: gr.Guardrails, broker: broker_mod.Broker,
                           account_state, guards: Guards) -> None:
@@ -1952,9 +2376,16 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
             tick.note(f"no new positions this tick: {blocked}")
         return
     if not gr.entries_allowed_now(guard, tick.now):
-        if state.picks:
-            tick.note(f"new entries closed at {plan.entries_until:%H:%M}, so a pick "
-                      "that has not fired by now is left alone")
+        for pick in state.picks:
+            if not isinstance(pick, dict):
+                continue
+            symbol = str(pick.get("symbol") or "").upper()
+            already = state.triggered.get(symbol) or {}
+            if not symbol or symbol in positions_now(state) or already.get("allowed") \
+                    or already.get("sent") or already.get("skipped"):
+                continue
+            note_late_entry(tick, state, plan, symbol,
+                            "the trigger had not been broken by the cutoff")
         return
 
     positions = state.all_positions()
@@ -2011,20 +2442,16 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
                                        "skipped": "past target"}
             continue
 
-        # Size on the price we would actually pay, not the price we planned for.
-        quantity = gr.max_shares_for(guard, account_state, symbol, last_close)
-        if quantity <= 0:
-            tick.record(state, symbol, "no entry",
-                        f"at {last_close:.2f} this book's limits allow zero shares")
-            continue
         # The trade is entered at the price the market gave, not the one the pick
         # planned for, so the stop is re-measured from there before anything is
-        # sent. Same clamp, same rejection, same reasons written down.
+        # sent. Same clamp, same rejection, same reasons written down. The stop
+        # comes first now, because the share count is worked out from it.
         low, high = _opening_range(state, symbol)
         levels = protective_levels(guard, entry=last_close, short=short,
                                    model_stop=_number(pick.get("stop")),
                                    model_target=target, opening_range_low=low,
-                                   opening_range_high=high)
+                                   opening_range_high=high,
+                                   atr=atr_for(state, symbol))
         if levels.reject:
             tick.say(f"  {symbol}: rejected. {levels.reject}")
             tick.rule("decision_rejected", f"{symbol}: {levels.reject}",
@@ -2037,42 +2464,108 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
         for message in levels.notes:
             tick.note(f"{symbol}: {message}")
 
+        # Size on the price we would actually pay, not the price we planned for.
+        quantity = size_for(tick, guard, account_state, symbol, last_close, levels.stop)
+        if quantity <= 0:
+            tick.record(state, symbol, "no entry",
+                        f"at {last_close:.2f} this book's limits allow zero shares")
+            continue
+
         borrow = _borrow_answer(state, symbol)
         intent = _entry_intent(symbol, short, quantity, last_close,
-                               tick.book.book_id, borrow)
+                               tick.book.book_id, borrow,
+                               sector=sector_for(state, symbol))
         tick.say(f"  {symbol} broke its {entry:.2f} trigger, now {last_close:.2f}")
-        decision = consider(tick, state, guard, account_state, intent, broker, guards,
-                            extra=f"stop {levels.stop:.2f}, target {levels.target:.2f}"
-                                  + (f", borrow: {borrow.note}" if short else ""),
-                            stop=levels.stop, target=levels.target)
+
+        # Same order as the pick path: the trigger record first, because a fill
+        # can arrive inside consider() and its ledger row reads these facts.
         state.triggered[symbol] = {
             "at": tick.now.isoformat(), "price": last_close,
-            "allowed": decision.allowed, "sent": False, "mode": tick.book.mode,
+            "allowed": False, "sent": False, "mode": tick.book.mode,
             "side": "short" if short else "long", "stop": levels.stop,
             "target": levels.target, "qty": int(quantity)}
+        extra = f"stop {levels.stop:.2f}"
+        if levels.target > 0:
+            extra += f", target {levels.target:.2f}"
+        facts = facts_line(trade_facts(state, symbol, guard))
+        if facts:
+            extra += f" [{facts}]"
+        if short:
+            extra += f", borrow: {borrow.note}"
+        decision = consider(tick, state, guard, account_state, intent, broker, guards,
+                            extra=extra, stop=levels.stop, target=levels.target)
+        state.triggered[symbol]["allowed"] = decision.allowed
         if decision.daily_halt:
             state.halt("a guardrail asked for a halt for the rest of the day")
+
+
+def flatten_price(quote: dict | None, short: bool) -> float | None:
+    """The price a limit flatten goes out at: the bid to sell, the ask to buy.
+
+    Momentum v2, item A11 (Mo, 2026-09-06). From 15:45 the book gets out with
+    limit orders sitting on the other side's price, because spreads widen and
+    depth collapses in the last few minutes and a market order into that pays
+    for the hurry. Closing a long means selling, so it takes the bid. Closing a
+    short means buying, so it takes the ask.
+
+    None when the quote carries neither, and then the caller sends a market
+    order and says so, because being flat matters more than the last few cents.
+    """
+    if not isinstance(quote, dict):
+        return None
+    wanted = "ask" if short else "bid"
+    price = _number(quote.get(wanted), -1.0)
+    if price > 0:
+        return round(price, 2)
+    return snapshot_price(quote)
 
 
 def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
                guard: gr.Guardrails, broker: broker_mod.Broker, account_state,
                guards: Guards) -> None:
-    """Close everything. The momentum books carry nothing overnight, ever."""
+    """Close everything, in the two stages Momentum v2 asks for (item A11).
+
+    From flatten_at, 15:45, every position goes out as a LIMIT order at the bid
+    for a long and the ask for a short. Spreads widen and depth collapses in the
+    last few minutes of the day, so a market order into that pays for the hurry.
+
+    From flatten_market_at, 15:55, anything still open goes out at MARKET. That
+    is the backstop, and it exists because being flat matters more than the last
+    few cents. A book with no flatten_market_at in its settings behaves exactly
+    as it always did and sends market orders throughout.
+    """
     positions = state.all_positions()
     if not positions:
         tick.say(f"Nothing is open at {plan.flatten_at:%H:%M}, so there is nothing "
                  "to close.")
         return
-    tick.say(f"It is past {plan.flatten_at:%H:%M}. Closing all {len(positions)} "
-             "open positions.")
+
+    at_market = plan.flatten_market_at is None or gr.must_flatten_at_market_now(
+        guard, tick.now)
+    if at_market:
+        tick.say(f"It is past {(plan.flatten_market_at or plan.flatten_at):%H:%M}. "
+                 f"Closing all {len(positions)} open positions at market, which is "
+                 "the backstop.")
+    else:
+        tick.say(f"It is past {plan.flatten_at:%H:%M}. Closing all {len(positions)} "
+                 "open positions with limit orders at the bid or the ask. Anything "
+                 f"still open at {plan.flatten_market_at:%H:%M} goes out at market.")
+
     quotes = snapshot_by_symbol(broker, [{"symbol": s} for s in positions], [])
     counter = make_day_trade_counter(guard)
     today = tick.now.date()
     for symbol, position in positions.items():
         price = snapshot_price(quotes.get(symbol))
+        limit = None
+        if not at_market:
+            limit = flatten_price(quotes.get(symbol), position.is_short)
+            if limit is None:
+                tick.note(f"{symbol}: no bid or ask came back, so this one goes out "
+                          "at market rather than waiting for a price that may not "
+                          "arrive before the close")
         intent = gr.OrderIntent(
             symbol=symbol, side="BUY" if position.is_short else "SELL",
-            qty=int(round(abs(position.qty))), limit_price=None, purpose="flatten",
+            qty=int(round(abs(position.qty))), limit_price=limit, purpose="flatten",
             book_id=tick.book.book_id)
         verdict = day_trade_check(guard, intent, today, counter, position.opened_on)
         if verdict.blocked:
@@ -2082,9 +2575,12 @@ def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
             tick.record(state, symbol, "flatten refused by the day trade rule",
                         verdict.reason)
             continue
+        how = ("at market" if intent.limit_price is None
+               else f"limit {intent.limit_price:.2f} on the "
+                    f"{'ask' if position.is_short else 'bid'}")
         consider(tick, state, guard, account_state, intent, broker, guards,
-                 extra=(f"end of day close out, last price {price:.2f}" if price
-                        else "end of day close out"))
+                 extra=(f"end of day close out {how}, last price {price:.2f}" if price
+                        else f"end of day close out {how}"))
 
 
 def write_daily(tick: BookTick, state: bs.BookState) -> None:
@@ -2114,6 +2610,45 @@ def write_daily(tick: BookTick, state: bs.BookState) -> None:
 
 # ------------------------------------------------------------------- one book
 
+def sector_exposure_for(state: bs.BookState) -> dict[str, float]:
+    """How much money this book has in each industry, as {industry: dollars}.
+
+    The industry comes off the shortlist row the position was opened from, which
+    is where the scanner wrote what IBKR's contract details said. A position
+    whose industry nobody knows is counted under the empty string, which no
+    sector cap ever matches, so it never quietly makes room for another name in
+    a sector it might belong to.
+    """
+    out: dict[str, float] = {}
+    for symbol, position in state.all_positions().items():
+        sector = sector_for(state, symbol) or ""
+        out[sector] = round(out.get(sector, 0.0) + abs(_number(position.market_value)), 2)
+    return out
+
+
+def fill_v2_state(account_state, state: bs.BookState, book: gr.BookConfig,
+                  now: datetime) -> None:
+    """Put the Momentum v2 facts on the snapshot the guardrails check against.
+
+    Three of the new rules need facts only the loop can see (Mo, 2026-09-06):
+
+        week_pnl, month_pnl, consecutive_losing_days
+                          item A8, read out of this book's earlier state files
+        sector_exposure   item A9, this book's money by industry
+
+    The two account wide figures, account_equity and symbol_exposure_all_books,
+    are filled in by main() instead, because only main() sees all five books at
+    once. Left empty here they fall back to this book's own numbers, which is
+    the tighter and therefore safer answer.
+    """
+    history = loss_history(book.order_ref, now.date(),
+                           _number(state.realized_pnl_today))
+    account_state.week_pnl = history.week_pnl
+    account_state.month_pnl = history.month_pnl
+    account_state.consecutive_losing_days = history.losing_days
+    account_state.sector_exposure = sector_exposure_for(state)
+
+
 def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: Guards,
              broker: broker_mod.Broker, account_id: str, broker_positions: dict,
              rules: str, write_ledger: bool, halt_reason: str | None = None,
@@ -2134,6 +2669,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
 
     account_state = bs.account_state_for(
         state, gr, now, account_id, guards.stop_present, broker_positions)
+    fill_v2_state(account_state, state, book, now)
 
     phase, why = phase_for(now, plan, pick_done=state.picked_at is not None,
                            last_manage_at=state.last_manage_at, swept_at=state.swept_at)
@@ -2151,7 +2687,9 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
             print(f"  HALTED: {state.halt_reason}")
 
     try:
-        if phase == SWEEP:
+        if phase == PREOPEN:
+            do_preopen(tick, state, broker)
+        elif phase == SWEEP:
             do_sweep(tick, state, plan, sweep_due(now, plan, state.swept_at) or "")
         elif phase == SCAN:
             do_scan(tick, state, plan)
@@ -2175,6 +2713,22 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         tick.rule("book_failed", f"the {phase} phase of book {book.book_id} raised "
                   f"{type(exc).__name__}: {exc}", "this book was skipped this tick")
 
+    # Item A9 asks for the count of positions pointing the same way at once to
+    # be written down every tick, because five morning gappers all long is one
+    # bet made five times and the ledger should say so.
+    held = state.all_positions().values()
+    longs = sum(1 for position in held if not position.is_short)
+    shorts = len(held) - longs
+    if held:
+        tick.rule("same_direction_count",
+                  f"book {book.book_id} holds {longs} long and {shorts} short at "
+                  f"{now:%H:%M}, in "
+                  f"{len({sector_for(state, s) or 'unknown' for s in state.all_positions()})} "
+                  "industries", "written down, nothing was blocked")
+
+    tick.next_tick_seconds = gr.next_tick_seconds(
+        guard, now, holding=bool(state.all_positions() or state.working_orders))
+
     state.tick_count += 1
     state.last_tick = now.isoformat()
     state.last_phase = phase
@@ -2196,7 +2750,31 @@ def tick_log_line(now: datetime, rules: str, book: gr.BookConfig, tick: BookTick
             f"picks={len(state.picks)} | would_be_orders={tick.would_be_orders} | "
             f"approved={tick.approved} | refused={tick.refused} | sent={tick.sent} | "
             f"halted={'yes' if state.halted else 'no'} | "
-            f"model_cost={tick.model_cost:.4f} | notes={len(tick.notes)}")
+            f"model_cost={tick.model_cost:.4f} | notes={len(tick.notes)} | "
+            f"next_tick={tick.next_tick_seconds}s")
+
+
+#: Where the loop writes how soon it wants waking again, in whole seconds.
+#: agent/run_tick.sh reads it after every tick. See docs/LOOP.md.
+NEXT_TICK_FILE = "next_tick_seconds"
+
+
+def write_next_tick(seconds: int) -> Path:
+    """Say how soon this loop wants waking again, in one small file. Item A14.
+
+    launchd wakes the loop on a fixed timetable and cannot be told to speed up
+    mid morning, so the cadence is written here instead and the wrapper honours
+    it: agent/run_tick.sh reads this file after a tick and, when it says less
+    than a minute, runs a short in-process sub-loop of its own until the next
+    launchd wake up is due. That way the 30 second cadence between 09:35 and
+    11:00 costs no change to the launchd job at all.
+
+    The number written is the SMALLEST any book asked for, because the loop
+    ticks every book together and the busiest one sets the pace.
+    """
+    path = output_dir() / NEXT_TICK_FILE
+    path.write_text(f"{max(1, int(seconds))}\n")
+    return path
 
 
 def write_tick_log(lines: list[str]) -> Path:
@@ -2353,7 +2931,8 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
         print(f"  halted this tick: {', '.join(sorted(halts))}")
 
     lines: list[str] = []
-    totals = {"would_be": 0, "approved": 0, "refused": 0, "sent": 0, "cost": 0.0}
+    totals = {"would_be": 0, "approved": 0, "refused": 0, "sent": 0, "cost": 0.0,
+              "next_tick": 300}
     any_daily = False
 
     for book in books:
@@ -2377,6 +2956,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
         totals["refused"] += tick.refused
         totals["sent"] += tick.sent
         totals["cost"] += tick.model_cost
+        totals["next_tick"] = min(totals["next_tick"], tick.next_tick_seconds)
         any_daily = any_daily or state.daily_written
 
     if any_daily and equity > 0:
@@ -2390,6 +2970,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
             dry_run=not args.write_ledger)
 
     path = write_tick_log(lines)
+    cadence = write_next_tick(int(totals["next_tick"]))
     print("\n" + "=" * 78)
     for line in lines:
         print(line)
@@ -2397,12 +2978,16 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
           f"{totals['refused']} refused, {totals['sent']} sent, "
           f"{totals['cost']:.4f} dollars of model spend")
     print(f"Tick log {path}")
+    print(f"Next tick wanted in {int(totals['next_tick'])} seconds ({cadence})")
     if RECONCILE_ERROR:
         print(f"agent/reconcile.py could not be imported ({RECONCILE_ERROR}), so every "
               "book was halted this tick.")
     if PDT_ERROR:
         print(f"agent/pdt.py could not be imported ({PDT_ERROR}), so day trades were "
               "read from the book files and the five day count is unknown.")
+    if PREOPEN_ERROR:
+        print(f"agent/preopen.py could not be imported ({PREOPEN_ERROR}), so nothing "
+              "was gathered before the open and the scanner works it out at 09:35.")
     return 0
 
 

@@ -182,7 +182,12 @@ def test_momentum_phases_through_the_day():
     assert plan.manage_minutes == 5
     assert plan.flat_by_close is True
 
-    assert loop.phase_for(at(9, 0), plan)[0] == loop.IDLE
+    # 09:00 is when the pre-open run starts, not when the book is idle. It
+    # gathers the history the 09:35 ranking needs, spread out so the data budget
+    # is not spent in the five minutes around the open. See docs/PREOPEN_FLOW.md.
+    assert loop.phase_for(at(8, 55), plan)[0] == loop.IDLE
+    assert loop.phase_for(at(9, 0), plan)[0] == loop.PREOPEN
+    assert loop.phase_for(at(9, 25), plan)[0] == loop.PREOPEN
     assert loop.phase_for(at(9, 31), plan)[0] == loop.SCAN
     assert loop.phase_for(at(9, 36), plan)[0] == loop.PICK
     assert loop.phase_for(at(9, 36), plan, pick_done=True)[0] == loop.MANAGE
@@ -190,6 +195,7 @@ def test_momentum_phases_through_the_day():
     assert loop.phase_for(at(12, 5), plan, pick_done=True)[0] == loop.MANAGE
     # Past the entry window with no pick, it manages rather than picking.
     assert loop.phase_for(at(12, 5), plan)[0] == loop.MANAGE
+    assert loop.phase_for(at(15, 46), plan, pick_done=True)[0] == loop.FLATTEN
     assert loop.phase_for(at(15, 56), plan, pick_done=True)[0] == loop.FLATTEN
     assert loop.phase_for(at(16, 5), plan, pick_done=True)[0] == loop.CLOSED
     assert loop.phase_for(at(10, 15, SATURDAY), plan)[0] == loop.CLOSED
@@ -293,7 +299,7 @@ def test_a_full_mode_book_without_the_variable_never_reaches_the_broker(sandbox)
     state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
     account_state = bs.account_state_for(state, gr, at(9, 40), "DUT077572", False, {})
     intent = gr.OrderIntent(symbol="AAPL", side="BUY", qty=10, limit_price=100.0,
-                            purpose="entry", book_id="A")
+                            purpose="entry", book_id="A", sector="Technology")
 
     decision = loop.consider(tick, state, guard, account_state, intent, broker,
                              loop.read_guards())
@@ -313,7 +319,7 @@ def test_the_order_reference_is_the_books_own_tag(sandbox):
                          write_ledger=False, quiet=True)
     state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
     intent = gr.OrderIntent(symbol="AAPL", side="BUY", qty=10, limit_price=100.0,
-                            purpose="entry", book_id="A")
+                            purpose="entry", book_id="A", sector="Technology")
 
     loop.submit(tick, state, intent, broker, guard)
 
@@ -343,10 +349,23 @@ def test_loop_disabled_does_nothing_at_all(sandbox):
 
 
 def _momentum_shortlist():
+    """Two candidate rows in the Momentum v2 shape (Mo, 2026-09-06).
+
+    Each carries the first five minute candle, whose sign is the direction rule
+    (item A5), the 14 day average true range the stop is measured from (item
+    A1), its place in the relative volume ranking (item A4), and the industry
+    the sector cap counts against (item A9). A row with no industry cannot be
+    entered at all, so leaving one out is a test of that rule rather than a
+    shortcut.
+    """
     return [{"symbol": "AAPL", "opening_range_high": 100.0, "opening_range_low": 99.0,
-             "score": 10.0, "gain_pct": 4.0, "rel_volume": 3.0},
+             "opening_range_open": 99.2, "opening_range_close": 99.8,
+             "atr": 2.0, "atr_pct_of_price": 2.0, "rank": 1, "sector": "Technology",
+             "score": 3.0, "gain_pct": 4.0, "rel_volume": 3.0},
             {"symbol": "MSFT", "opening_range_high": 200.0, "opening_range_low": 198.0,
-             "score": 8.0, "gain_pct": 3.0, "rel_volume": 2.5}]
+             "opening_range_open": 198.5, "opening_range_close": 199.5,
+             "atr": 4.0, "atr_pct_of_price": 2.0, "rank": 2, "sector": "Health Care",
+             "score": 2.5, "gain_pct": 3.0, "rel_volume": 2.5}]
 
 
 def _pick_tick(sandbox, book_id="B", now=None, halt_reason=None, broker=None):
@@ -580,7 +599,7 @@ def test_the_stop_the_target_and_the_fade_each_close_a_long():
     assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5, 101.0,
                                 closes_through_vwap=1)[0] is None
     assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5, 101.0,
-                                closes_through_vwap=2)[0] == "fade"
+                                closes_through_vwap=2)[0] == "fade_observed"
     assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5,
                                 100.0)[0] is None
 
@@ -596,7 +615,7 @@ def test_a_short_is_the_mirror_image():
     assert loop.exit_reason_for(short, plan, guard, TUESDAY, 99.0, 98.0,
                                 closes_through_vwap=1)[0] is None
     assert loop.exit_reason_for(short, plan, guard, TUESDAY, 99.0, 98.0,
-                                closes_through_vwap=2)[0] == "fade"
+                                closes_through_vwap=2)[0] == "fade_observed"
 
 
 def test_the_insider_book_has_a_time_stop_and_no_fade():

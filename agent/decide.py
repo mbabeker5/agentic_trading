@@ -94,7 +94,7 @@ BARS_KEPT = 6
 # month of decisions made against one packet shape cannot be silently compared
 # with a month made against another. Bump it when a field is added or removed
 # from what build_pick_packet in agent/loop.py writes.
-PACKET_SCHEMA_VERSION = "2026-09-06"
+PACKET_SCHEMA_VERSION = "2026-09-06-momentum-v2"
 
 # How long one model call may take, and how long the whole thing may take.
 # 45 seconds is handed to the adapter as its socket timeout with no retries
@@ -106,7 +106,9 @@ MODEL_BUDGET_S = 60.0
 
 # How many names one call may pick when a strategy.yaml does not say. Every
 # strategy.yaml does say, as risk.max_picks, and this is only the floor under a
-# missing file.
+# missing file. Ten in the momentum books since Momentum v2 (item D1, Mo
+# 2026-09-06): ten small positions rather than five big ones, because the
+# published edge is in the breadth of the ranking.
 DEFAULT_MAX_PICKS = 5
 
 # --------------------------------------------------- the shape of a reply
@@ -372,22 +374,33 @@ def load_params(strategy_dir: str | Path) -> tuple[dict, list[str]]:
 # setting. Two jobs: they let the prompts render before a yaml exists, and they
 # supply the one number the yaml has no key for.
 #
-# `target_r_multiple` is that number. docs/STRATEGY.md offers "a target or a
-# trailing rule" and fixes neither, so the momentum books take a target at twice
-# the distance from entry to stop and it lives here until someone puts it in the yaml.
+# There USED to be a `target_r_multiple` here, a target at twice the distance
+# from entry to stop, because the old spec offered "a target or a trailing rule"
+# and fixed neither. Momentum v2 (item A2, Mo 2026-09-06) removed the target
+# from the momentum books outright: a position leaves by its stop or at the
+# close and nothing else, because two independent studies found a target
+# destroys this strategy's edge. The insider and Congress books still have no
+# target key either; they run on a trailing stop and a time stop.
 FALLBACK_PARAMS: dict[str, dict] = {
     "momentum_hybrid": {
-        "entries_per_day_max": 5, "max_open_positions": 5, "max_position_pct": 15,
-        "max_order_notional": 15000, "stop_loss_pct": 1.5, "max_daily_loss_pct": 2,
-        "entries_until": "11:00", "flatten_at": "15:55", "price_floor": 5,
-        "short_price_floor": 10, "min_avg_volume": 1000000, "rel_volume_min": 2.0,
-        "allow_shorts": True, "gross_exposure_pct_max": 100, "target_r_multiple": 2,
-        "loop_minutes": 5, "vwap_fade_closes": 2,
+        "entries_per_day_max": 10, "max_open_positions": 10, "max_position_pct": 10,
+        "max_order_notional": 10000, "stop_loss_pct": 1.5, "max_daily_loss_pct": 1,
+        "entries_until": "10:15", "flatten_at": "15:45", "flatten_market_at": "15:55",
+        "price_floor": 5, "short_price_floor": 10, "min_avg_volume": 1000000,
+        "rel_volume_min": 2.0, "allow_shorts": False, "gross_exposure_pct_max": 100,
+        "loop_minutes": 5, "vwap_fade_closes": 2, "max_picks": 10,
+        "risk_per_trade_pct": 0.25, "stop_atr_pct": 10, "atr_days": 14,
+        "use_profit_target": False, "min_atr_usd": 0.50, "min_atr_pct_of_price": 1.5,
+        "fast_poll_seconds": 30, "fast_poll_until": "11:00",
+        "sector_gross_pct_max": 25, "account_symbol_pct_max": 15,
+        "max_weekly_loss_pct": 4, "max_monthly_loss_pct": 6,
+        "max_consecutive_losing_days": 3,
     },
     "momentum_rules": {
-        "entries_per_day_max": 3, "max_open_positions": 5, "max_position_pct": 15,
-        "stop_loss_pct": 1.5, "target_r_multiple": 2, "max_order_notional": 15000,
-        "vwap_fade_closes": 2,
+        "entries_per_day_max": 10, "max_open_positions": 10, "max_position_pct": 10,
+        "stop_loss_pct": 1.5, "max_order_notional": 10000, "vwap_fade_closes": 2,
+        "max_picks": 10, "risk_per_trade_pct": 0.25, "stop_atr_pct": 10,
+        "atr_days": 14, "use_profit_target": False,
     },
     "insider": {
         "entries_per_day_max": 3, "max_open_positions": 10, "max_position_pct": 5,
@@ -491,9 +504,17 @@ def _compact_bars(bars: list, keep: int = BARS_KEPT) -> list:
 # invent one, and an invented reason reads exactly like a real one in the
 # ledger. The insider and Congress rows below keep both keys, because their
 # sweeps read filings and the text is real.
+# Momentum v2 (Mo, 2026-09-06) added six of these. `rank` and `score` are the
+# name's place in the relative volume ranking, which is now the selection rule
+# (item A4). `atr` and `atr_pct_of_price` are what the stop and the volatility
+# filter are measured from (items A1 and A3). `opening_range_open` and
+# `opening_range_close` are the first five minute candle, whose sign is the
+# direction rule (item A5). `sector` is what the sector cap counts (item A9).
 MOMENTUM_CANDIDATE_KEYS = (
     "symbol", "long_name", "stock_type", "last", "gain_pct", "opening_range_high",
-    "opening_range_low", "rel_volume", "volume_today", "avg_volume_20d",
+    "opening_range_low", "opening_range_open", "opening_range_close",
+    "rel_volume", "rank", "volume_today", "avg_volume_20d",
+    "atr", "atr_pct_of_price", "sector",
     "session_vwap", "last_close", "score", "flagged_by",
     "shortable", "borrow_note",
 )
@@ -793,7 +814,36 @@ def parse_decision(text: str,
 
 # ------------------------------------------------------- the rules only book
 
+def direction_from_candle(row: dict) -> str | None:
+    """Long, short or no trade at all, from the first five minute candle.
+
+    Momentum v2, item A5, approved by Mo on 2026-09-06. The rule the published
+    test actually used: a candle that closed above where it opened is a long, one
+    that closed below is a short, and a flat candle, where the open and the close
+    are the same price, is NOT A TRADE. A flat candle means the buyers and the
+    sellers finished the first five minutes level, which is the opposite of the
+    thing this strategy looks for.
+
+    Returns None when the candle is flat and also when nobody recorded one, and
+    None means the name is skipped either way. The scanner writes the candle onto
+    the row as opening_range_open and opening_range_close.
+    """
+    opened = _num(row.get("opening_range_open"))
+    closed = _num(row.get("opening_range_close"))
+    if opened is None or closed is None or opened <= 0 or closed <= 0:
+        return None
+    if closed > opened:
+        return "long"
+    if closed < opened:
+        return "short"
+    return None
+
+
 def _short_candidate(row: dict) -> bool:
+    """Kept for the two filing books, which have no opening candle at all.
+
+    The momentum books go through direction_from_candle above instead.
+    """
     side = str(row.get("side") or row.get("direction") or "").lower()
     if side in ("short", "sell"):
         return True
@@ -819,13 +869,25 @@ def rules_only_decision(packet: dict, params: dict, shape: str,
                         book_id: str | None = None) -> DecisionResult:
     """Book B. No model, no judgment, no cost. The control the others are measured against.
 
-    Picks: the top three candidates by score, entering at the opening range high,
-    or at the opening range low for a candidate that gapped down. Stop is the
-    percent stop from the spec, or the opposite end of the opening range when that
-    is closer. Target is twice the distance from entry to stop. The reason on every
-    row is "rules only", because there is no judgment to record.
+    Picks, as Momentum v2 leaves them (Mo, 2026-09-06). The candidates arrive
+    already ranked by relative volume, highest first, which is the selection rule
+    (item A4), so this takes them in the order they came in. For each one:
 
-    Manage: hold everything. The stop, the target and the flatten time in
+      direction  the sign of the first five minute candle, and a flat candle is
+                 no trade at all (item A5)
+      entry      the opening range high for a long, the low for a short
+      stop       10 percent of the 14 day average true range away from the entry,
+                 and never inside the opening range (item A1). When no average
+                 true range came through, the old percentage stop stands in.
+      target     none, ever (item A2)
+      qty_hint   the money the book risks on one trade divided by the distance
+                 from the entry to the stop, capped by the notional limit
+                 (item A6)
+
+    The reason on every row is "rules only", because there is no judgment to
+    record.
+
+    Manage: hold everything. The stop, the flatten time and the guardrails in
     agent/loop.py do all the exiting for this book, and a rules-only book has no
     opinion about a fade.
     """
@@ -843,48 +905,58 @@ def rules_only_decision(packet: dict, params: dict, shape: str,
 
     max_picks = max_picks_for(params)
     stop_pct = float(params.get("stop_loss_pct") or 1.5)
+    stop_atr_pct = _num(params.get("stop_atr_pct"))
+    outside_range = bool(params.get("stop_outside_opening_range", True))
+    wants_target = bool(params.get("use_profit_target", False))
     r_multiple = float(params.get("target_r_multiple") or 2.0)
+    risk_pct = _num(params.get("risk_per_trade_pct"))
     equity = _num((packet.get("account") or {}).get("equity")) or \
         float(params.get("starting_equity") or params.get("capital") or 100000)
-    position_pct = float(params.get("max_position_pct") or params.get("position_pct") or 15)
+    position_pct = float(params.get("max_position_pct") or params.get("position_pct") or 10)
     max_notional = float(params.get("max_order_notional") or (equity * position_pct / 100.0))
     budget = min(equity * position_pct / 100.0, max_notional)
 
-    candidates = sorted(
-        [c for c in (packet.get("candidates") or []) if isinstance(c, dict)],
-        key=lambda c: _num(c.get("score"), 4) or 0.0, reverse=True)
+    candidates = _ranked_candidates(packet)
 
     for row in candidates:
-        if len(result.picks) >= max_picks:
-            result.skips.append({"symbol": str(row.get("symbol") or "").upper(),
-                                 "rationale": "rules only"})
-            continue
         symbol = str(row.get("symbol") or "").upper()
+        if len(result.picks) >= max_picks:
+            result.skips.append({"symbol": symbol, "rationale": "rules only"})
+            continue
         high = _num(row.get("opening_range_high"))
         low = _num(row.get("opening_range_low"))
-        short = _short_candidate(row)
+
+        side = direction_from_candle(row)
+        if side is None:
+            # A flat candle, or no candle at all. Either way there is nothing to
+            # take a direction from, so the name is skipped rather than guessed at.
+            if symbol:
+                result.skips.append({"symbol": symbol, "rationale": "rules only"})
+            continue
+        short = side == "short"
         entry = low if short else high
         if not symbol or not entry or entry <= 0:
             if symbol:
                 result.skips.append({"symbol": symbol, "rationale": "rules only"})
             continue
-        if short:
-            percent_stop = entry * (1.0 + stop_pct / 100.0)
-            stop = round(min(percent_stop, high) if high and high > entry else percent_stop, 2)
-            risk = stop - entry
-            target = round(entry - r_multiple * risk, 2)
-        else:
-            percent_stop = entry * (1.0 - stop_pct / 100.0)
-            stop = round(max(percent_stop, low) if low and 0 < low < entry else percent_stop, 2)
-            risk = entry - stop
-            target = round(entry + r_multiple * risk, 2)
+
+        stop = _rules_stop(entry=entry, short=short, atr=_num(row.get("atr")),
+                           stop_atr_pct=stop_atr_pct, stop_pct=stop_pct,
+                           high=high, low=low, outside_range=outside_range)
+        risk = (stop - entry) if short else (entry - stop)
         if risk <= 0:
             result.skips.append({"symbol": symbol, "rationale": "rules only"})
             continue
+
+        target = None
+        if wants_target:
+            target = round(entry - r_multiple * risk, 2) if short \
+                else round(entry + r_multiple * risk, 2)
+
         result.picks.append({
-            "symbol": symbol, "side": "short" if short else "long",
+            "symbol": symbol, "side": side,
             "entry": round(entry, 2), "stop": stop, "target": target,
-            "qty_hint": int(math.floor(budget / entry)) if entry > 0 else 0,
+            "qty_hint": _rules_quantity(equity, risk_pct, risk, budget, entry),
             "rationale": "rules only"})
 
     if candidates and not result.picks:
@@ -892,9 +964,79 @@ def rules_only_decision(packet: dict, params: dict, shape: str,
         # about an insider or Congress shortlist. Better to say that out loud than
         # to look like a decision to buy nothing.
         result.notes.append(
-            f"no pick: none of the {len(candidates)} candidates carried an opening range, "
-            "which is the only entry the rules-only path knows how to work out")
+            f"no pick: none of the {len(candidates)} candidates carried an opening range "
+            "and a five minute candle, which is the only entry the rules-only path "
+            "knows how to work out")
     return result
+
+
+def _ranked_candidates(packet: dict) -> list[dict]:
+    """The candidates in the order the scanner ranked them, best first.
+
+    Since Momentum v2 the scanner writes a `rank` on every row, 1 being the
+    highest relative volume (item A4), and this simply honours it. A packet from
+    an older scanner, or from one of the filing sweeps, has no rank, and then the
+    rows are sorted by `score` exactly as they always were.
+    """
+    rows = [c for c in (packet.get("candidates") or []) if isinstance(c, dict)]
+    if any(_num(c.get("rank")) for c in rows):
+        return sorted(rows, key=lambda c: _num(c.get("rank")) or 10_000)
+    return sorted(rows, key=lambda c: _num(c.get("score"), 4) or 0.0, reverse=True)
+
+
+def _rules_stop(*, entry: float, short: bool, atr: float | None,
+                stop_atr_pct: float | None, stop_pct: float,
+                high: float | None, low: float | None,
+                outside_range: bool) -> float:
+    """Where the rules-only path puts the stop, item A1.
+
+    Ten percent of the 14 day average true range away from the entry price, and
+    never inside the opening range: at or below the range low for a long, at or
+    above the range high for a short. When no average true range came through,
+    the old percentage stop stands in, and then the range edge is used only when
+    it is NEARER than that stop, which is what the old rule did.
+
+    This mirrors stop_price_for in agent/guardrails.py on purpose. That function
+    is the referee and clamps whatever comes out of here, so the two have to
+    agree or book B would have every one of its stops quietly moved.
+    """
+    if atr and stop_atr_pct:
+        distance = atr * (stop_atr_pct / 100.0)
+        stop = entry + distance if short else entry - distance
+        if outside_range:
+            if short and high and high > entry:
+                stop = max(stop, high)
+            elif not short and low and 0 < low < entry:
+                stop = min(stop, low)
+        return round(stop, 2)
+
+    if short:
+        percent_stop = entry * (1.0 + stop_pct / 100.0)
+        return round(min(percent_stop, high) if high and high > entry else percent_stop, 2)
+    percent_stop = entry * (1.0 - stop_pct / 100.0)
+    return round(max(percent_stop, low) if low and 0 < low < entry else percent_stop, 2)
+
+
+def _rules_quantity(equity: float, risk_pct: float | None, risk: float,
+                    budget: float, entry: float) -> int:
+    """How many shares the rules-only path asks for, item A6.
+
+    The money the book is willing to lose on one trade, divided by the distance
+    from the entry price to the stop, and then capped by the notional budget. A
+    book with no risk_per_trade_pct, which is the two filing books, just gets the
+    budget divided by the price, exactly as before.
+
+    It is a hint and nothing more. gr.shares_for_risk and the guardrails in
+    agent/loop.py work the number out again and are free to cut it to zero.
+    """
+    if entry <= 0:
+        return 0
+    ceiling = int(math.floor(budget / entry))
+    if not risk_pct or risk <= 0:
+        return max(0, ceiling)
+    risk_dollars = equity * (risk_pct / 100.0)
+    wanted = int(math.floor(risk_dollars / risk))
+    return max(0, min(wanted, ceiling))
 
 
 # ---------------------------------------------------------------- the decision

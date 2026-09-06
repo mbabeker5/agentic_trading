@@ -2,7 +2,7 @@
 
 One run of `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py` is one tick. A tick is not one book, it is all five: A, B, C, D and E, in the order they appear in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml`.
 
-There is no `while` loop anywhere in it, and that is on purpose. launchd wakes the script, it looks at the clock, does the one thing that belongs to that minute for each book, writes down what it saw, and exits. Everything a book has to carry from one tick to the next lives in a file on disk. So a tick that crashes, or a Mac that was asleep, costs one tick and not the day.
+There is no `while` loop anywhere in it, and that is on purpose. launchd wakes the script, it looks at the clock, does the one thing that belongs to that minute for each book, writes down what it saw, and exits. Everything a book has to carry from one tick to the next lives in a file on disk. So a tick that crashes, or a Mac that was asleep, costs one tick and not the day. The wrapper may call the loop several times in a row when a book has asked to be looked at sooner, which is the cadence section below, but each of those calls is still one whole tick that starts and finishes on its own.
 
 Nothing is ordered today. Not on paper, not through a preview, not through the broker's own dry-run flag. Every order the loop works out is printed as `DRY RUN BOOK_A would place ...`, written to the ledger as a decision, and that is where it stops. The four locks that keep it that way are near the bottom of this page.
 
@@ -15,6 +15,7 @@ Nothing is ordered today. Not on paper, not through a preview, not through the b
 | The loop | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py` |
 | The one door to a broker | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/broker.py` |
 | What each book remembers | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/book_state.py` |
+| The pre-open run, from 09:00 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preopen.py` |
 | The register of books | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml` |
 | The limits every book starts from | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml` |
 | Each book's own numbers | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/<folder>/strategy.yaml` |
@@ -32,27 +33,34 @@ Five books share one IBKR paper account, `DUT077572`. What tells them apart is t
 
 | Book | Strategy | Model | Clock | Sold at the close |
 |---|---|---|---|---|
-| A | Opening momentum | Claude Fable | every 5 minutes | yes, 15:55 |
-| B | Opening momentum | none, rules only | every 5 minutes | yes, 15:55 |
+| A | Opening momentum | Claude Fable | 30 seconds when busy, 5 minutes when not | yes, from 15:45 |
+| B | Opening momentum | none, rules only | 30 seconds when busy, 5 minutes when not | yes, from 15:45 |
 | C | Insider buying | Claude Fable | every 30 minutes | no, holds for weeks |
 | D | Congress trades | Claude Fable | every 30 minutes | no, holds for weeks |
-| E | Opening momentum | GPT-6 Astra | every 5 minutes | yes, 15:55 |
+| E | Opening momentum | GPT-6 Astra | 30 seconds when busy, 5 minutes when not | yes, from 15:45 |
 
-All times are New York time, and every one of them is read from the book's own `strategy.yaml` rather than written into the code. Change a time in that file and the loop changes.
+All times are New York time, and every one of them is read from the book's own `strategy.yaml` rather than written into the code. Change a time in that file and the loop changes. The momentum clock changed on 2026-09-06 with Momentum v2 and now depends on what the book is doing rather than on the minute hand, which is the next section but one.
 
 ### The three momentum books, A, B and E
 
 ```
-09:25            the first tick, five minutes early, checks the plumbing is up
-09:30 to 09:35   the scanner runs and writes the shortlist
+09:00            the pre-open run starts: the gap scan and the paced history pulls
+09:30 to 09:35   the opening range builds
 09:35            the pick: the model, or the rules alone for book B
-09:35 to 11:00   entries may be opened
-09:35 to 15:55   positions are watched every five minutes
-15:55            everything still open is sold
+09:35 to 10:15   entries may be opened
+09:35 to 15:45   positions are watched
+15:45            flattening begins, with limit orders at the bid or the ask
+15:55            anything still open goes out at market, as the backstop
 16:00 onwards    the day is written up
 ```
 
+Two of those times moved on 2026-09-06. Entries used to run to 11:00 and now stop at 10:15 (item D3), because an entry after 10:15 chases a move that has already been made. And the close used to be one market order at 15:55; it is now two stages, 15:45 with limit orders and 15:55 at market only if something is still open (item A11), because spreads widen and depth thins in the last few minutes and a market order into that pays for the hurry.
+
 The three of them share one scanner run. Whichever ticks first pays for it, and the other two read the file it wrote, because running the scanner three times in one minute would spend three times the data budget on three copies of the same answer.
+
+### Before the open
+
+From 09:00 the momentum books have work to do before the market is even open. `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preopen.py` runs the pre-market gap scan every few minutes, keeps a candidate list of up to 100 names, and pulls each new name's history at no more than four requests a minute: the 14 days of five minute bars the relative volume baseline needs, and the daily bars the 14 day average true range needs. The pacing is the point. IBKR allows only about 60 historical requests in any 10 minutes, so spending that budget between 09:00 and 09:26 means it is not being spent in the five minutes around the open when it is scarcest. It is written one tick at a time like everything else here, with `step(now, broker)` looking at the clock and at what is already on disk and doing only what that minute owes. The whole timeline, every step's time budget, what happens to a name that gaps late, and the honest limits of what has actually been built are in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/PREOPEN_FLOW.md`.
 
 ### The insider book, C
 
@@ -76,6 +84,14 @@ Nothing is sold at the close. Its positions live for days to weeks and most of t
 Also never sold at the close.
 
 A book on a thirty minute clock works out whether it is due from when it last looked, not from the minute hand. So a tick missed because the Mac was asleep does not push the whole day out of step.
+
+### How often the loop wakes up, and who decides
+
+Since Momentum v2 the cadence is a number the books work out, not a number in the launchd job (item A14). A momentum book asks to be looked at every 30 seconds between 09:35 and 11:00 while it is holding a position or has a working order, and every 5 minutes the rest of the time. The insider and Congress books have no fast window at all, so they always ask for their own five or thirty minutes. The reason for the fast window is the stop: a stop this tight needs sub-minute resolution, even with the stop itself resting at the broker.
+
+Each book's answer comes from `gr.next_tick_seconds` at the end of its turn, and at the end of the tick the loop writes the smallest number any book asked for into `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/next_tick_seconds`. The file holds one plain whole number of seconds and nothing else, and it is rewritten every tick. The smallest wins because the loop ticks all five books together, so the busiest one sets the pace for everybody.
+
+That file exists because launchd cannot be argued with. It wakes the script on a fixed timetable and there is no way to tell it, at 09:41, to come back in thirty seconds. So the wrapper honours the file instead: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/run_tick.sh` reads it after a tick and, when it says less than a minute, runs a short sub-loop inside itself, ticking at that pace until the next launchd wake up is due, and then exits. The 30 second cadence therefore costs no change at all to the launchd job. Both halves are built. The loop writes the file at the end of every tick, and the wrapper reads it, sleeps that long and ticks again, at most nine extra times and never past the next launchd wake up. It checks `output/LOOP_DISABLED` every time round, so pulling the handle does not have to wait out a five minute run, and it only ever enters that sub-loop after a tick that finished cleanly, because a loop that fell over should be looked at rather than run nine more times.
 
 ---
 
@@ -240,6 +256,7 @@ All in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/`.
 | `congress_shortlist_2026-09-08.json` | book D's sweep |
 | `loop.log` | one line per book per tick, with the rules hash on every one |
 | `pdt_BOOK_A.json` | one book's rolling day trade count |
+| `next_tick_seconds` | one whole number of seconds: how soon the busiest book wants looking at again. Rewritten every tick, and read by `agent/run_tick.sh` |
 
 Delete a book's state file and that book starts its day over. Do not do that while it is holding something: the file is the only record of which book owns which position.
 
@@ -249,23 +266,28 @@ State carries over between days. The insider and Congress books hold for weeks, 
 
 ## Where the stop lives, and why it goes to the broker
 
-Every position is opened with two numbers on it: a stop and, usually, a target. They are set at the moment of the fill by `record_fill` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`, taken from the trigger record the pick wrote, and re-measured against the price actually paid rather than the price that was planned.
+A momentum position is opened with one number on it, and only one: a stop. There is no target at all, and there has not been since Momentum v2 landed on 2026-09-06 (item A2). A position leaves by its stop or at the close, and by nothing else, because two independent studies found that putting a target on this strategy destroys its edge: the handful of trades that run a long way are what pay for all the small losses, and a target cuts exactly those off. The insider and Congress books, C and D, still take targets, and their strategy files still say `use_profit_target: true`.
 
-The model proposes both numbers and does not get the final say on either:
+The stop is set at the moment of the fill by `record_fill` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`, taken from the trigger record the pick wrote, and re-measured against the price actually paid rather than the price that was planned.
 
-- **The stop is clamped.** `guardrails.stop_price_for` works out the rule stop, 1.5 percent from entry or the opening range level when that is nearer. The model's stop is used only when it sits inside that, so a model may move a stop closer to entry and can never move one further away. For a long the nearer stop is the higher of the two, for a short the lower.
+The model proposes a stop and does not get the final say on it:
+
+- **The stop is clamped.** `guardrails.stop_price_for` works out the rule stop. On a momentum book that is 10 percent of the name's 14 day average true range away from entry, and then, because it may never sit inside the opening range, it is pushed out to the range low for a long or the range high for a short whenever it would otherwise land inside (item A1). The model's stop is used only when it sits inside that, so a model may move a stop closer to entry and can never move one further away. For a long the nearer stop is the higher of the two, for a short the lower. That clamp is unchanged.
+- **1.5 percent is now only a fallback.** It used to be the momentum stop. Today it stands in only for a position whose average true range nobody could work out, which should not happen for a name that passed the volatility filter, and it exists so a position carried in from an older state file still gets a stop rather than none. The insider and Congress books never had an average true range stop, so for them the percentage stop, 8 percent in C and 10 percent in D, is still the real one.
 - **A stop on the wrong side of entry throws the pick away.** A long stopping out above where it bought would close the instant it opened. That is not a widening, it is nonsense, so the pick is refused with a `decision_rejected` row naming the two prices.
-- **A target on the wrong side is dropped, not fatal.** The position still has a stop, so it is still safe. It runs to the trailing stop, the time stop or the close instead, and the drop is written down.
+- **A target on the wrong side is dropped, not fatal.** This one only reaches books C and D now, since the momentum books propose no target to be wrong about. The position still has a stop, so it is still safe. It runs to the trailing stop, the time stop or the close instead, and the drop is written down.
 
 That covers the file. The other half is the account.
 
 ### The stop rests at the broker
 
-An entry does not go out as one order. It goes out as a bracket: a limit parent, a stop child on the other side, and a limit target child when the pick has a usable target. All three carry the book's `orderRef`, so a child order can be traced back to the book that owns it exactly like its parent.
+An entry does not go out as one order. On a momentum book it goes out as two: a limit parent, and a stop child on the other side. That is the whole thing, because there is no target to hang a third leg on. Books C and D, which do take targets, get the full bracket of three. Every leg carries the book's `orderRef`, so a child order can be traced back to the book that owns it exactly like its parent.
 
 The reason is simple. If the stop existed only in this Mac's memory, then a Mac that sleeps, a crashed tick or a dropped network connection would leave a live position with nothing protecting it, and nobody would know until the next tick woke up. A stop resting at IBKR works whether or not this code is running.
 
-`McpBroker.bracket_order` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/broker.py` calls the server's `ibkr_bracket_order` tool. That tool does not take three order dictionaries. It takes the entry's action, quantity and limit price plus a `takeProfitPrice` and a `stopLossPrice`, and builds the three IBKR orders itself with both children hung off the parent's id. Anything that has to be on every leg goes in `orderOptions`, which the server copies onto all three, and that is where `orderRef` and `account` go. Its `takeProfitPrice` is not optional, so a pick whose target was dropped takes a second path instead: the parent, then the stop, as two ordinary orders. The stop still rests at the broker. What is lost is the one-cancels-the-other link between the two children, and with no target there is nothing for the stop to be cancelled against.
+`McpBroker.bracket_order` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/broker.py` deliberately does not use the server's own `ibkr_bracket_order` tool any more. That tool takes the entry's action, quantity and limit price plus a `takeProfitPrice` and a `stopLossPrice`, and its `takeProfitPrice` is not optional, checked by reading the pinned server's source on 2026-09-06. A momentum entry has no take profit price to hand it, so the tool cannot be used at all.
+
+Instead the bracket is built here out of the server's plain order tool, which is what IBKR does underneath anyway. The parent limit goes out first with transmit switched off, so it rests inside Gateway and cannot reach the market on its own. Then the stop child goes out carrying the parent's order id and transmit switched on, and that is what releases the two together. Both carry the same one-cancels-the-other group, so a fill on either cancels the other, and both carry the book's `orderRef` and the account. An entry that reached the market with nothing protecting it is the exact hole this path exists to close. The stop child is a stop-limit rather than a plain stop, with half a percent of room below the trigger for a long and above it for a short, because a plain stop turns into a market order the moment it is touched and in a thin gap down that fills wherever the book happens to be. A book that still takes a profit target, which is C and D, gets a third leg in the same group.
 
 ### Moving a stop
 
@@ -273,14 +295,27 @@ There is no "edit this order" on this path, so tightening a stop is two steps: c
 
 The child order ids are written into the book's state file as `working_orders` entries marked `is_child`, because an order that has to be cancelled later is an order whose id has to survive the tick that placed it.
 
-Today this is all rehearsal. A dry run prints the three legs it would have sent, one line each, under the order it would have placed:
+Today this is all rehearsal. A dry run prints the legs it would have sent, one line each, under the order it would have placed. On a momentum book there are two of them and no more:
 
 ```
 DRY RUN BOOK_A would place BUY 1000 ABC limit 9.38 (purpose: entry)
     leg: entry  BUY 1000 ABC limit 9.38 (purpose: entry) tagged BOOK_A
-    leg: stop   SELL 1000 ABC stop 9.24 tagged BOOK_A
-    leg: target SELL 1000 ABC limit 9.66 tagged BOOK_A
+    leg: stop   SELL 1000 ABC stop 9.13 tagged BOOK_A
 ```
+
+It is worth walking that example through, because every number in it came from a rule. ABC has a 14 day average true range of 1.60 dollars, so the stop starts 16 cents from the 9.38 entry, at 9.22. But 9.22 is inside the opening range, whose low is 9.13, so the stop is pushed out to 9.13. The distance is now 25 cents. The book risks 0.25 percent of its 100,000 dollars, which is 250 dollars, and 250 divided by 0.25 is 1,000 shares. Those 1,000 shares are worth 9,380 dollars, which is inside the 10 percent notional cap of 10,000, so the size stands. Had it not been, the order would have been cut to fit the cap and the trade would have risked less than 250 dollars. Being under the risk budget is fine. Being over it is not.
+
+### The VWAP fade closes nothing in month one
+
+The VWAP fade is the rule that says the opening push is over: two five minute closes in a row back through the day's volume-weighted average price. It used to close the position. Since 2026-09-06 it closes nothing at all (item D2).
+
+Both halves of it end up in the same place. The rule fade, and a fade the model called by answering `fade`, both come back as the trigger `fade_observed`, both get written into the Rules Log under the rule id `vwap_fade_observed`, and in both cases the position is held. The loop says so on the tick, in as many words: a fade would have closed this, and in month one it only gets written down.
+
+The reason is that the fade comes from a different published strategy and was never tested on this one, so grafting it on as an exit would have been a guess. Month one measures the pick, and records what every fade would have cost or saved, which is a month of evidence rather than an opinion.
+
+An `exit` from the model still closes the position. That is a different answer from `fade`. It means the model wants out now, rather than noticing that the push has gone, and the manage prompt tells the model exactly that, including a line asking it not to reach for `exit` to force a fade through.
+
+One line puts the old behaviour back: `risk.vwap_fade_action` in a book's `strategy.yaml`. It reads `log_only` today. Set it to `exit` and the fade closes positions again, for the rule and for the model together.
 
 ### When the model does not give a usable answer
 
@@ -292,6 +327,25 @@ Two rows to know in the Rules Log, because they mean opposite things:
 | `decision_rejected` | A reply did arrive and could not be trusted: not JSON, the wrong shape, a pick with an unknown side, a missing confidence, or a confidence outside 0 to 1. | Nothing. That row, or that whole reply, is thrown away and no rules answer stands in for it, because standing in would quietly turn a broken model into a working book. |
 
 A single bad row inside a reply that otherwise parsed only costs that row. A reply that cannot be read at all costs the whole tick, and the book opens nothing until the next one.
+
+Two footnotes on that table, both worth knowing before anybody counts these rows at month end. `decision_rejected` is also the row written when a pick's stop comes back on the wrong side of entry, which is nothing to do with a model and can happen on book B, which never calls one. And there is a third id next to these two, `decision_failed`, for the case where the decision fell over before a model was ever reached, such as a prompt that would not render. The loop chooses between them on the spot: if there are rejected rows it is `decision_rejected`, otherwise it is `decision_failed`.
+
+### The other rows Momentum v2 added to the Rules Log
+
+Eight more rows a reader will meet from 2026-09-06. None of them is an error, and the first three are there to be counted at the end of the month rather than acted on during it.
+
+| Row | What it means |
+|---|---|
+| `entries_cutoff` | An entry the 10:15 cutoff turned away, with the name and the time. Every one of them is written down, so at the end of the month the cutoff can be measured rather than argued about: if the names it refused all went on to run, the cutoff cost money and should move back. |
+| `vwap_fade_observed` | A fade that would have closed a position under the old rule. The position was held. See the section above. |
+| `same_direction_count` | How many of this book's positions point the same way, and across how many industries, written every tick that the book is holding anything. Ten morning gappers all long is one bet made ten times, and the ledger should say so. Nothing is blocked by it (item A9). |
+| `weekly_loss_cap` | The book is down 4 percent or more this calendar week, so it is paused for Mo to look at. Entries only. Closing orders still go through. |
+| `monthly_loss_cap` | The same thing over a calendar month, at 6 percent. |
+| `losing_streak_pause` | The book has finished down three trading days in a row. Same answer: paused, entries only, exits still allowed. |
+| `sector_cap` | An entry that would have put more than a quarter of the book's gross exposure limit into one industry. It is also the row for an entry in a name IBKR would not give an industry for, because a limit that cannot be measured is not a limit, so an unknown industry is refused rather than assumed harmless. |
+| `account_symbol_cap` | An entry that would leave more than 15 percent of what all five books are worth riding on a single ticker, counted across every book rather than inside one. |
+
+The three loss limits are worked out by the loop rather than by the guardrails, because only the loop can see a book's earlier days. `loss_history` in `agent/loop.py` reads the book's own state files, adds up this calendar week and this calendar month, counts the run of losing days behind them, and hands all three over on the AccountState as `week_pnl`, `month_pnl` and `consecutive_losing_days`. The guardrails own the limits; the loop owns the arithmetic.
 
 ---
 
@@ -318,6 +372,12 @@ Checked against the live MCP server on 2026-09-06: the snapshot it returns holds
 ### The Daily tab has no book column
 
 It tracks the one paper account all five books share, so a day is a day and not a day per book. Each book's own end of day figures go to the Rules Log, which does have a book column and which the Books tab slices on. The one account level line is written once, after every book has had its turn.
+
+### The pre-open wants waking every minute, and launchd wakes it every five
+
+`agent/preopen.py` is now driven by the loop: 09:00 to 09:30 is a phase of its own, `preopen`, and books A, B and E share the one run exactly as they share the one scanner run. What is not done is the launchd side. The pacing rule is four historical requests a minute, and a tick is over in a second or two, so a tick can never send more than four. Twenty six wake ups between 09:00 and 09:26 pays for about a hundred requests, which is what the morning needs. Five minute wake ups pay for about twenty, and most of the candidate list would reach 09:35 with nothing behind it.
+
+So the launchd job for that half hour has to fire every minute rather than every five. That is a change to `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.tick.plist` and to the generator that writes it, which belongs to whoever owns the launchd jobs. Until it is made, the pre-open gathers roughly a fifth of what it should, and the 09:35 scanner falls back to working the numbers out from daily bars, which is slower and spends the data budget at the worst moment of the day. Nothing breaks; the morning is just less prepared than it should be.
 
 ### Holidays are known to the day trade counter and to nothing else
 

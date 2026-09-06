@@ -88,6 +88,13 @@ __all__ = [
     "must_flatten_now",
     "is_regular_hours",
     "stop_price_for",
+    "atr_stop_distance",
+    "shares_for_risk",
+    "weekly_loss_hit",
+    "monthly_loss_hit",
+    "losing_streak_hit",
+    "must_flatten_at_market_now",
+    "next_tick_seconds",
     "trailing_stop_price",
     "time_stop_due",
     "trading_days_between",
@@ -104,6 +111,11 @@ __all__ = [
     "DEFAULT_BORROW_AVAILABILITY_MULTIPLE",
     "DEFAULT_MAX_DAY_TRADES_PER_5_DAYS",
     "DEFAULT_ASSUMED_LIVE_EQUITY_MIN_USD",
+    "DEFAULT_ATR_DAYS",
+    "DEFAULT_MIN_HISTORY_SESSIONS",
+    "DEFAULT_RANK_BY",
+    "DEFAULT_REL_VOLUME_WINDOW",
+    "DEFAULT_REL_VOLUME_BASELINE_DAYS",
 ]
 
 
@@ -182,6 +194,34 @@ DEFAULT_BORROW_AVAILABILITY_MULTIPLE = 10.0
 # five business days, and the live account balance that rule assumes.
 DEFAULT_MAX_DAY_TRADES_PER_5_DAYS = 3
 DEFAULT_ASSUMED_LIVE_EQUITY_MIN_USD = 25_000.0
+
+# MOMENTUM V2, approved by Mo on 2026-09-06 from the consolidated critique in
+# research/momentum_spec_critique_2026-09-06.md. These are the defaults behind
+# the new settings; the real numbers live in the yaml files as always.
+#
+# The average true range is the average size of one session's price swing over
+# the last 14 sessions, counting the gap from the previous close. Fourteen
+# sessions is the number the published work used and is long enough to settle
+# down without going stale.
+DEFAULT_ATR_DAYS = 14
+
+# How much history a name needs before it may be traded at all. Mo considered
+# and REJECTED a rule barring anything listed in the last 90 days. This does the
+# same job honestly: what matters is having enough sessions to measure the
+# liquidity floor and the average true range, and a name without them fails
+# those tests anyway.
+DEFAULT_MIN_HISTORY_SESSIONS = 30
+
+# How the shortlist is ordered, and what the relative volume behind that order
+# is measured on. The ranking by volume, rather than by the size of the gap, is
+# what carried the published result.
+DEFAULT_RANK_BY = "rel_volume"
+DEFAULT_REL_VOLUME_WINDOW = "09:30-09:35"
+DEFAULT_REL_VOLUME_BASELINE_DAYS = 14
+
+# The orders a book may still send once one of the limits beyond the day has
+# paused it. The same answer as the kill switch: get out, never in.
+PAUSED_BOOK_ALLOWED_PURPOSES = ("exit", "stop", "flatten")
 
 # Who makes the call inside a book. "hybrid" means a model picks the names
 # inside the rules; "rules_only" means no model is called at all.
@@ -267,6 +307,25 @@ class MoneyConfig:
     tiny_capital_usd is what a book in tiny mode is allowed to put at risk. It
     does nothing while a book is on dry_run or full; it is written down here so
     the number lives with the other money numbers rather than in the code.
+
+    Momentum v2, approved by Mo on 2026-09-06, added the rest:
+
+    risk_per_trade_pct     how much of the book one trade may lose, as a
+                           percentage. The share count comes from this divided
+                           by the distance from entry to the stop, so every
+                           position risks about the same. None on a book that
+                           still sizes on max_position_pct alone, which is the
+                           insider and Congress books.
+    max_weekly_loss_pct    the loss limits beyond the day. Any one of these
+    max_monthly_loss_pct   three pauses the book for Mo to look at it, and none
+    max_consecutive_losing_days
+                           of them ever blocks a closing order. None means the
+                           rule is off.
+    sector_gross_pct_max   how much of the book's gross exposure limit may sit
+                           in one industry. None means off, which is what the
+                           shared settings say, because it is a momentum rule.
+    account_symbol_pct_max how much of the money all five books hold between
+                           them may sit in one ticker. None means off.
     """
 
     starting_equity: float
@@ -276,6 +335,12 @@ class MoneyConfig:
     max_order_notional: float
     gross_exposure_pct_max: float = 100.0
     tiny_capital_usd: float = DEFAULT_TINY_CAPITAL_USD
+    risk_per_trade_pct: float | None = None
+    max_weekly_loss_pct: float | None = None
+    max_monthly_loss_pct: float | None = None
+    max_consecutive_losing_days: int | None = None
+    sector_gross_pct_max: float | None = None
+    account_symbol_pct_max: float | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +355,25 @@ class RiskConfig:
 
     time_stop_trading_days is how many trading days a position may live before
     it is closed whatever the price. None means no clock.
+
+    Momentum v2, approved by Mo on 2026-09-06, added the volatility stop:
+
+    atr_days       how many completed sessions the average true range covers.
+                   The average true range is the average size of one session's
+                   price swing, counting the gap from the previous close.
+    stop_atr_pct   the stop distance, as a percentage of that average. At 10,
+                   a stock whose average swing is 2 dollars stops 20 cents away.
+                   None means the book has no volatility stop and falls back to
+                   stop_loss_pct, which is what the insider and Congress books
+                   do.
+    stop_outside_opening_range
+                   true when the stop may never sit inside the first five
+                   minutes' range. A stop inside the range is inside the noise
+                   the trade is made of, so it would be hit by the setup itself.
+    use_profit_target
+                   false on the momentum books, which now leave by the stop or
+                   at the close and nothing else. Two independent studies found
+                   a target destroys this strategy's edge.
     """
 
     stop_loss_pct: float
@@ -297,6 +381,10 @@ class RiskConfig:
     trailing_stop_pct: float | None = None
     trailing_activation_pct: float | None = None
     time_stop_trading_days: int | None = None
+    atr_days: int = 14
+    stop_atr_pct: float | None = None
+    stop_outside_opening_range: bool = False
+    use_profit_target: bool = True
 
 
 @dataclass(frozen=True)
@@ -324,6 +412,18 @@ class UniverseConfig:
     borrow_availability_multiple times as many shares available to borrow as we
     intend to sell. The loop reads all three numbers from the broker and puts
     them on the order intent.
+
+    Momentum v2, approved by Mo on 2026-09-06, added the volatility filter and
+    the hard exclusions. min_atr_usd and min_atr_pct_of_price both have to hold:
+    fifty cents is a big daily swing on a 6 dollar stock and nothing at all on a
+    600 dollar one. min_history_sessions is how much history a name needs before
+    it may be traded at all, and it is what Mo chose INSTEAD of a rule barring
+    anything listed in the last 90 days, because what actually matters is having
+    enough sessions to measure the liquidity floor and the average true range.
+    The five exclude flags are the promoter and binary-event traps: blank cheque
+    companies, warrants, rights, preferred shares, anything traded over the
+    counter or listed abroad, and anything halted right now. The scanner applies
+    them; they are written here so a book's whole universe reads in one place.
     """
 
     price_floor: float
@@ -340,15 +440,43 @@ class UniverseConfig:
     require_shortable: bool = False
     max_borrow_fee_pct: float = DEFAULT_MAX_BORROW_FEE_PCT
     borrow_availability_multiple: float = DEFAULT_BORROW_AVAILABILITY_MULTIPLE
+    atr_days: int = DEFAULT_ATR_DAYS
+    min_atr_usd: float | None = None
+    min_atr_pct_of_price: float | None = None
+    min_history_sessions: int = DEFAULT_MIN_HISTORY_SESSIONS
+    exclude_spacs: bool = True
+    exclude_warrants_and_rights: bool = True
+    exclude_preferred: bool = True
+    require_us_primary_listing: bool = True
+    exclude_halted: bool = True
 
 
 @dataclass(frozen=True)
 class ScannerConfig:
-    """How the morning shortlist is built."""
+    """How the morning shortlist is built.
+
+    Momentum v2, approved by Mo on 2026-09-06, changed how the shortlist is
+    ordered. rank_by is "rel_volume": the names are sorted by relative volume,
+    highest first, and the top max_candidates are taken. It used to be sorted by
+    the size of the gap multiplied by the volume, and the published result came
+    from the volume ranking rather than the size of the move.
+
+    rel_volume_window and rel_volume_baseline_days say what that relative volume
+    is: the volume in the first five minutes, against the same five minutes on
+    each of the previous 14 sessions. Both are carried here for the record and
+    for agent/preopen.py, which pulls that history before the open.
+
+    There is no Finviz setting any more. Mo decided not to buy Finviz Elite, so
+    on 2026-09-06 the flag and its whole code path were deleted rather than left
+    switched off (item D7).
+    """
 
     rel_volume_min: float
     max_candidates: int
     exclude_leveraged_etfs: bool
+    rank_by: str = DEFAULT_RANK_BY
+    rel_volume_window: str = DEFAULT_REL_VOLUME_WINDOW
+    rel_volume_baseline_days: int = DEFAULT_REL_VOLUME_BASELINE_DAYS
 
 
 @dataclass(frozen=True)
@@ -362,6 +490,27 @@ class ScheduleConfig:
     It is empty in the shipped settings, and it is used by the day trade counter
     in agent/pdt.py to work out what a business day is. Nothing else in this
     file has ever known about holidays, and that has not changed.
+
+    Momentum v2, approved by Mo on 2026-09-06, split the close in two and made
+    the cadence data driven:
+
+    flatten_at         when flattening BEGINS, with limit orders at the bid or
+                       the ask, because spreads widen and depth collapses in the
+                       last few minutes.
+    flatten_market_at  the backstop. Anything still open at this time goes out
+                       at market, because being flat matters more than the last
+                       few cents. None on a book with no backstop, and then
+                       flatten_at behaves exactly as it always did.
+    fast_poll_seconds  how often a book looks at itself between fast_poll_from
+    fast_poll_from     and fast_poll_until while it is holding something. Thirty
+    fast_poll_until    seconds in the momentum books, because a stop this tight
+                       needs sub-minute resolution even with the stop resting at
+                       the broker. None means the book only ever uses
+                       loop_minutes.
+    preopen_start      when the pre-open run starts, and the two deadlines
+    preopen_history_done_by
+    preopen_subscribe_done_by
+                       inside it. See docs/PREOPEN_FLOW.md.
     """
 
     timezone: str
@@ -374,6 +523,13 @@ class ScheduleConfig:
     trade_only_regular_hours: bool
     entries_per_day_max: int | None = None
     holidays: tuple[date, ...] = ()
+    flatten_market_at: time | None = None
+    fast_poll_seconds: int | None = None
+    fast_poll_from: time | None = None
+    fast_poll_until: time | None = None
+    preopen_start: time | None = None
+    preopen_history_done_by: time | None = None
+    preopen_subscribe_done_by: time | None = None
 
 
 @dataclass(frozen=True)
@@ -627,6 +783,28 @@ class AccountState:
                            only the loop sees all five books at once. Empty
                            means nothing is taken and the symbol_exclusive rule
                            has nothing to say.
+
+    Momentum v2, approved by Mo on 2026-09-06, added six more. All six default
+    to a value that means "nothing to see", so a caller written before them
+    behaves exactly as it did:
+
+    week_pnl               money made or lost this calendar week, closed and
+    month_pnl              open together, and this calendar month. The loop
+                           works both out by reading the book's earlier state
+                           files, because only the loop can see them.
+    consecutive_losing_days
+                           how many trading days in a row this book has finished
+                           down. Three in a row pauses it.
+    sector_exposure        how much money this book has in each industry, as
+                           {industry: dollars}. The loop fills it from IBKR's
+                           contract details.
+    account_equity         what all five books are worth added together. Used by
+                           the account level per symbol cap. None means the loop
+                           did not say, and then this book's own equity stands
+                           in, which is the smaller and therefore safer number.
+    symbol_exposure_all_books
+                           how much money every book has in each ticker added
+                           together, as {symbol: dollars}.
     """
 
     equity: float
@@ -642,6 +820,12 @@ class AccountState:
     gross_exposure: float | None = None
     entries_opened_today: int = 0
     symbols_held_elsewhere: dict[str, str] | None = None
+    week_pnl: float = 0.0
+    month_pnl: float = 0.0
+    consecutive_losing_days: int = 0
+    sector_exposure: dict[str, float] | None = None
+    account_equity: float | None = None
+    symbol_exposure_all_books: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.now, datetime):
@@ -669,6 +853,32 @@ class AccountState:
         self.symbols_held_elsewhere = _clean_symbol_owners(
             self.symbols_held_elsewhere
         )
+        self.week_pnl = _finite_number(self.week_pnl, "AccountState.week_pnl")
+        self.month_pnl = _finite_number(self.month_pnl, "AccountState.month_pnl")
+        if isinstance(self.consecutive_losing_days, bool) or not isinstance(
+            self.consecutive_losing_days, int
+        ):
+            raise GuardrailUsageError(
+                "AccountState.consecutive_losing_days has to be a whole number of "
+                f"days, but it is {self.consecutive_losing_days!r}."
+            )
+        if self.consecutive_losing_days < 0:
+            raise GuardrailUsageError(
+                "AccountState.consecutive_losing_days cannot be negative, but it is "
+                f"{self.consecutive_losing_days}."
+            )
+        self.sector_exposure = _clean_money_map(
+            self.sector_exposure, "AccountState.sector_exposure", upper=False
+        )
+        self.symbol_exposure_all_books = _clean_money_map(
+            self.symbol_exposure_all_books,
+            "AccountState.symbol_exposure_all_books",
+            upper=True,
+        )
+        if self.account_equity is not None:
+            self.account_equity = _finite_number(
+                self.account_equity, "AccountState.account_equity"
+            )
 
     @property
     def total_pnl_today(self) -> float:
@@ -716,6 +926,25 @@ class AccountState:
 
     def is_short(self, symbol: str) -> bool:
         return self.position_direction(symbol) == "short"
+
+    def sector_exposure_now(self, sector: str | None) -> float:
+        """How much money this book already has in one industry, always positive."""
+        if not sector:
+            return 0.0
+        return abs(float((self.sector_exposure or {}).get(str(sector).strip(), 0.0)))
+
+    def symbol_exposure_everywhere(self, symbol: str) -> float:
+        """How much every book has in one ticker added together, always positive.
+
+        Falls back to what this book alone holds when the loop did not hand in
+        the account wide map, because one book's holding is at least a floor
+        under the true figure.
+        """
+        clean = _clean_symbol(symbol, "symbol")
+        everywhere = self.symbol_exposure_all_books or {}
+        if clean in everywhere:
+            return abs(float(everywhere[clean]))
+        return self.held_exposure(clean)
 
     def symbol_owner(self, symbol: str) -> str | None:
         """Which other book already has this symbol, or None when nobody has.
@@ -790,6 +1019,12 @@ class OrderIntent:
     judgement: every check written before halts were tracked at all goes on
     behaving as it did. The loop must always pass what IBKR said, and must pass
     None when IBKR said nothing, because None is what the rule refuses on.
+
+    sector is the industry IBKR's contract details give for this name, and it is
+    what the sector cap counts against (Momentum v2, item A9, Mo 2026-09-06).
+    None means the broker did not say, and on a book that has a sector cap an
+    unknown industry stops an entry rather than being counted as harmless, for
+    exactly the same reason an unknown halt status does.
     """
 
     symbol: str
@@ -806,11 +1041,14 @@ class OrderIntent:
     shares_available_to_borrow: int | None = None
     halted: bool | None = False
     limit_state: bool | None = False
+    sector: str | None = None
 
     def __post_init__(self) -> None:
         self.symbol = _clean_symbol(self.symbol, "OrderIntent.symbol")
         self.halted = _optional_flag(self.halted, "OrderIntent.halted")
         self.limit_state = _optional_flag(self.limit_state, "OrderIntent.limit_state")
+        if self.sector is not None:
+            self.sector = str(self.sector).strip() or None
         if self.book_id is not None:
             self.book_id = _clean_book_id(self.book_id, "OrderIntent.book_id")
         if not isinstance(self.shortable, bool):
@@ -1080,6 +1318,20 @@ def _build_money(raw: dict, where: str) -> MoneyConfig:
         tiny_capital_usd=_optional_positive_number(
             raw, "money.tiny_capital_usd", where, default=DEFAULT_TINY_CAPITAL_USD
         ),
+        risk_per_trade_pct=_optional_percent(raw, "money.risk_per_trade_pct", where),
+        max_weekly_loss_pct=_optional_percent(raw, "money.max_weekly_loss_pct", where),
+        max_monthly_loss_pct=_optional_percent(
+            raw, "money.max_monthly_loss_pct", where
+        ),
+        max_consecutive_losing_days=_optional_positive_int(
+            raw, "money.max_consecutive_losing_days", where
+        ),
+        sector_gross_pct_max=_optional_percent(
+            raw, "money.sector_gross_pct_max", where
+        ),
+        account_symbol_pct_max=_optional_percent(
+            raw, "money.account_symbol_pct_max", where
+        ),
     )
 
 
@@ -1103,6 +1355,15 @@ def _build_risk(raw: dict, where: str) -> RiskConfig:
         trailing_activation_pct=trailing_activation_pct,
         time_stop_trading_days=_optional_positive_int(
             raw, "risk.time_stop_trading_days", where
+        ),
+        atr_days=_optional_positive_int(raw, "risk.atr_days", where)
+        or DEFAULT_ATR_DAYS,
+        stop_atr_pct=_optional_positive_number(raw, "risk.stop_atr_pct", where),
+        stop_outside_opening_range=_optional_bool(
+            raw, "risk.stop_outside_opening_range", where, default=False
+        ),
+        use_profit_target=_optional_bool(
+            raw, "risk.use_profit_target", where, default=True
         ),
     )
 
@@ -1222,6 +1483,31 @@ def _build_universe(raw: dict, where: str) -> UniverseConfig:
             where,
             default=DEFAULT_BORROW_AVAILABILITY_MULTIPLE,
         ),
+        atr_days=_optional_positive_int(raw, "universe.atr_days", where)
+        or DEFAULT_ATR_DAYS,
+        min_atr_usd=_optional_positive_number(raw, "universe.min_atr_usd", where),
+        min_atr_pct_of_price=_optional_percent(
+            raw, "universe.min_atr_pct_of_price", where
+        ),
+        min_history_sessions=_optional_positive_int(
+            raw, "universe.min_history_sessions", where
+        )
+        or DEFAULT_MIN_HISTORY_SESSIONS,
+        exclude_spacs=_optional_bool(
+            raw, "universe.exclude_spacs", where, default=True
+        ),
+        exclude_warrants_and_rights=_optional_bool(
+            raw, "universe.exclude_warrants_and_rights", where, default=True
+        ),
+        exclude_preferred=_optional_bool(
+            raw, "universe.exclude_preferred", where, default=True
+        ),
+        require_us_primary_listing=_optional_bool(
+            raw, "universe.require_us_primary_listing", where, default=True
+        ),
+        exclude_halted=_optional_bool(
+            raw, "universe.exclude_halted", where, default=True
+        ),
     )
 
 
@@ -1232,6 +1518,16 @@ def _build_scanner(raw: dict, where: str) -> ScannerConfig:
         exclude_leveraged_etfs=_need_bool(
             raw, "scanner.exclude_leveraged_etfs", where
         ),
+        rank_by=_optional_text(raw, "scanner.rank_by", where, default=DEFAULT_RANK_BY)
+        or DEFAULT_RANK_BY,
+        rel_volume_window=_optional_text(
+            raw, "scanner.rel_volume_window", where, default=DEFAULT_REL_VOLUME_WINDOW
+        )
+        or DEFAULT_REL_VOLUME_WINDOW,
+        rel_volume_baseline_days=_optional_positive_int(
+            raw, "scanner.rel_volume_baseline_days", where
+        )
+        or DEFAULT_REL_VOLUME_BASELINE_DAYS,
     )
 
 
@@ -1260,18 +1556,54 @@ def _build_schedule(raw: dict, where: str) -> ScheduleConfig:
             raw, "schedule.entries_per_day_max", where
         ),
         holidays=_optional_date_list(raw, "schedule.holidays", where),
+        flatten_market_at=_optional_clock_time(
+            raw, "schedule.flatten_market_at", where
+        ),
+        fast_poll_seconds=_optional_positive_int(
+            raw, "schedule.fast_poll_seconds", where
+        ),
+        fast_poll_from=_optional_clock_time(raw, "schedule.fast_poll_from", where),
+        fast_poll_until=_optional_clock_time(raw, "schedule.fast_poll_until", where),
+        preopen_start=_optional_clock_time(raw, "schedule.preopen_start", where),
+        preopen_history_done_by=_optional_clock_time(
+            raw, "schedule.preopen_history_done_by", where
+        ),
+        preopen_subscribe_done_by=_optional_clock_time(
+            raw, "schedule.preopen_subscribe_done_by", where
+        ),
     )
 
-    _check_times_in_order(
-        [
-            ("schedule.scan_start", schedule.scan_start),
-            ("schedule.pick_time", schedule.pick_time),
-            ("schedule.entries_until", schedule.entries_until),
-            ("schedule.flatten_at", schedule.flatten_at),
-            ("schedule.market_close", schedule.market_close),
-        ],
-        where,
-    )
+    ordered = [
+        ("schedule.scan_start", schedule.scan_start),
+        ("schedule.pick_time", schedule.pick_time),
+        ("schedule.entries_until", schedule.entries_until),
+        ("schedule.flatten_at", schedule.flatten_at),
+    ]
+    # The market backstop sits between the start of the flatten and the close
+    # when a book has one. A book with none is checked exactly as it always was.
+    if schedule.flatten_market_at is not None:
+        ordered.append(("schedule.flatten_market_at", schedule.flatten_market_at))
+    ordered.append(("schedule.market_close", schedule.market_close))
+    _check_times_in_order(ordered, where)
+
+    if (schedule.fast_poll_from is None) != (schedule.fast_poll_until is None):
+        raise GuardrailConfigError(
+            f"The settings schedule.fast_poll_from and schedule.fast_poll_until in "
+            f"{where} go together: either set both, or leave both empty for a book "
+            "that only ever uses loop_minutes. Right now only one of them has a time."
+        )
+    if (
+        schedule.fast_poll_from is not None
+        and schedule.fast_poll_until is not None
+        and schedule.fast_poll_from >= schedule.fast_poll_until
+    ):
+        raise GuardrailConfigError(
+            f"The setting schedule.fast_poll_from in {where} is "
+            f"{schedule.fast_poll_from.strftime('%H:%M')}, which is not before "
+            f"schedule.fast_poll_until at "
+            f"{schedule.fast_poll_until.strftime('%H:%M')}. The fast window has to "
+            "run forwards."
+        )
     if schedule.loop_minutes > 60:
         raise GuardrailConfigError(
             f"The setting schedule.loop_minutes in {where} is "
@@ -1851,6 +2183,13 @@ def _need_clock_time(raw: dict, dotted_name: str, where: str) -> time:
     return time(hour=int(match.group(1)), minute=int(match.group(2)))
 
 
+def _optional_clock_time(raw: dict, dotted_name: str, where: str) -> time | None:
+    """A time such as "15:55", or None when the setting is missing or empty."""
+    if _is_unset(raw, dotted_name):
+        return None
+    return _need_clock_time(raw, dotted_name, where)
+
+
 def _clean_symbol(symbol: str, label: str) -> str:
     if not isinstance(symbol, str) or not symbol.strip():
         raise GuardrailUsageError(f"{label} has to be a symbol such as AAPL.")
@@ -1892,6 +2231,30 @@ def _clean_symbol_owners(owners, label: str = "AccountState.symbols_held_elsewhe
         )
         for symbol, book_id in owners.items()
     }
+
+
+def _clean_money_map(value, label: str, upper: bool) -> dict[str, float]:
+    """A {name: dollars} map, checked and tidied. None becomes an empty map.
+
+    upper says whether the keys are tickers, which are always upper case, or
+    industry names, which are words and are left as they were written.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise GuardrailUsageError(
+            f"{label} has to be a map of names to dollar amounts, but it is "
+            f"{type(value).__name__}."
+        )
+    out: dict[str, float] = {}
+    for key, amount in value.items():
+        name = str(key).strip()
+        if not name:
+            raise GuardrailUsageError(f"{label} has an entry with an empty name.")
+        if upper:
+            name = _clean_symbol(name, f"a key of {label}")
+        out[name] = _finite_number(amount, f"{label}[{name!r}]")
+    return out
 
 
 def _clean_book_id(book_id: str, label: str) -> str:
@@ -2001,6 +2364,52 @@ def must_flatten_now(g: Guardrails, now: datetime) -> bool:
     return g.schedule.flatten_at <= local.time() < g.schedule.market_close
 
 
+def must_flatten_at_market_now(g: Guardrails, now: datetime) -> bool:
+    """True once the market order backstop is due, item A11.
+
+    Flattening starts at flatten_at with limit orders at the bid or the ask,
+    because spreads widen and depth collapses in the last few minutes. Anything
+    still open at flatten_market_at goes out at market instead, because being
+    flat matters more than the last few cents.
+
+    Always false for a book with no backstop time and for one that is never
+    flattened at all.
+    """
+    backstop = g.schedule.flatten_market_at
+    if backstop is None or not g.flat_by_close:
+        return False
+    local = _eastern(g, now)
+    if not _is_weekday(local):
+        return False
+    return backstop <= local.time() < g.schedule.market_close
+
+
+def next_tick_seconds(g: Guardrails, now: datetime, holding: bool = False) -> int:
+    """How long until this book wants looking at again, in seconds. Item A14.
+
+    Thirty seconds between fast_poll_from and fast_poll_until while the book is
+    holding a position or has a working order, because a stop this tight needs
+    sub-minute resolution even with the stop resting at the broker. Five minutes
+    the rest of the time, and five minutes for a book with no fast window at
+    all, which is the insider and Congress books.
+
+    The loop reads this rather than deciding for itself, so the cadence is a
+    number in a yaml file and not a rule buried in the code.
+    """
+    slow = max(1, int(g.schedule.loop_minutes)) * 60
+    fast = g.schedule.fast_poll_seconds
+    start = g.schedule.fast_poll_from
+    end = g.schedule.fast_poll_until
+    if not holding or fast is None or start is None or end is None:
+        return slow
+    local = _eastern(g, now)
+    if not _is_weekday(local):
+        return slow
+    if start <= local.time() < end:
+        return max(1, int(fast))
+    return slow
+
+
 def trading_days_between(opened_on: date, today: date) -> int:
     """How many trading days a position has been alive.
 
@@ -2078,27 +2487,61 @@ def daily_loss_hit(g: Guardrails, state: AccountState) -> bool:
     return state.total_pnl_today <= -allowed_loss + CENT_TOLERANCE
 
 
+def atr_stop_distance(g: Guardrails, atr: float | None) -> float | None:
+    """How far the stop sits from the entry price, in dollars, off the ATR.
+
+    Momentum v2, item A1, approved by Mo on 2026-09-06. The average true range
+    is the average size of one session's price swing over the last 14 sessions,
+    counting the gap from the previous close. The stop sits risk.stop_atr_pct
+    percent of that away, so a stock whose average swing is 2 dollars stops 20
+    cents away and a quieter one stops closer still.
+
+    Returns None when this book has no volatility stop, which is the insider and
+    Congress books, or when nobody could work out an average true range for this
+    name. Then the caller falls back to the plain percentage stop.
+    """
+    if g.risk.stop_atr_pct is None or atr is None:
+        return None
+    value = _finite_number(atr, "atr")
+    if value <= 0:
+        return None
+    distance = value * (g.risk.stop_atr_pct / 100.0)
+    return distance if distance > 0 else None
+
+
 def stop_price_for(
     g: Guardrails,
     entry_price: float,
     opening_range_low: float | None,
     side: str = "BUY",
     opening_range_high: float | None = None,
+    atr: float | None = None,
 ) -> float:
     """Where the stop loss goes for a position opened at entry_price.
 
-    For a long, bought with a BUY: start with the percentage stop from the
-    settings, 1.5 percent below entry. If the low of the opening five minutes is
-    nearer to entry than that, and the settings allow it, use the opening range
-    low instead, because a nearer stop means a smaller loss when it is hit. The
-    answer is always below the entry price.
+    THE MOMENTUM V2 STOP, item A1, when an average true range is handed in and
+    the book has risk.stop_atr_pct set: the stop sits 10 percent of the 14 day
+    average true range away from the entry price. On top of that, when
+    risk.stop_outside_opening_range is true, it may never sit INSIDE the first
+    five minutes' range, so for a long it is pushed down to at or below the
+    range low and for a short up to at or above the range high. A stop inside
+    the range is inside the noise the trade is made of, so the setup itself
+    would hit it.
 
-    For a short, opened with a SELL, everything is the mirror image: the stop
-    sits 1.5 percent above entry, or on the high of the opening five minutes if
-    that is nearer, and the answer is always above the entry price. Pass the
-    range high in opening_range_high; opening_range_low is ignored for a short.
+    THE FALLBACK, when there is no average true range or the book has no
+    volatility stop, which is the insider and Congress books: the old rule
+    exactly as it was. Start with the percentage stop from the settings, 1.5
+    percent below entry on the momentum books. If the low of the opening five
+    minutes is nearer to entry than that, and the settings allow it, use the
+    opening range low instead, because a nearer stop means a smaller loss when
+    it is hit.
 
-    Either way the answer is rounded to whole cents.
+    For a short, opened with a SELL, everything is the mirror image and the
+    answer is always above the entry price. Pass the range high in
+    opening_range_high; opening_range_low is ignored for a short.
+
+    Either way the answer is always on the right side of entry, and is rounded
+    to whole cents.
     """
     if not isinstance(entry_price, (int, float)) or isinstance(entry_price, bool):
         raise GuardrailUsageError(
@@ -2112,17 +2555,26 @@ def stop_price_for(
     side = _clean_side(side, "side")
 
     if side == "SELL":
-        return _short_stop_price(g, entry_price, opening_range_high)
+        return _short_stop_price(g, entry_price, opening_range_high, atr)
 
-    percent_stop = entry_price * (1.0 - g.risk.stop_loss_pct / 100.0)
-    stop = percent_stop
-
-    if opening_range_low is not None and g.risk.use_opening_range_low_if_tighter:
-        low = _finite_number(opening_range_low, "opening_range_low")
-        # Only useful if it is genuinely below entry. A range low at or above the
-        # entry price would mean an instant stop out, so it is ignored.
-        if 0 < low < entry_price:
-            stop = max(percent_stop, low)
+    distance = atr_stop_distance(g, atr)
+    if distance is not None:
+        stop = entry_price - distance
+        if g.risk.stop_outside_opening_range and opening_range_low is not None:
+            low = _finite_number(opening_range_low, "opening_range_low")
+            # At or below the range low. A range low at or above entry is
+            # nonsense for a long and is ignored, exactly as it is below.
+            if 0 < low < entry_price:
+                stop = min(stop, low)
+    else:
+        percent_stop = entry_price * (1.0 - g.risk.stop_loss_pct / 100.0)
+        stop = percent_stop
+        if opening_range_low is not None and g.risk.use_opening_range_low_if_tighter:
+            low = _finite_number(opening_range_low, "opening_range_low")
+            # Only useful if it is genuinely below entry. A range low at or above
+            # the entry price would mean an instant stop out, so it is ignored.
+            if 0 < low < entry_price:
+                stop = max(percent_stop, low)
 
     stop = _round_cents(stop)
     if stop >= entry_price:
@@ -2133,18 +2585,28 @@ def stop_price_for(
 
 
 def _short_stop_price(
-    g: Guardrails, entry_price: float, opening_range_high: float | None
+    g: Guardrails,
+    entry_price: float,
+    opening_range_high: float | None,
+    atr: float | None = None,
 ) -> float:
-    """The mirror of the long stop: above the entry price, and the nearer wins."""
-    percent_stop = entry_price * (1.0 + g.risk.stop_loss_pct / 100.0)
-    stop = percent_stop
-
-    if opening_range_high is not None and g.risk.use_opening_range_low_if_tighter:
-        high = _finite_number(opening_range_high, "opening_range_high")
-        # A range high at or below where we sold would stop us out instantly, so
-        # it is ignored, exactly as a range low above entry is for a long.
-        if high > entry_price:
-            stop = min(percent_stop, high)
+    """The mirror of the long stop: above the entry price."""
+    distance = atr_stop_distance(g, atr)
+    if distance is not None:
+        stop = entry_price + distance
+        if g.risk.stop_outside_opening_range and opening_range_high is not None:
+            high = _finite_number(opening_range_high, "opening_range_high")
+            if high > entry_price:
+                stop = max(stop, high)
+    else:
+        percent_stop = entry_price * (1.0 + g.risk.stop_loss_pct / 100.0)
+        stop = percent_stop
+        if opening_range_high is not None and g.risk.use_opening_range_low_if_tighter:
+            high = _finite_number(opening_range_high, "opening_range_high")
+            # A range high at or below where we sold would stop us out instantly,
+            # so it is ignored, exactly as a range low above entry is for a long.
+            if high > entry_price:
+                stop = min(percent_stop, high)
 
     stop = _round_cents(stop)
     if stop <= entry_price:
@@ -2259,6 +2721,92 @@ def max_shares_for(
     return max(0, int(shares))
 
 
+def shares_for_risk(
+    g: Guardrails,
+    state: AccountState,
+    symbol: str,
+    entry_price: float,
+    stop_price: float,
+) -> int:
+    """How many shares to buy so that being wrong costs one trade's worth of risk.
+
+    Momentum v2, item A6, approved by Mo on 2026-09-06. The book risks
+    money.risk_per_trade_pct of its equity on each trade, which is 0.25 percent
+    or 250 dollars on a 100,000 dollar book. The share count is that money
+    divided by the distance from the entry price to the stop, so a name with a
+    wide stop gets fewer shares and a name with a tight stop gets more, and
+    every position loses about the same when it is wrong.
+
+    The answer is then put through max_shares_for, so the notional caps, the
+    single order cap and the cash left over are all still the ceiling. A very
+    tight stop would otherwise buy an enormous position, which is exactly the
+    failure this pair of rules exists to prevent.
+
+    A book with no risk_per_trade_pct, which is the insider and Congress books,
+    gets max_shares_for on its own, so nothing changes for them. So does a call
+    with a stop that is not on the right side of the entry price, because there
+    is no risk distance to divide by and refusing to size is worse than sizing
+    the old way.
+    """
+    ceiling = max_shares_for(g, state, symbol, entry_price)
+    risk_pct = g.money.risk_per_trade_pct
+    if risk_pct is None or risk_pct <= 0:
+        return ceiling
+
+    entry = _finite_number(entry_price, "entry_price")
+    stop = _finite_number(stop_price, "stop_price")
+    distance = abs(entry - stop)
+    if distance <= 0:
+        return ceiling
+
+    risk_dollars = float(state.equity) * (risk_pct / 100.0)
+    if risk_dollars <= 0:
+        return 0
+    wanted = (
+        Decimal(repr(_round_cents(risk_dollars))) / Decimal(repr(_round_cents(distance)))
+    ).to_integral_value(rounding=ROUND_FLOOR)
+    return max(0, min(int(wanted), ceiling))
+
+
+def weekly_loss_hit(g: Guardrails, state: AccountState) -> bool:
+    """True when this week's loss has reached the weekly cap.
+
+    Measured against what the book was worth when the market opened today, which
+    is the same base the daily cap uses, so the two numbers are read the same
+    way. A book with no weekly cap always gets false.
+    """
+    return _beyond_the_day_hit(g.money.max_weekly_loss_pct, state, state.week_pnl)
+
+
+def monthly_loss_hit(g: Guardrails, state: AccountState) -> bool:
+    """True when this month's loss has reached the monthly cap."""
+    return _beyond_the_day_hit(g.money.max_monthly_loss_pct, state, state.month_pnl)
+
+
+def _beyond_the_day_hit(
+    limit_pct: float | None, state: AccountState, pnl: float
+) -> bool:
+    if limit_pct is None:
+        return False
+    if state.day_start_equity <= 0:
+        # No sensible balance to measure against, so take the safe answer.
+        return True
+    allowed = state.day_start_equity * (limit_pct / 100.0)
+    return float(pnl) <= -allowed + CENT_TOLERANCE
+
+
+def losing_streak_hit(g: Guardrails, state: AccountState) -> bool:
+    """True when this book has finished down too many days in a row.
+
+    A run of small losses is the shape a broken strategy makes, and no daily,
+    weekly or monthly cap catches it on its own.
+    """
+    limit = g.money.max_consecutive_losing_days
+    if limit is None:
+        return False
+    return int(state.consecutive_losing_days) >= limit
+
+
 # ---------------------------------------------------------------------------
 # The main check
 # ---------------------------------------------------------------------------
@@ -2284,8 +2832,11 @@ def check_order(g: Guardrails, state: AccountState, intent: OrderIntent) -> Deci
     _check_short_discipline(g, state, intent, decision)
     _check_clock(g, state, intent, decision, when)
     _check_daily_loss(g, state, intent, decision)
+    _check_beyond_the_day_losses(g, state, intent, decision)
     _check_size(g, state, intent, decision)
     _check_gross_exposure(g, state, intent, decision)
+    _check_sector_cap(g, state, intent, decision)
+    _check_account_symbol_cap(g, state, intent, decision)
     _check_entries_per_day(g, state, intent, decision)
 
     return decision
@@ -2729,6 +3280,158 @@ def _check_daily_loss(
         f"percent ({_money(allowed_loss)}) of the "
         f"{_money(state.day_start_equity)} it opened with. No new positions for the "
         "rest of the day. Closing orders are still allowed.",
+    )
+
+
+def _check_beyond_the_day_losses(
+    g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
+) -> None:
+    """The three limits beyond the day, item A8, approved by Mo on 2026-09-06.
+
+    A weekly cap, a monthly cap and a run of losing days. Any one of them pauses
+    the book until Mo has looked at it, because without them a book could lose a
+    little every day for a fortnight and no rule would ever notice.
+
+    None of the three ever blocks a closing order. A paused book gets out of
+    what it holds; it just opens nothing new.
+    """
+    if intent.purpose in PAUSED_BOOK_ALLOWED_PURPOSES:
+        return
+
+    base = float(state.day_start_equity)
+
+    if weekly_loss_hit(g, state):
+        allowed = base * ((g.money.max_weekly_loss_pct or 0.0) / 100.0)
+        decision.add(
+            "weekly_loss_cap",
+            f"{_pot_words(g.book_id).capitalize()} is down "
+            f"{_money(abs(state.week_pnl))} this week, which has reached its weekly "
+            f"limit of {_plain_number(g.money.max_weekly_loss_pct)} percent "
+            f"({_money(allowed)}). The book is paused and opens nothing new until "
+            "Mo has looked at it. Closing orders are still allowed.",
+        )
+
+    if monthly_loss_hit(g, state):
+        allowed = base * ((g.money.max_monthly_loss_pct or 0.0) / 100.0)
+        decision.add(
+            "monthly_loss_cap",
+            f"{_pot_words(g.book_id).capitalize()} is down "
+            f"{_money(abs(state.month_pnl))} this month, which has reached its "
+            f"monthly limit of {_plain_number(g.money.max_monthly_loss_pct)} percent "
+            f"({_money(allowed)}). The book is paused and opens nothing new until "
+            "Mo has looked at it. Closing orders are still allowed.",
+        )
+
+    if losing_streak_hit(g, state):
+        decision.add(
+            "losing_streak_pause",
+            f"{_pot_words(g.book_id).capitalize()} has finished down "
+            f"{state.consecutive_losing_days} trading days in a row, and the limit "
+            f"is {g.money.max_consecutive_losing_days}. A run of small losses is the "
+            "shape a broken strategy makes, so the book is paused for Mo to look at "
+            "it. Closing orders are still allowed.",
+        )
+
+
+def _check_sector_cap(
+    g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
+) -> None:
+    """No more than a quarter of the book in one industry, item A9.
+
+    Five morning gappers move together far more than five unrelated names do, so
+    ten positions in one industry is really one bet made ten times. The cap is a
+    share of the book's gross exposure limit, which at a 100 percent gross cap
+    is a share of the book itself.
+
+    An industry the broker could not tell us stops the entry. That is the same
+    answer an unknown halt status gets and for the same reason: a limit that
+    cannot be measured is not a limit, and reading a missing answer as "fine" is
+    how the rule would quietly stop working.
+    """
+    limit_pct = g.money.sector_gross_pct_max
+    if limit_pct is None or intent.purpose != "entry":
+        return
+
+    if not intent.sector:
+        decision.add(
+            "sector_cap",
+            f"This order would open a position in {intent.symbol}, and nobody told "
+            "this check which industry it is in. The sector cap cannot be measured "
+            "without it, and an unknown industry is refused rather than counted as "
+            "harmless, because the whole point of the cap is that gap up names in "
+            "one industry all move together. Getting out is never blocked by it.",
+        )
+        return
+
+    notional = intent.notional
+    if notional is None:
+        # Already refused by max_order_notional, and there is nothing to add up.
+        return
+
+    equity = float(state.equity)
+    if equity <= 0:
+        return
+    cap = equity * (g.money.gross_exposure_pct_max / 100.0) * (limit_pct / 100.0)
+    held = state.sector_exposure_now(intent.sector)
+    would_be = held + notional
+    if would_be <= cap + CENT_TOLERANCE:
+        return
+
+    decision.add(
+        "sector_cap",
+        f"This order would put {_money(would_be)} of {_pot_words(g.book_id)} into "
+        f"{intent.sector}: {_money(held)} already there and {_money(notional)} from "
+        f"this order. The limit is {_plain_number(limit_pct)} percent of the book's "
+        f"gross exposure limit, which is {_money(cap)}. Names that gapped this "
+        "morning in the same industry are one bet, not several.",
+    )
+
+
+def _check_account_symbol_cap(
+    g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
+) -> None:
+    """No more than 15 percent of everything the books hold in one ticker, item A9.
+
+    This one counts across all five books rather than inside one, which is why
+    it needs the account wide figures the loop hands in. The one ticker one book
+    rule already stops two books buying the same name; this is the second layer
+    under it, and it also catches one book piling into a single ticker.
+
+    When the loop did not say what all five books are worth, this book's own
+    equity stands in. That is the smaller number, so the cap comes out tighter
+    rather than looser, which is the safe direction to be wrong in.
+    """
+    limit_pct = g.money.account_symbol_pct_max
+    if limit_pct is None or intent.purpose != "entry":
+        return
+    notional = intent.notional
+    if notional is None:
+        return
+
+    base = state.account_equity
+    measured_against = "everything the five books are worth"
+    if base is None or base <= 0:
+        base = float(state.equity)
+        measured_against = (
+            "what this book alone is worth, because nobody said what the five books "
+            "hold between them, and the smaller figure is the safer one to measure "
+            "against"
+        )
+    if base <= 0:
+        return
+
+    cap = base * (limit_pct / 100.0)
+    held = state.symbol_exposure_everywhere(intent.symbol)
+    would_be = held + notional
+    if would_be <= cap + CENT_TOLERANCE:
+        return
+
+    decision.add(
+        "account_symbol_cap",
+        f"This order would leave {_money(would_be)} riding on {intent.symbol} across "
+        f"every book: {_money(held)} already held and {_money(notional)} from this "
+        f"order. The limit is {_plain_number(limit_pct)} percent of "
+        f"{measured_against}, which is {_money(cap)}.",
     )
 
 

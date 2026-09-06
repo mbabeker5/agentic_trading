@@ -1,14 +1,15 @@
 # ============================================================================
-# PROVISIONAL. Every number in this file is a proposal waiting on Mo's
-# approval, taken from the parameter table in docs/STRATEGY.md. Nothing here
-# has been signed off. status: provisional below says the same thing in a way
-# the code can read.
+# MOMENTUM V2, approved by Mo on 2026-09-06.
+# Every number below was signed off from the consolidated critique at
+# research/momentum_spec_critique_2026-09-06.md. The one item still open is
+# shorting (A10), which stays switched off until Mo decides. The change list
+# and the git hash it was approved under are in CHANGELOG.md beside this file.
 # ============================================================================
 #
 # Book B runs this, and it is the control in the experiment. Every number below
 # is the same as in strategies/momentum_hybrid/strategy.yaml, and the only line
 # that differs is discretion: no model is called at all. The code takes the top
-# names off the scanner's shortlist in order and follows the rules.
+# names off the scanner's ranking in order and follows the rules.
 #
 # Keep the two files identical apart from that line and the name. If book A
 # beats book B it is because the model earned it, and that only means something
@@ -17,10 +18,14 @@
 # fails if the two ever drift apart.
 #
 # Spec: /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md
+# Changelog: /Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_rules/CHANGELOG.md
 
 strategy:
-  status: provisional         # provisional or approved. Mo decides.
+  status: approved            # provisional or approved. Mo decides. Approved
+                              # 2026-09-06 for everything except shorting.
   name: Opening momentum, rules only
+  version: v2                 # bumped whenever a number in this file changes,
+                              # so a ledger row can name the version it ran under
   spec: docs/STRATEGY.md
   discretion: rules_only      # no model is called at all
   holds_overnight: false      # nothing survives the close
@@ -29,46 +34,131 @@ strategy:
 money:
   starting_equity: 100000     # the book's own pot, not the whole account.
                               # config/books.yaml sets this from capital_usd.
-  max_position_pct: 15        # no single stock may be more than this percent
-                              # of the book. 15 percent of 100k is 15k.
-  max_open_positions: 5       # at most this many stocks held at the same time
-  max_daily_loss_pct: 2       # lose this percent of the day's opening balance
-                              # and the book stops opening new trades that day
-  max_order_notional: 15000   # no single order may be worth more than this
+
+  risk_per_trade_pct: 0.25    # A6. THE SIZE RULE. Every trade risks this
+                              # percent of the book, which is 250 dollars on a
+                              # 100,000 dollar book. The share count is that
+                              # money divided by the distance from the entry
+                              # price to the stop, so a name with a wide stop
+                              # gets fewer shares and a name with a tight stop
+                              # gets more. Every position then loses about the
+                              # same amount when it is wrong, which is the
+                              # whole point: at a flat 15 percent of the book
+                              # per name, one halt gap in one name cost more
+                              # than the whole daily cap.
+  max_position_pct: 10        # A6. The notional cap on top of the size rule. A
+                              # very tight stop would otherwise buy an enormous
+                              # position, so no single name may be worth more
+                              # than this percent of the book whatever the
+                              # arithmetic says. 10 percent of 100k is 10k.
+  max_open_positions: 10      # D1. Ten small positions rather than five big
+                              # ones. The published edge is in the breadth of
+                              # the ranking, not in picking the best one or two.
+  max_daily_loss_pct: 1       # A7. THE DERIVATION, because the old cap could
+                              # never bind and was decoration: 10 positions at
+                              # 0.25 percent risk each is a natural worst case
+                              # of 2.5 percent in one day, so a cap set above
+                              # that would never fire. 1 percent binds after
+                              # four full stop outs, which is a bad morning and
+                              # the right moment to stop for the day.
+  max_order_notional: 10000   # no single order may be worth more than this,
+                              # which is the same 10 percent of the book as
+                              # max_position_pct above
   gross_exposure_pct_max: 100 # longs and shorts added together may never be
-                              # worth more than the book itself. With 5
-                              # positions at 15 percent the natural ceiling is
-                              # 75 percent, so this is a backstop.
+                              # worth more than the book itself. With 10
+                              # positions at 10 percent the natural ceiling is
+                              # 100 percent, so this one can now actually bite.
+
+  max_weekly_loss_pct: 4      # A8. Lose this much in a calendar week and the
+                              # book pauses for Mo to look at it. Without a
+                              # rule beyond the day, a book could lose 1 percent
+                              # a day for ten days and nothing would notice.
+  max_monthly_loss_pct: 6     # A8. The same idea over a calendar month.
+  max_consecutive_losing_days: 3
+                              # A8. Three losing days in a row pauses the book
+                              # as well, because a run of small losses is the
+                              # shape a broken strategy makes.
+
+  sector_gross_pct_max: 25    # A9. No more than this share of the book's gross
+                              # exposure limit may sit in one industry. Five
+                              # morning gappers move together far more than
+                              # five unrelated names do, so ten positions in
+                              # one sector is really one bet made ten times.
+                              # At a 100 percent gross cap this is 25 percent
+                              # of book equity, which is two and a half
+                              # positions. A name whose industry the broker
+                              # could not tell us is refused rather than
+                              # assumed harmless.
+  account_symbol_pct_max: 15  # A9. Across ALL five books, not just this one, no
+                              # single ticker may carry more than this percent
+                              # of the money the books hold between them. The
+                              # one ticker one book rule already stops two books
+                              # buying the same name; this is the second layer
+                              # under it.
 
 risk:
-  stop_loss_pct: 1.5          # a long stops 1.5 percent below entry, a short
-                              # 1.5 percent above it
+  atr_days: 14                # A1 and A3. How many completed sessions the
+                              # average true range covers. The average true
+                              # range is the average size of a day's price swing
+                              # over those sessions, counting the gap from the
+                              # previous close, so it is bigger on a wild stock
+                              # and smaller on a quiet one.
+  stop_atr_pct: 10            # A1. THE STOP. The stop sits this percent of the
+                              # 14 day average true range away from the entry
+                              # price. A stock whose average daily swing is 2
+                              # dollars therefore stops 20 cents away. That is
+                              # about five times tighter than the 1.5 percent
+                              # stop it replaced, and a tight volatility based
+                              # stop is the one thing every published version of
+                              # this strategy has in common.
+  stop_outside_opening_range: true
+                              # A1. The stop may never sit inside the opening
+                              # range. For a long it is moved to at or below the
+                              # low of the first five minutes, for a short to at
+                              # or above the high. Inside the range is inside
+                              # the noise the trade is made of, so a stop there
+                              # would be hit by the setup itself.
+  stop_loss_pct: 1.5          # THE FALLBACK ONLY. Used when the average true
+                              # range for a name is not known, which should
+                              # never happen for a candidate, because the
+                              # volatility filter below needs the same number.
+                              # It exists so a position carried in from an older
+                              # state file still gets a stop rather than none.
+                              # It is not the strategy's stop any more.
   use_opening_range_low_if_tighter: true
-                              # if the low of the first five minutes is nearer
-                              # to entry than the percentage stop, use it
-                              # instead. For a short the range high does the
-                              # same job.
-  trailing_stop_pct:          # left empty on purpose. docs/STRATEGY.md offers
-  trailing_activation_pct:    # "a target or a trailing rule" and sets no
-                              # numbers, and the book is flat by 15:55 anyway.
-                              # Put a pair of numbers here and the trailing
-                              # stop switches itself on.
+                              # kept for the fallback path above and for any
+                              # book that has no average true range: the range
+                              # low is used when it is nearer than the percent
+                              # stop
+  use_profit_target: false    # A2. NO PROFIT TARGET. A position leaves by its
+                              # stop or at the close, and nothing else. Two
+                              # independent studies found that putting a target
+                              # on this strategy destroys its edge, because the
+                              # few trades that run a long way are what pay for
+                              # all the small losses.
+  trailing_stop_pct:          # left empty on purpose. With no target and a
+  trailing_activation_pct:    # tight stop there is nothing for a trailing rule
+                              # to add before the 15:45 flatten. Put a pair of
+                              # numbers here and the trailing stop switches
+                              # itself on.
   time_stop_trading_days: 1   # a position never lives past the close, so one
-                              # trading day is the honest number. The 15:55
+                              # trading day is the honest number. The 15:45
                               # flatten does the actual work.
   vwap_fade_closes: 2         # how many five minute closes in a row back
                               # through the session VWAP count as the opening
                               # push being over. One weak bar is noise, so the
-                              # number is not 1. Book B calls no model, so here
-                              # this number has only one reader, agent/loop.py,
-                              # which fires on exactly this count. It matches
-                              # the number in momentum_hybrid because B is the
-                              # control and only the model may differ between
-                              # them. Set it to 0 to switch the rule off.
+                              # number is not 1.
+  vwap_fade_action: log_only  # D2. IN MONTH ONE THE FADE CLOSES NOTHING. It is
+                              # written down every time it would have fired and
+                              # acted on never, because it comes from a
+                              # different published strategy and grafting it on
+                              # as an exit was never tested. Month one measures
+                              # what it would have cost or saved. Set this to
+                              # `exit` to make it close positions again.
 
-  max_picks: 5                # at most this many names may come back from one
-                              # decision call. decide() in agent/decide.py trims
-                              # to it on both paths, the model's and the
+  max_picks: 10               # D1. At most this many names may come back from
+                              # one decision call. decide() in agent/decide.py
+                              # trims to it on both paths, the model's and the
                               # rules-only one, so book B cannot quietly pick
                               # more names than book A. It is a ceiling on the
                               # answer, not on the day: schedule.entries_per_day_max
@@ -77,6 +167,18 @@ risk:
 
 universe:
   price_floor: 5              # ignore anything trading below this many dollars
+
+  min_atr_usd: 0.50           # A3. THE VOLATILITY FILTER, first half. A name
+                              # whose average daily swing is under fifty cents
+                              # cannot pay for the spread and the commission on
+                              # a five minute trade.
+  min_atr_pct_of_price: 1.5   # A3. Second half, and both have to hold. Fifty
+                              # cents is a big swing on a 6 dollar stock and
+                              # nothing at all on a 600 dollar one, so the same
+                              # test is applied again in percentage terms.
+                              # Without this filter the scan fills up with quiet
+                              # large caps whose five minute range is noise.
+
   min_avg_dollar_volume: 20000000
                               # the liquidity floor (Mo, 2026-09-06). A name has
                               # to trade at least this many dollars a day on
@@ -88,15 +190,47 @@ universe:
                               # the two: about 1,950 US names cleared it against
                               # about 2,700 that clear this one.
   dollar_volume_sessions: 30  # how many completed sessions that average covers
+  min_history_sessions: 30    # A12. A name needs at least this many completed
+                              # sessions behind it before it can be traded. Mo
+                              # considered and rejected a rule barring anything
+                              # listed in the last 90 days; this does the same
+                              # job honestly, because what actually matters is
+                              # whether there is enough history to measure the
+                              # liquidity floor and the average true range, and
+                              # a name without it fails those tests anyway.
   min_avg_volume: 1000000     # DEPRECATED, kept as an alias so an older file
                               # still loads. The scanner ignores it.
+
+  # A12. THE HARD EXCLUSIONS, applied before the model ever sees a name. These
+  # are the promoter and binary-event traps the red team ranked as the largest
+  # single source of loss in a strategy that buys whatever gapped hardest.
+  exclude_spacs: true         # a blank cheque company is a coin flip on a deal,
+                              # not a momentum trade
+  exclude_warrants_and_rights: true
+                              # warrants and rights move several times as far as
+                              # the share they are written on and are thin
+  exclude_preferred: true     # preferred shares barely move and barely trade
+  require_us_primary_listing: true
+                              # which keeps out anything traded over the counter
+                              # and any foreign line
+  exclude_halted: true        # nothing is opened in a name that cannot be
+                              # traded right now. The live check is on the order
+                              # path in agent/guardrails.py, rule id `halted`,
+                              # reading IBKR's tick type 49.
+
   allow_options: false        # no options in month one
-  allow_shorts: false         # OFF. Shorting is deferred to month two pending the
-                              # review team's critique (2026-09-06). The mirrored
-                              # stop, gross exposure cap and borrow check already
-                              # exist in the code, so flipping this to true is all
-                              # it takes once the hub confirms. Until then a short
-                              # is refused with rule id no_shorts.
+  allow_shorts: false         # A10 IS STILL PENDING MO'S DECISION, so this
+                              # stays false and the short side of the strategy
+                              # is deferred. The short sale restriction under
+                              # Rule 201 triggers on a 10 percent fall and then
+                              # forbids shorting at or below the bid for two
+                              # days, and a gap down name on heavy volume is
+                              # exactly that population, so "break below the
+                              # range low" shorts may not be fillable as
+                              # designed. Everything a short needs already
+                              # exists in the code, so this is one line to flip
+                              # once Mo decides. Until then a short is refused
+                              # with rule id no_shorts.
   short_price_floor: 10       # shorts only on shares at 10 dollars or more.
                               # Cheap shares are the expensive ones to be short
                               # of: hard to borrow, and they can double in a
@@ -130,34 +264,69 @@ scanner:
   # returns 50 rows in under a second. So every number in this file is applied
   # in our own code against real daily bars, where nothing can switch it off.
   # Four unfiltered scans feed the shortlist: TOP_PERC_GAIN and TOP_PERC_LOSE
-  # for the moves, HOT_BY_VOLUME and HIGH_STVOLUME_5MIN for the volume. Gainers
-  # become long candidates and fallers become short ones, each row tagged with
-  # its direction. See agent/README_scanner.md.
-  rel_volume_min: 2.0         # a candidate must be trading at least this many
-                              # times its normal pace for the time of day,
-                              # measured at 09:35. At or above, not above.
-  max_candidates: 20          # the shortlist the rules pick from is capped here
+  # for the moves, HOT_BY_VOLUME and HIGH_STVOLUME_5MIN for the volume. See
+  # agent/README_scanner.md.
+  #
+  # There is no Finviz block here any more (D7). Mo decided not to buy Finviz
+  # Elite, so the flag and the whole code path were deleted on 2026-09-06 rather
+  # than left switched off. Do not add it back thinking it went missing.
+  rank_by: rel_volume         # A4. THE SELECTION RULE. The shortlist is ordered
+                              # by relative volume, highest first, and the top
+                              # names are taken. It used to be ordered by the
+                              # size of the gap multiplied by the volume. The
+                              # ranking by volume, not the size of the move, is
+                              # what carried the published result.
+  rel_volume_min: 2.0         # the floor, applied before the ranking. A
+                              # candidate must be trading at least this many
+                              # times its normal pace for the time of day. At or
+                              # above, not above.
+  rel_volume_window: "09:30-09:35"
+                              # A4. The window relative volume is measured on:
+                              # the first five minutes, not the whole morning.
+  rel_volume_baseline_days: 14
+                              # A4. And what it is measured against: the same
+                              # five minute window on each of the previous 14
+                              # sessions. agent/preopen.py pulls that history
+                              # before the open so the ranking is ready at 09:35.
+  max_candidates: 20          # how many names the ranking hands to the rules.
+                              # Ten of them at most can become positions.
   exclude_leveraged_etfs: true  # no 2x or 3x or inverse products
-
-  finviz:
-    # The optional Finviz Elite cross-check, off because Mo has not bought it
-    # (39.50 dollars a month). The scanner run is shared by books A, B and E, so
-    # this switch only has an effect in config/guardrails.yaml, which is where
-    # the scanner reads it from. It is written out here too so a book's settings
-    # can be read in one place.
-    enabled: false
 
 schedule:
   timezone: America/New_York  # every time below is New York time
-  scan_start: "09:30"         # market opens, scanner runs
+  preopen_start: "09:00"      # the pre-open run starts here: the gap scan and
+                              # the history pulls, spread out so the data
+                              # budget is not spent in the five minutes when it
+                              # is scarcest. See docs/PREOPEN_FLOW.md.
+  preopen_history_done_by: "09:26"
+  preopen_subscribe_done_by: "09:29"
+  scan_start: "09:30"         # market opens, the opening range starts building
   pick_time: "09:35"          # the rules pick their names, entries may begin
-  entries_until: "11:00"      # no new positions opened after this
-  flatten_at: "15:55"         # sell everything still open
+  entries_until: "10:15"      # D3. NO NEW POSITIONS AFTER THIS. It used to be
+                              # 11:00. Entries after 10:15 chase moves that have
+                              # already been made, and every entry this cutoff
+                              # blocks is written down so month one measures
+                              # what the cutoff cost rather than guessing.
+  flatten_at: "15:45"         # A11. Flattening BEGINS here, with limit orders at
+                              # the bid or the ask, because spreads widen and
+                              # depth collapses in the last few minutes and a
+                              # market order into that pays for it.
+  flatten_market_at: "15:55"  # A11. The backstop. Anything still open at this
+                              # time goes out at market, because being flat
+                              # matters more than the last few cents.
   market_close: "16:00"       # market shuts
-  loop_minutes: 5             # the book wakes up this often during the day
+  loop_minutes: 5             # the book's ordinary cadence, out of hours and
+                              # once the morning is over
+  fast_poll_seconds: 30       # A14. But between fast_poll_from and
+  fast_poll_from: "09:35"     # fast_poll_until, while this book holds a
+  fast_poll_until: "11:00"    # position or has a working order, it looks every
+                              # 30 seconds instead. A stop this tight needs
+                              # sub-minute resolution even with the stop resting
+                              # at the broker.
   trade_only_regular_hours: true  # no pre-market or after-hours trading
-  entries_per_day_max: 5      # at most this many brand new names in one day.
-                              # Adding to something already held does not count.
+  entries_per_day_max: 10     # D1. At most this many brand new names in one
+                              # day. Adding to something already held does not
+                              # count.
 
 pdt:
   # The pattern day trader rule, as this book applies it. Day trading is this

@@ -9,17 +9,30 @@ almost always because something happened overnight. Those are the only names
 this strategy is interested in. This script finds them.
 
 It asks IB Gateway five questions, checks the answers against the rules in the
-strategy spec, and writes a shortlist of at most twenty names to a JSON file.
-Claude reads that file at 9:35 AM and decides which of them, if any, are worth
-trading. The script itself decides nothing and trades nothing.
+strategy spec, and writes a shortlist of at most twenty names to a JSON file,
+ranked by relative volume with the heaviest first. Claude reads that file at
+9:35 AM and decides which of them, if any, are worth trading. The script itself
+decides nothing and trades nothing.
 
-Both directions are on the list. Names off IBKR's gainers list are tagged
-`long`, names off its fallers list are tagged `short`, and each row carries that
-tag under both `direction` and `side` so whichever field the next step reads, it
-reads the right one. Note that shorting itself was deferred to month two by the
-review team on 2026-09-06, so `allow_shorts` is false in both momentum book
-files and the loop will not act on a short even though the scanner finds them.
-The shortlist is honest about what is there; the book decides what to do with it.
+Both directions are on the list, and which one a name gets comes from the first
+five minutes of its own trading: a 9:30 to 9:35 candle that closed above where
+it opened is a `long`, one that closed below is a `short`, and one that opened
+and closed at exactly the same price is no trade at all and comes off the list.
+Each row carries the tag under both `direction` and `side` so whichever field
+the next step reads, it reads the right one. Note that shorting itself was
+deferred to month two by the review team on 2026-09-06, so `allow_shorts` is
+false in both momentum book files and the loop will not act on a short even
+though the scanner finds them. The shortlist is honest about what is there; the
+book decides what to do with it.
+
+**Momentum v2, 2026-09-06.** Four of Mo's approved changes landed in this file
+on that date and are described in their own sections below: the volatility floor
+(A3), ranking by relative volume rather than by the size of the move (A4),
+direction from the opening candle (A5), and the hard exclusions (A12). A fifth
+decision, D7, took the optional Finviz Elite cross-check out of the file
+altogether; it is gone rather than switched off, and a test keeps it gone. The
+reasoning for all five is in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06.md`.
 
 ## The one thing to understand before anything else
 
@@ -126,22 +139,37 @@ pre-flight reads that line and puts the codes straight into the alert.
 ## Where the numbers come from
 
 If `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml`
-exists, the script reads four values out of it:
+exists, the script reads these values out of it:
 
 | Key in the YAML | Meaning | Falls back to |
 |---|---|---|
 | `universe.price_floor` | ignore anything cheaper than this | 5 dollars |
 | `universe.min_avg_dollar_volume` | ignore anything that normally trades less than this many dollars a day | 20,000,000 |
 | `universe.dollar_volume_sessions` | how many completed sessions that average covers | 30 |
+| `universe.atr_days` | how many sessions the average true range covers | 14 |
+| `universe.min_atr_usd` | the smallest daily range worth trading, in dollars | 0.50 |
+| `universe.min_atr_pct_of_price` | and the same floor as a share of the price | 1.5 |
+| `universe.min_history_sessions` | how many completed sessions a name needs before it is judged at all | 30 |
+| `universe.exclude_spacs` | drop blank cheque companies | `true` |
+| `universe.exclude_warrants_and_rights` | drop warrant and rights lines | `true` |
+| `universe.exclude_preferred` | drop preferred shares | `true` |
+| `universe.require_us_primary_listing` | keep OTC and non-US lines out | `true` |
+| `universe.exclude_halted` | drop anything IBKR says is halted | `true` |
 | `scanner.rel_volume_min` | how many times its normal pace a name has to be trading, measured at 09:35 | 2.0 |
 | `scanner.max_candidates` | how long the shortlist can be | 20 |
-| `scanner.finviz.enabled` | whether to cross-check against a Finviz Elite export | `false` |
-| `scanner.finviz.export_url` | the whole Finviz export link | empty |
-| `scanner.finviz.auth_token_key` | which key in `.secrets/finviz.env` holds the token | `FINVIZ_AUTH_TOKEN` |
-| `scanner.finviz.secrets_file` | which file inside `.secrets/` to read it from | `finviz.env` |
+| `scanner.rel_volume_window` | the window the strategy's own relative volume rule is about, carried for the record | `09:30-09:35` |
+| `scanner.rel_volume_baseline_days` | how many prior days that window is measured against, carried for the record | 14 |
 
 Anything missing falls back to the value above. The script never writes to that
 file. Another part of the project owns it.
+
+The last two are written into the output and are not used for arithmetic here.
+The real 9:30 to 9:35 measurement against the prior fourteen days is built from
+streaming ticks by
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preopen.py`.
+This scanner's own relative volume is the same idea measured from daily bars,
+which is the fallback for a morning when the pre-open run did not happen, and
+writing the window down means a shortlist says which of the two it got.
 
 `universe.min_avg_volume`, the old floor of a million shares a day, is still
 read and still written into the output so an old run can be read back, but
@@ -176,30 +204,39 @@ nothing filters on it any more. See the next section for why it changed.
    in their best rank order, then alternating down the four. This matters more
    than it sounds: stacking the lists and then trimming would throw the last one
    away entirely and leave only gainers.
-5. Adds the Finviz Elite names, if that cross-check is switched on. It is off.
-6. Drops the obvious leveraged funds straight away, by ticker, before
+5. Drops the obvious leveraged funds straight away, by ticker, before
    spending any data requests on them.
-7. Keeps the first thirty-five and looks up daily price history for each: what it
+6. Keeps the first thirty-five and looks up daily price history for each: what it
    is trading at now, what it closed at yesterday, how many shares have changed
    hands today, its average daily dollar volume over the last thirty completed
-   sessions, and its average daily share volume over the last twenty.
+   sessions, its average daily share volume over the last twenty, and its
+   average true range over the last fourteen.
+7. Drops anything with fewer than thirty completed sessions of history. A stock
+   listed last week has no normal to be unusual against, and averaging its first
+   three days would dress up a wild number as a settled one. This is the rule
+   that replaced the listing age rule Mo rejected; see "The hard exclusions"
+   below.
 8. Applies the number filters, all of them here rather than at Gateway: price
    at or above the floor, average daily dollar volume at or above the liquidity
-   floor, and relative volume at or above the threshold. All three are "at or
-   above", not "above", which is what the numbers in the spec mean. A name with
-   fewer than ten completed sessions of history gets no average at all, so it
-   fails this step. A stock listed last week has no normal to be unusual
-   against, and averaging its first three days would dress up a wild number as a
-   settled one.
-9. Settles each name's direction and drops the ones that contradict themselves.
-   See "Long and short" below.
-10. Looks up what each survivor actually is and drops it if it is priced in
-    anything but US dollars, if its home exchange is not one of NYSE, NASDAQ,
-    ARCA, AMEX, BATS or IEX, or if it is a leveraged or inverse fund.
-11. Ranks what is left, trims to the shortlist length, and only then fetches
-    the opening five-minute range for the names that made it. Fetching last
-    saves data requests, which are rationed.
-12. Writes the JSON file. Unless a scan failed, in which case it writes nothing
+   floor, the volatility floor, and relative volume at or above the threshold.
+   All of them are "at or above", not "above", which is what the numbers in the
+   spec mean.
+9. Settles each name's direction from the scan it came off and the sign of its
+   own move, and drops the ones that contradict themselves. This is the cheap
+   check; the real one comes at step 12. See "Long and short" below.
+10. Looks up what each survivor actually is, including what industry IBKR puts
+    it in, and drops it if it is priced in anything but US dollars, if its home
+    exchange is not one of NYSE, NASDAQ, ARCA, AMEX, BATS or IEX, or if it is a
+    leveraged or inverse fund, a SPAC, a warrant, a rights line, a preferred
+    share, or something IBKR reported as halted.
+11. Ranks what is left by relative volume, heaviest first, trims to the
+    shortlist length, and only then fetches the opening five-minute range for
+    the names that made it. Fetching last saves data requests, which are
+    rationed.
+12. Takes each shortlisted name's direction from the sign of its 9:30 to 9:35
+    candle, dropping any name whose candle opened and closed at the same price,
+    and numbers what survives 1, 2, 3 down the list.
+13. Writes the JSON file. Unless a scan failed, in which case it writes nothing
     and exits 3.
 
 ## How a scan is checked
@@ -231,8 +268,18 @@ scans only works while one request is in flight.
 
 ## Long and short
 
-A gainers scan says a name is going up. A fallers scan says it is going down. A
-volume scan says a name is busy and nothing at all about direction. So:
+**The rule that decides is the sign of the 9:30 to 9:35 candle** (change A5,
+approved 2026-09-06). Closed above where it opened, the name is a `long`. Closed
+below, it is a `short`. Opened and closed at exactly the same price, it is **no
+trade** and comes off the shortlist entirely. That is the published strategy's
+own rule, word for word, and it beats anything the overnight gap implies,
+because the gap is what happened before the bell and the candle is what buyers
+and sellers actually did once trading started. A name that gapped up 10 percent
+and then faded through its first five minutes is a short under this rule, and it
+used to be a long.
+
+That check can only run once the opening ranges are in, which is late in the
+run, so a cheaper one runs first on the scan lists themselves:
 
 - flagged by `TOP_PERC_GAIN` only, direction is `long`
 - flagged by `TOP_PERC_LOSE` only, direction is `short`
@@ -242,19 +289,49 @@ volume scan says a name is busy and nothing at all about direction. So:
   might, direction again comes from its own move, because its own price is
   better evidence than a list it appeared on
 
-Then a name whose own move contradicts its tag is **dropped**, not shortlisted.
-A name off the gainers list that is actually down on the day would otherwise get
-a "break above the opening high" trigger pointing the wrong way, which is worse
-than not listing it. That cut shows up as `passed_direction_agrees` in the
-counts.
+A name whose own move contradicts its tag is **dropped** at that point, not
+shortlisted. A name off the gainers list that is actually down on the day would
+otherwise get a "break above the opening high" trigger pointing the wrong way,
+which is worse than not listing it. That cut shows up as
+`passed_direction_agrees` in the counts.
 
-The score is the **size** of the move times the log of relative volume, not the
-signed move. Ranking on the signed number would sort every short to the bottom
-and the shortlist cap would then throw them all away.
+Then the candle overrules whatever that cheap check decided, for every name
+whose candle is known. The names dropped for a flat candle show up as the gap
+between `passed_direction_agrees` and `passed_direction_candle`, and `warnings`
+names them. A name whose candle is **not** known keeps the direction the cheap
+check gave it rather than being thrown away, which matters on delayed data,
+where a 9:35 run has no 9:30 bar yet.
 
 The short price floor of 10 dollars in the book files is deliberately **not**
 applied here. The scanner writes one shortlist that books A, B and E all read,
 and a per-book rule belongs to the book, not to the shared list.
+
+## The volatility floor
+
+A candidate has to actually move enough in a normal day for a five minute
+breakout to mean anything. The measure is the **average true range** over the
+last fourteen completed sessions, and a name has to clear **both** halves of the
+floor: at least **0.50 dollars** of daily range and at least **1.5 percent** of
+its own price. This was a universe filter in the published test, and without it
+the shortlist fills up with quiet large caps whose whole five minute range is
+noise.
+
+Both halves are needed because either one alone lets the wrong names through. 50
+cents of range on a 400 dollar stock is dead quiet, so the percentage catches
+that one. 1.5 percent of a 6 dollar stock is 9 cents, which is inside the
+spread, so the dollar floor catches that one.
+
+The true range of a session is not simply its high minus its low, because that
+misses the gap. It is the largest of three numbers: high minus low, the distance
+from the high to yesterday's close, and the distance from the low to yesterday's
+close. A stock that closed at 20, opened at 24 and then traded between 24 and 25
+has a one dollar high-to-low range and a five dollar true range, and five is the
+honest number. The average is the plain mean of the last fourteen of those.
+
+A name whose average true range cannot be worked out **fails** the filter. Not
+measurable means not traded, which is the safe answer. The survivors show up as
+`passed_volatility` in the counts, and every shortlisted row carries `atr`,
+`atr_days_used` and `atr_pct_of_price` so the number can be checked.
 
 ## The filter probe in the pre-flight
 
@@ -348,22 +425,89 @@ The name check is deliberately skipped for ordinary company shares, so a real
 company called something like Bullfrog AI is not thrown out over a word in its
 name. Only funds and other non-ordinary listings get the name treatment.
 
-### The score
+### The score, which is now the ranking by relative volume
 
-Names are ranked on the size of the day's move multiplied by the natural log of
-relative volume. A big move on ordinary volume is not to be trusted, and heavy
-volume with no price move is not a momentum trade, so multiplying the two
-rewards names that have both. The log stops one enormous volume reading from
-swamping everything else.
+**The shortlist is ranked by relative volume alone, heaviest first** (change A4,
+approved 2026-09-06). The `score` field on each row is simply that name's
+relative volume, and `rank` is where it came: 1 for the busiest name, 2 for the
+next, and so on down the list. The top `max_candidates` are kept.
 
-The size of the move, not the signed move. A stock down 9 percent on five times
-its normal volume is as good a short as the mirror image is a long, and ranking
-on the signed number would sort every short to the bottom of the list where the
-cap would throw it away.
+It used to be the size of the day's move multiplied by the natural log of
+relative volume. That was our own invention. The published result this strategy
+is copying came from ranking candidates by relative volume and taking the top
+few, and it was the **ranking** that carried the result, not the size of the
+gap. So a name up 2 percent on nine times its normal volume now goes ahead of a
+name up 20 percent on three times, which is the reverse of the old order.
+
+The 2 times normal floor has not gone anywhere. It still runs earlier, as a
+filter: a name below twice its normal pace never reaches the ranking at all.
+What changed is only the order of the survivors.
+
+`rank` is numbered after the flat-candle drop, so the published list always
+reads 1, 2, 3 with no holes in it.
 
 Names whose own move contradicts the scan that flagged them are removed
 outright, not just ranked low. That cut shows up as `passed_direction_agrees` in
 the counts, and "Long and short" above explains it.
+
+### The hard exclusions
+
+Change A12, approved 2026-09-06. These names never reach the model at all,
+because they are structurally not what this strategy trades whatever their price
+did this morning:
+
+| Dropped | How it is spotted | Switch |
+|---|---|---|
+| leveraged and inverse funds | the ticker list and the fund name words, described above | `universe.exclude_leveraged_etfs` |
+| SPACs, meaning blank cheque companies | a name containing "Acquisition Corp", "Acquisition Co", "Acquisition Holdings", or the word SPAC on its own | `universe.exclude_spacs` |
+| warrants | IBKR's `WAR` stock type, the word warrant in the name, or a warrant ticker shape | `universe.exclude_warrants_and_rights` |
+| rights lines | a rights ticker suffix **and** the word right or rights in the name | `universe.exclude_warrants_and_rights` |
+| preferred shares | IBKR's `PREFERRED` stock type, "Preferred", "Pfd" or "Pref Shs" in the name, or a `.PR` style ticker | `universe.exclude_preferred` |
+| anything not on a US venue | the US listing test, which is what keeps OTC and non-US lines out | `universe.require_us_primary_listing` |
+| anything halted | IBKR's own halt flag, when it gives one | `universe.exclude_halted` |
+
+Two of those tests are deliberately cautious about the ticker, because getting
+them wrong throws out real businesses every single morning:
+
+- A **rights** line is only dropped when the name says "right" or "rights" as
+  well as the ticker ending in R or RT. Plenty of ordinary companies have
+  tickers ending in R, Palantir and Builders FirstSource among them.
+- A bare trailing **W** is only read as a warrant on a five character ticker,
+  which is the NASDAQ convention of a fifth letter bolted onto a four letter
+  root. Reading it on any ticker would throw out Lowe's (LOW), Dow (DOW) and
+  Corning (GLW). Ticker shapes with a separator in them, like `.WS`, `-WS` and
+  a trailing `+`, are unambiguous and are dropped on sight.
+
+**The halt check cannot actually be made here today.** IBKR's contract details
+carry no halt flag on this account, so the code looks for one, finds nothing,
+and writes a line into `warnings` saying so rather than implying it looked and
+found the name trading normally. The halt check that really runs is the one on
+the order path, in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py`,
+rule id `halted`, which reads IBKR's tick type 49. Nothing here invents a halt
+flag to fill the gap.
+
+**There is no rule about how recently a name listed, and that is deliberate.**
+The reviewers proposed dropping anything listed in the last 90 days. Mo rejected
+it and replaced it with a demand for enough history to measure the name at all:
+the thirty completed sessions the dollar volume average needs
+(`universe.min_history_sessions`) and the fourteen the average true range needs.
+A name that has traded long enough to be measured has traded long enough to be
+traded, and a listing date is a worse proxy for that than the sessions
+themselves. The names that fall at that hurdle show up as `passed_history` in
+the counts, and a test asserts no listing-age rule has crept back in.
+
+### The industry each name is in
+
+Every shortlisted row now carries `sector`, taken from IBKR's contract details
+(its `industry` field, falling back to `category` and then `subcategory`,
+whichever first says something), along with `category` and `subcategory`
+themselves for the month end review. The **sector cap** in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py`
+is what reads it, and it refuses an entry outright when nobody can say what
+industry a name is in, so an empty `sector` means that name cannot be traded
+even though it is on the list. That is worth noticing rather than ignoring, and
+the run names any such shortlisted names in `warnings`.
 
 ## What is in the JSON file
 
@@ -386,7 +530,6 @@ The top of the file describes the run:
 | `control_scan_code` | the fifth scan, the one that proves the scanner is answering |
 | `scan_filters_sent` | always `[]`, and a test keeps it that way |
 | `scan_diagnostics` | one block per scan, explained below |
-| `finviz` | whether the cross-check ran, and what it added |
 | `thresholds` | the numbers used, and whether they came from the YAML or the built-in defaults |
 | `counts` | how many names survived each stage, explained below |
 | `scanner_requests_used` | how many of the five scanner requests were spent |
@@ -423,17 +566,21 @@ because it shows exactly where the names went:
 | `scanned_top_perc_lose` | rows returned by the fallers scan |
 | `scanned_hot_by_volume` | rows returned by the heavy volume scan |
 | `scanned_high_stvolume_5min` | rows returned by the five minute volume scan |
-| `merged_unique` | distinct names across all four, plus Finviz if it is on |
+| `merged_unique` | distinct names across all four scans |
 | `after_known_leveraged_tickers` | left after dropping known leveraged funds by ticker |
 | `capped_for_enrichment` | left after trimming to thirty-five |
 | `daily_bars_ok` | how many returned usable price history |
+| `passed_history` | how many have the thirty completed sessions it takes to judge them |
 | `passed_price_floor` | still at or above the price floor |
 | `passed_dollar_volume` | still at or above the 20 million dollar average daily liquidity floor |
+| `passed_volatility` | still above both halves of the volatility floor, 0.50 dollars and 1.5 percent of price |
 | `passed_rel_volume` | still trading at or above the relative volume threshold |
 | `passed_direction_agrees` | the name's own move agrees with the scan that flagged it |
 | `passed_us_listing` | priced in dollars and listed on an allowed US exchange |
 | `passed_leverage_name_filter` | left after the fund name check |
+| `passed_hard_exclusions` | left after the SPAC, warrant, rights, preferred and halt checks |
 | `opening_range_ok` | how many returned a first five minutes to measure |
+| `passed_direction_candle` | left after dropping the names whose opening candle was flat |
 | `final` | how many made the shortlist |
 | `final_long` | of those, how many are long candidates |
 | `final_short` | and how many are short candidates |
@@ -449,20 +596,30 @@ Each entry in `candidates` looks like this:
 | `gain_pct` | percentage move from yesterday's close |
 | `opening_range_high` | the highest price in the first five minutes. The entry trigger is a break above this |
 | `opening_range_low` | the lowest price in the first five minutes. This is one of the two candidates for the stop |
+| `opening_range_open` | what the 9:30 to 9:35 candle opened at |
+| `opening_range_close` | and what it closed at. These two are what decided `direction` |
 | `volume_today` | shares traded so far today |
 | `avg_volume_20d` | average shares traded per day over the last twenty completed sessions. Only the bottom half of the relative volume ratio, which is shares against shares. Nothing is filtered on it |
 | `avg_dollar_volume` | average dollars traded per day over the last thirty completed sessions. This is the liquidity floor's number |
 | `avg_dollar_volume_sessions` | how many completed sessions that average actually used, which is fewer than thirty for a recent listing |
+| `completed_sessions` | how many completed daily bars the name has at all. Under `min_history_sessions` and it never reached the filters |
+| `atr` | the average true range in dollars: how far this name travels in a normal session |
+| `atr_days_used` | how many sessions that average used. 14 on a normal run |
+| `atr_pct_of_price` | the same range as a percentage of the price, which is the second half of the volatility floor |
 | `rel_volume` | today's volume divided by what would be normal by this time of day |
 | `rel_volume_minutes_elapsed` | how many minutes of trading that ratio was measured over. 5 means it was measured at the 9:35 anchor the rule is about |
-| `direction` | `long` or `short`. Which way this name is a candidate |
+| `direction` | `long` or `short`. Which way this name is a candidate, taken from the opening candle |
 | `side` | the same value again, because the loop reads `side` and the decision code reads either |
 | `flagged_by` | which scans flagged it. Two entries is a stronger signal than one |
 | `scan_rank` | the best place it took on any scan, 0 being the top of a list |
+| `rank` | where it came on this shortlist. 1 is the heaviest relative volume |
 | `reasons` | short plain-language sentences explaining why it is on the list, meant to be read |
-| `score` | the ranking number described above |
+| `score` | the ranking number, which is now simply the relative volume |
 | `long_name` | the company or fund's full name |
 | `stock_type` | `COMMON` for ordinary shares, `ETF` for a fund, and so on |
+| `sector` | what industry IBKR puts it in. The sector cap reads this, and an empty string means the name cannot be entered |
+| `category` | IBKR's finer grain under the industry |
+| `subcategory` | and finer again. Nothing filters on either; they are here for the month end review |
 
 ## Things worth knowing
 
@@ -550,36 +707,29 @@ into the session". Nothing survives the filters anyway, because nothing has
 traded, but do not read that number as meaning anything. It is a pre-existing
 quirk of `measure_session_progress` and is only visible when the market is shut.
 
-## The Finviz Elite cross-check, which is off
+## The Finviz Elite cross-check, which was removed
 
-Finviz Elite has native gap and relative-volume filters and a CSV export
-endpoint, which makes it a genuinely useful second opinion on what gapped this
-morning. **Mo has not bought it** (39.50 dollars a month as of 2026-09-06), so
-the switch is off and nothing in this project has signed up for anything.
+There used to be an optional second opinion here. Finviz Elite has native gap
+and relative volume filters and a CSV export endpoint, so the scanner could
+download that export and fold those tickers into the union as a cross-check on
+what IBKR's own lists found.
 
-With `scanner.finviz.enabled: false`, which is the shipped setting, the script
-writes one line in the log and makes **no network call at all**. A test asserts
-that by making any call to `urlopen` fail the test outright.
+**It is gone.** Mo decided not to buy Finviz Elite (39.50 dollars a month), which
+is decision D7 in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06.md`,
+and on 2026-09-06 the whole path came out of the file: the settings, the
+download, the CSV reader, the `finviz` tag on a candidate and the `finviz` block
+in the output. It was deleted rather than left switched off, because a dead code
+path that talks to the network is a thing somebody eventually turns on by
+accident.
 
-To turn it on later, three steps:
-
-1. Set `scanner.finviz.enabled: true` in
-   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml`.
-2. Put the whole Finviz export link, screener settings and all, in
-   `scanner.finviz.export_url`.
-3. If that link does not already carry its own `auth=` token, put the token in
-   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/finviz.env`
-   as a `KEY=value` line, and name the key in `scanner.finviz.auth_token_key`.
-   That folder is gitignored. The token is appended to the link at request time
-   and never appears in the log, in an error message, or in the shortlist.
-
-When it is on, the ticker column of the CSV is read, those names join the union
-tagged `finviz` in `flagged_by`, and they go through exactly the same price,
-liquidity, relative volume, US listing and leveraged fund checks as everything
-else. A name Finviz found that IBKR also found is tagged with both and is not
-duplicated. A name only Finviz found arrives with no contract id, which is fine:
-the script looks it up by ticker. The `finviz` block in the output says what
-happened either way.
+A note near the top of
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/scanner.py`
+says the same thing, so nobody adds it back thinking its absence was an
+oversight, and a test in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_scanner_filters.py`
+fails if the word turns up anywhere in that file outside that note. IBKR's four
+scans plus the control scan are the whole source of names now.
 
 ## Proved against the live Gateway
 

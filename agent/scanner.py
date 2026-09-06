@@ -3,9 +3,11 @@
 
 Asks IB Gateway which US stocks and ETFs are moving hard and trading unusually
 heavily, checks each one against the strategy's rules, and writes a shortlist of
-at most twenty names to a JSON file. Claude reads that file at 9:35 AM and
-decides which names, if any, are worth trading. Both directions: gainers become
-long candidates and losers become short candidates.
+at most twenty names to a JSON file, ranked by relative volume with the heaviest
+first. Claude reads that file at 9:35 AM and decides which names, if any, are
+worth trading. Both directions: a name whose first five minute candle closed
+above where it opened is a long candidate, one that closed below is a short
+candidate, and one that opened and closed at the same price is no trade at all.
 
 WE DO NOT TRUST IBKR'S SCANNER FILTERS (Mo, 2026-09-06)
 -------------------------------------------------------
@@ -20,9 +22,12 @@ month and never know why.
 So this script sends NO filters to Gateway, ever. Every scan is unfiltered, and
 every rule in docs/STRATEGY.md is applied here in our own code against real
 daily bars: the 5 dollar price floor, the 20 million dollar liquidity floor, the
-2 times relative volume floor at 09:35, the US listing test and the leveraged
-and inverse fund test. Filters that are checked here cannot be silently switched
-off by a subscription we do not have.
+30 session history requirement, the volatility floor of a 14 day average true
+range above 50 cents and above 1.5 percent of price, the 2 times relative volume
+floor at 09:35, the US listing test, the leveraged and inverse fund test and the
+hard exclusions on SPACs, warrants, rights and preferred shares. Filters that
+are checked here cannot be silently switched off by a subscription we do not
+have.
 
 Every scan also goes through agent/scan_truth.py before its rows are believed:
 errors are captured against the scan's own request id, an unfiltered control
@@ -62,21 +67,29 @@ Exit codes:
     3   a scan could not be trusted (ScanFailure). Nothing was written
 """
 
+# THE FINVIZ CROSS-CHECK WAS REMOVED ON 2026-09-06, ON PURPOSE
+# ------------------------------------------------------------
+# This file used to be able to fetch a Finviz Elite CSV export and fold those
+# tickers into the union as a second opinion on what had gapped. Mo decided not
+# to buy Finviz Elite (39.50 dollars a month), so decision D7 of
+# research/momentum_spec_critique_2026-09-06.md took the whole path out: the
+# settings, the download, the CSV reader and the "finviz" tag. It was deleted
+# rather than left switched off, because a dead code path that talks to the
+# network is a thing somebody eventually turns on by accident. This note is here
+# so nobody puts it back thinking its absence was an oversight. IBKR's own four
+# scans plus the control scan are the whole source of names now.
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
-import csv
-import io
 import json
 import logging
 import math
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -87,7 +100,6 @@ from ib_async import IB, ScannerSubscription, Stock, TagValue
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GUARDRAILS_PATH = PROJECT_ROOT / "config" / "guardrails.yaml"
-SECRETS_DIR = PROJECT_ROOT / ".secrets"
 
 # The project folder goes on the import path so that "agent.scan_truth" means the
 # same module here as it does in the tests. Importing it as a bare "scan_truth"
@@ -126,6 +138,53 @@ DEFAULT_MIN_AVG_DOLLAR_VOLUME = 20_000_000.0
 DEFAULT_DOLLAR_VOLUME_SESSIONS = 30
 DEFAULT_REL_VOLUME_MIN = 2.0
 DEFAULT_MAX_CANDIDATES = 20
+
+# THE VOLATILITY FLOOR (change A3, approved 2026-09-06)
+# -----------------------------------------------------
+# A name has to actually move enough in a normal day for a five minute breakout
+# to mean anything. The measure is the average true range over the last 14
+# completed sessions, which is the average of how far the stock travelled in a
+# session, and a candidate has to clear BOTH halves of the floor: at least 50
+# cents of daily range, and at least 1.5 percent of its own price.
+#
+# Both halves are needed because either one alone lets the wrong names through.
+# 50 cents on a 400 dollar stock is dead quiet, so the percentage catches that.
+# 1.5 percent of a 6 dollar stock is 9 cents, which is inside the spread, so the
+# dollar floor catches that. Without this filter the shortlist fills up with
+# large, quiet names whose whole five minute range is noise.
+DEFAULT_ATR_DAYS = 14
+DEFAULT_MIN_ATR_USD = 0.50
+DEFAULT_MIN_ATR_PCT_OF_PRICE = 1.5
+
+# Written into the output for the record, not used for arithmetic in this file.
+# The published edge ranks names by the volume traded between 9:30 and 9:35
+# against the same five minutes over the prior 14 sessions. That true
+# measurement is built from streaming ticks by
+# /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preopen.py.
+# This scanner's own relative volume is the same idea measured from daily bars,
+# which is the fallback for a morning when the pre-open run did not happen.
+DEFAULT_REL_VOLUME_WINDOW = "09:30-09:35"
+DEFAULT_REL_VOLUME_BASELINE_DAYS = 14
+
+# THE HARD EXCLUSIONS (change A12, approved 2026-09-06)
+# -----------------------------------------------------
+# Names that get dropped before the model ever sees them, because they are
+# structurally not what this strategy trades: leveraged and inverse funds, blank
+# cheque companies (SPACs), warrants, rights, preferred shares, anything not
+# listed on a US venue, and anything in a trading halt.
+#
+# Deliberately NOT on this list: any rule about how recently a name listed. Mo
+# rejected the 90 day listing age rule. What replaced it is a demand for enough
+# history to measure the name at all, which is min_history_sessions below (the
+# 30 completed sessions the dollar volume average needs) together with the 14
+# sessions the average true range needs. A name that has traded long enough to
+# be measured has traded long enough to be traded.
+DEFAULT_EXCLUDE_SPACS = True
+DEFAULT_EXCLUDE_WARRANTS_AND_RIGHTS = True
+DEFAULT_EXCLUDE_PREFERRED = True
+DEFAULT_REQUIRE_US_PRIMARY_LISTING = True
+DEFAULT_EXCLUDE_HALTED = True
+DEFAULT_MIN_HISTORY_SESSIONS = 30
 
 # The relative volume test is anchored at 9:35 AM Eastern, five minutes after
 # the open. That is the moment the strategy makes its picks, and Mo's rule of
@@ -235,7 +294,6 @@ CONTROL_SCAN_CODE = "MOST_ACTIVE"
 # Plain-English labels for the scan codes, for the "reasons" field.
 SCAN_CODE_LABELS = {spec.code: spec.label for spec in SCAN_SPECS}
 SCAN_CODE_LABELS[CONTROL_SCAN_CODE] = "IBKR's most active list (the control scan)"
-SCAN_CODE_LABELS["finviz"] = "the Finviz Elite export cross-check"
 
 # Sending a forbidden code would be a silent nothing at 9:35, so refuse at import.
 assert not (set(SCAN_CODES) | {CONTROL_SCAN_CODE}) & FORBIDDEN_SCAN_CODES, (
@@ -295,16 +353,44 @@ NO_LIVE_DATA_CODES = frozenset({354, 492, 10089, 10091, 10167, 10168, 10197})
 
 MARKET_DATA_TYPE_LABELS = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed frozen"}
 
-# Finviz Elite, the optional cross-check. Mo has not bought it (39.50 dollars a
-# month as of 2026-09-06), so the switch in config/guardrails.yaml is off and
-# this code path does nothing but log one line. Nothing here signs up for
-# anything, and with the switch off nothing here touches the network.
-FINVIZ_SECRETS_FILE = "finviz.env"
-FINVIZ_DEFAULT_TOKEN_KEY = "FINVIZ_AUTH_TOKEN"
-FINVIZ_TIMEOUT_S = 20.0
-FINVIZ_MAX_SYMBOLS = 100
-FINVIZ_TICKER_COLUMNS = ("ticker", "symbol")
-FINVIZ_FLAG = "finviz"
+# ---------------------------------------------------------------------------
+# What each hard exclusion looks like in the words IBKR gives us
+# ---------------------------------------------------------------------------
+#
+# All we get from a contract details lookup is the ticker, the company or fund's
+# full name, and IBKR's own stock type. So every test below is built out of
+# those three things and nothing else. Each one is a separate small function so
+# it can be read on its own and tested on its own.
+
+# A blank cheque company: a shell that raised money to buy a business it has not
+# named yet. Almost all of them are called "<Something> Acquisition Corp".
+SPAC_NAME_PHRASES = ("ACQUISITION CORP", "ACQUISITION CO", "ACQUISITION HOLDINGS")
+SPAC_WORD = re.compile(r"\bSPAC\b")
+
+# A warrant is a right to buy the share later. It trades separately, it is far
+# thinner than the share, and it is not what this strategy is buying.
+WARRANT_NAME_PHRASES = (" WARRANT", "WARRANTS")
+WARRANT_STOCK_TYPES = frozenset({"WAR", "WARRANT", "WARRANTS"})
+# Ticker shapes. The ones with a separator in them (BRK.WS, ABC-WS, ABC+) are
+# unambiguous, so they count on their own. A bare trailing W is different: it is
+# the NASDAQ convention of a fifth letter bolted onto a four letter root, so it
+# only counts on a five character ticker. Reading a bare trailing W on any
+# length of ticker would throw out Lowe's (LOW), Dow (DOW) and Corning (GLW),
+# which are ordinary companies, every single morning.
+WARRANT_SUFFIXES_WITH_SEPARATOR = (".WS", "-WS", "/WS", ".W", "-W", "/W", "+")
+WARRANT_BARE_SUFFIX_LENGTHS = {"W": 5, "WS": 6}
+
+# A right is a short lived entitlement handed to existing holders. Same story as
+# a warrant: separate, thin, not the share itself.
+RIGHT_SUFFIXES = (".RT", "-RT", "/RT", "RT", "R")
+RIGHT_NAME_PHRASE = " RIGHT"
+
+# Preferred shares behave like bonds. They do not gap and run with the market.
+PREFERRED_NAME_PHRASES = (" PREFERRED", " PFD", "PREF SHS")
+PREFERRED_STOCK_TYPES = frozenset({"PREFERRED", "PFD"})
+# BAC.PRK and BAC-PRB are preferred lines of Bank of America. The separator is
+# what makes this safe: plain "PR" inside a ticker would catch PRU (Prudential).
+PREFERRED_TICKER_PATTERN = re.compile(r"[.\-/]PR")
 
 log = logging.getLogger("scanner")
 
@@ -312,37 +398,6 @@ log = logging.getLogger("scanner")
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class FinvizSettings:
-    """The optional Finviz Elite cross-check, off unless the YAML turns it on.
-
-    Finviz Elite has native gap and relative-volume filters and a CSV export
-    endpoint, which makes it a useful second opinion on what actually gapped.
-    Mo has not bought it, so `enabled` is false in config/guardrails.yaml and
-    with it false nothing here touches the network at all.
-
-    export_url is the whole Finviz export link, screener settings and all. If
-    that link already carries its `auth=` token then nothing else is needed. If
-    it does not, put the token in a file of KEY=value lines at
-    /Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/finviz.env
-    under the key named by auth_token_key, and it is appended to the link at
-    request time. The token is never written into the output file or the log.
-    """
-
-    enabled: bool = False
-    export_url: str = ""
-    auth_token_key: str = FINVIZ_DEFAULT_TOKEN_KEY
-    secrets_file: str = FINVIZ_SECRETS_FILE
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "export_url_set": bool(self.export_url),
-            "auth_token_key": self.auth_token_key,
-            "secrets_file": self.secrets_file,
-        }
 
 
 @dataclass
@@ -360,6 +415,11 @@ class Thresholds:
     universe.min_avg_volume, the old share count, is still read out of the
     settings file so an older file loads, but nothing in here filters on it any
     more. It is carried into the output so a run can be read back later.
+
+    The atr_ fields are the volatility floor of change A3, and the exclude_ and
+    require_ fields are the hard exclusions of change A12, both approved by Mo
+    on 2026-09-06. min_history_sessions is what replaced the rejected rule about
+    how recently a name listed.
     """
 
     price_floor: float = DEFAULT_PRICE_FLOOR
@@ -367,9 +427,22 @@ class Thresholds:
     dollar_volume_sessions: int = DEFAULT_DOLLAR_VOLUME_SESSIONS
     rel_volume_min: float = DEFAULT_REL_VOLUME_MIN
     max_candidates: int = DEFAULT_MAX_CANDIDATES
+    atr_days: int = DEFAULT_ATR_DAYS
+    min_atr_usd: float = DEFAULT_MIN_ATR_USD
+    min_atr_pct_of_price: float = DEFAULT_MIN_ATR_PCT_OF_PRICE
+    #: Written into the output for the record only. The real 9:30 to 9:35
+    #: measurement against the prior 14 days is built by agent/preopen.py from
+    #: streaming ticks; nothing in this file does arithmetic with these two.
+    rel_volume_window: str = DEFAULT_REL_VOLUME_WINDOW
+    rel_volume_baseline_days: int = DEFAULT_REL_VOLUME_BASELINE_DAYS
+    exclude_spacs: bool = DEFAULT_EXCLUDE_SPACS
+    exclude_warrants_and_rights: bool = DEFAULT_EXCLUDE_WARRANTS_AND_RIGHTS
+    exclude_preferred: bool = DEFAULT_EXCLUDE_PREFERRED
+    require_us_primary_listing: bool = DEFAULT_REQUIRE_US_PRIMARY_LISTING
+    exclude_halted: bool = DEFAULT_EXCLUDE_HALTED
+    min_history_sessions: int = DEFAULT_MIN_HISTORY_SESSIONS
     source: str = "built-in defaults"
     deprecated_min_avg_volume: float | None = None
-    finviz: FinvizSettings = field(default_factory=lambda: FinvizSettings())
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -379,10 +452,20 @@ class Thresholds:
             "rel_volume_min": self.rel_volume_min,
             "rel_volume_anchor_eastern": REL_VOLUME_ANCHOR_LABEL,
             "rel_volume_anchor_minutes": REL_VOLUME_ANCHOR_MINUTES,
+            "rel_volume_window": self.rel_volume_window,
+            "rel_volume_baseline_days": self.rel_volume_baseline_days,
             "max_candidates": self.max_candidates,
+            "atr_days": self.atr_days,
+            "min_atr_usd": self.min_atr_usd,
+            "min_atr_pct_of_price": self.min_atr_pct_of_price,
+            "exclude_spacs": self.exclude_spacs,
+            "exclude_warrants_and_rights": self.exclude_warrants_and_rights,
+            "exclude_preferred": self.exclude_preferred,
+            "require_us_primary_listing": self.require_us_primary_listing,
+            "exclude_halted": self.exclude_halted,
+            "min_history_sessions": self.min_history_sessions,
             "source": self.source,
             "deprecated_min_avg_volume": self.deprecated_min_avg_volume,
-            "finviz_enabled": self.finviz.enabled,
         }
 
 
@@ -427,6 +510,26 @@ def load_thresholds(path: Path) -> Thresholds:
             log.warning("Ignoring bad value for %s in %s: %r", key, path, value)
             return current
 
+    def pick_flag(section: dict[str, Any], key: str, current: bool) -> bool:
+        """A yes or no switch. Written out in words, so "no" has to mean no.
+
+        YAML already turns true and false into real booleans, but somebody
+        editing the file by hand may well write "off" or "no", and bool("no") is
+        True in Python, which would silently turn a switch back on.
+        """
+        value = section.get(key)
+        if value is None:
+            return current
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "yes", "on", "1"}:
+                return True
+            if text in {"false", "no", "off", "0"}:
+                return False
+            log.warning("Ignoring bad value for %s in %s: %r", key, path, value)
+            return current
+        return bool(value)
+
     thresholds.price_floor = pick(universe, "price_floor", thresholds.price_floor, float)
     thresholds.min_avg_dollar_volume = pick(
         universe,
@@ -469,38 +572,62 @@ def load_thresholds(path: Path) -> Thresholds:
         )
         thresholds.max_candidates = 1
 
-    finviz = scanner.get("finviz") or {}
-    if isinstance(finviz, dict):
-        thresholds.finviz = FinvizSettings(
-            enabled=bool(finviz.get("enabled", False)),
-            export_url=str(finviz.get("export_url") or "").strip(),
-            auth_token_key=str(
-                finviz.get("auth_token_key") or FINVIZ_DEFAULT_TOKEN_KEY
-            ).strip(),
-            secrets_file=str(
-                finviz.get("secrets_file") or FINVIZ_SECRETS_FILE
-            ).strip(),
+    # The volatility floor (change A3). All three live under universe:.
+    thresholds.atr_days = int(
+        pick(universe, "atr_days", thresholds.atr_days, int)
+    )
+    if thresholds.atr_days < 1:
+        log.warning(
+            "An average true range over %d session(s) means nothing, using %d",
+            thresholds.atr_days,
+            DEFAULT_ATR_DAYS,
         )
+        thresholds.atr_days = DEFAULT_ATR_DAYS
+    thresholds.min_atr_usd = pick(
+        universe, "min_atr_usd", thresholds.min_atr_usd, float
+    )
+    thresholds.min_atr_pct_of_price = pick(
+        universe, "min_atr_pct_of_price", thresholds.min_atr_pct_of_price, float
+    )
+
+    # Read for the record, not used for arithmetic here. See agent/preopen.py.
+    value = scanner.get("rel_volume_window")
+    if value is not None:
+        thresholds.rel_volume_window = str(value).strip()
+    thresholds.rel_volume_baseline_days = int(
+        pick(
+            scanner,
+            "rel_volume_baseline_days",
+            thresholds.rel_volume_baseline_days,
+            int,
+        )
+    )
+
+    # The hard exclusions (change A12). All under universe:, all on by default.
+    thresholds.exclude_spacs = pick_flag(
+        universe, "exclude_spacs", thresholds.exclude_spacs)
+    thresholds.exclude_warrants_and_rights = pick_flag(
+        universe, "exclude_warrants_and_rights",
+        thresholds.exclude_warrants_and_rights)
+    thresholds.exclude_preferred = pick_flag(
+        universe, "exclude_preferred", thresholds.exclude_preferred)
+    thresholds.require_us_primary_listing = pick_flag(
+        universe, "require_us_primary_listing",
+        thresholds.require_us_primary_listing)
+    thresholds.exclude_halted = pick_flag(
+        universe, "exclude_halted", thresholds.exclude_halted)
+    thresholds.min_history_sessions = int(
+        pick(
+            universe,
+            "min_history_sessions",
+            thresholds.min_history_sessions,
+            int,
+        )
+    )
 
     thresholds.source = str(path)
     log.info("Loaded thresholds from %s", path)
     return thresholds
-
-
-def read_env_file(path: Path) -> dict[str, str]:
-    """KEY=value lines out of a .env style file. Missing file means no keys."""
-    values: dict[str, str] = {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return values
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +691,16 @@ class Candidate:
     currency: str = ""
     long_name: str = ""
     stock_type: str = ""
+    #: What industry IBKR says this name is in. The sector cap in
+    #: agent/guardrails.py counts gross exposure per industry against 25 percent
+    #: of the book, and it refuses an entry outright when nobody can say what
+    #: industry a name is in, so an empty string here means the name cannot be
+    #: traded. Always a string, never None, so the check has one thing to read.
+    sector: str = ""
+    #: IBKR's finer grain under the industry. Nothing filters on these two; they
+    #: are in the shortlist so the month end review can group trades properly.
+    category: str = ""
+    subcategory: str = ""
     flagged_by: list[str] = field(default_factory=list)
 
     #: "long" from a gainers scan, "short" from a fallers scan, and for a name
@@ -586,16 +723,32 @@ class Candidate:
     avg_dollar_volume_sessions: int | None = None
     rel_volume: float | None = None
     rel_volume_minutes_elapsed: float | None = None
+    #: How many completed daily sessions of history this name actually has. The
+    #: hard exclusions demand at least min_history_sessions of them.
+    completed_sessions: int | None = None
+    #: The average true range: how far this name travels in a normal session,
+    #: in dollars, over the last atr_days completed sessions. None means it
+    #: could not be worked out, which fails the volatility floor.
+    atr: float | None = None
+    atr_days_used: int | None = None
+    atr_pct_of_price: float | None = None
     opening_range_high: float | None = None
     opening_range_low: float | None = None
+    #: The open and close of the 9:30 to 9:35 candle itself. The sign of this
+    #: candle is what decides long or short (change A5), so it is published.
+    opening_range_open: float | None = None
+    opening_range_close: float | None = None
     score: float = 0.0
+    #: Where this name came on the shortlist, 1 being the heaviest relative
+    #: volume. Filled in once the sort has happened.
+    rank: int | None = None
     reasons: list[str] = field(default_factory=list)
 
     def contract(self) -> Stock:
         stock = Stock(self.symbol, "SMART", "USD")
-        # A name that came from Finviz rather than from a scan has no contract id
-        # yet, and setting conId to 0 would make Gateway look for contract zero
-        # instead of looking the ticker up. Leave it unset in that case.
+        # Every name now arrives from an IBKR scan, so it always has a contract
+        # id. Setting conId to 0 would make Gateway look for contract zero
+        # instead of looking the ticker up, so an empty id is left unset.
         if self.con_id:
             stock.conId = self.con_id
         if self.primary_exchange:
@@ -616,18 +769,28 @@ class Candidate:
             "gain_pct": round2(self.gain_pct),
             "opening_range_high": round2(self.opening_range_high),
             "opening_range_low": round2(self.opening_range_low),
+            "opening_range_open": round2(self.opening_range_open),
+            "opening_range_close": round2(self.opening_range_close),
             "volume_today": to_int(self.volume_today),
             "avg_volume_20d": to_int(self.avg_volume_20d),
             "avg_dollar_volume": to_int(self.avg_dollar_volume),
             "avg_dollar_volume_sessions": self.avg_dollar_volume_sessions,
+            "completed_sessions": self.completed_sessions,
+            "atr": round2(self.atr),
+            "atr_days_used": self.atr_days_used,
+            "atr_pct_of_price": round2(self.atr_pct_of_price),
             "rel_volume": round2(self.rel_volume),
             "rel_volume_minutes_elapsed": round2(self.rel_volume_minutes_elapsed),
             "flagged_by": list(self.flagged_by),
             "scan_rank": self.scan_rank,
+            "rank": self.rank,
             "reasons": list(self.reasons),
             "score": round2(self.score),
             "long_name": self.long_name,
             "stock_type": self.stock_type,
+            "sector": self.sector,
+            "category": self.category,
+            "subcategory": self.subcategory,
         }
 
 
@@ -649,35 +812,6 @@ def human_millions(value: float | None) -> str:
     return f"{value:.0f}"
 
 
-def parse_finviz_csv(body: str) -> list[str]:
-    """Tickers out of a Finviz Elite CSV export, in the order the export gave them.
-
-    Finviz calls the column "Ticker". "Symbol" is accepted too in case the export
-    template is set up differently. Anything that is not a plain ticker is
-    dropped rather than guessed at, and duplicates are removed keeping the first.
-    """
-    try:
-        reader = csv.DictReader(io.StringIO(body))
-        fieldnames = [str(name or "").strip().lower() for name in (reader.fieldnames or [])]
-        column = next((name for name in FINVIZ_TICKER_COLUMNS if name in fieldnames), None)
-        if column is None:
-            return []
-        index = fieldnames.index(column)
-        real_name = (reader.fieldnames or [])[index]
-        out: list[str] = []
-        seen: set[str] = set()
-        for row in reader:
-            symbol = str(row.get(real_name) or "").strip().upper()
-            if not symbol or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", symbol):
-                continue
-            if symbol not in seen:
-                seen.add(symbol)
-                out.append(symbol)
-        return out
-    except (csv.Error, UnicodeDecodeError):
-        return []
-
-
 def human_dollars(value: float | None) -> str:
     """A dollar figure a person can read, so 20000000.0 reads as 20.0 million dollars."""
     if value is None:
@@ -689,6 +823,143 @@ def human_dollars(value: float | None) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.0f} thousand dollars"
     return f"{value:.0f} dollars"
+
+
+# ---------------------------------------------------------------------------
+# The hard exclusions (change A12)
+# ---------------------------------------------------------------------------
+#
+# Each of these takes the three things IBKR's contract details actually give us
+# and answers one question: is this the kind of listing we refuse to trade? A
+# sentence comes back saying why, or None meaning it is fine. Separate functions
+# on purpose, so each one can be read and tested on its own.
+
+
+def spac_reason(symbol: str, long_name: str, stock_type: str) -> str | None:
+    """Is this a blank cheque company, a SPAC?
+
+    A SPAC is a shell that has raised money to buy some business it has not
+    named yet. Its price moves on rumours about a deal, not on trading momentum,
+    and it is one of the traps the red team ranked as a top source of loss.
+    Nearly all of them are named "<Something> Acquisition Corp".
+
+    SPAC is matched as a whole word so that SPACE and SPACEX are left alone.
+    """
+    name = (long_name or "").upper()
+    if not name:
+        return None
+    for phrase in SPAC_NAME_PHRASES:
+        if phrase in name:
+            return f'looks like a SPAC, its name contains "{phrase.title()}"'
+    if SPAC_WORD.search(name):
+        return 'looks like a SPAC, its name contains the word "SPAC"'
+    return None
+
+
+def warrant_reason(symbol: str, long_name: str, stock_type: str) -> str | None:
+    """Is this a warrant rather than the share itself?
+
+    Three separate signals, any one of which is enough: IBKR's own stock type,
+    the word warrant in the full name, and the ticker shape.
+
+    The ticker shape needs care. BRK.WS and ABC+ are unmistakable because of the
+    separator. A bare trailing W is not: it only means a warrant in the NASDAQ
+    convention of a fifth letter bolted onto a four letter root, so it is only
+    read that way on a five character ticker. Reading a trailing W on any ticker
+    would throw out Lowe's (LOW), Dow (DOW) and Corning (GLW) every morning,
+    which is exactly the mistake the rights rule below warns about.
+    """
+    if (stock_type or "").strip().upper() in WARRANT_STOCK_TYPES:
+        return "IBKR calls it a warrant"
+    name = (long_name or "").upper()
+    for phrase in WARRANT_NAME_PHRASES:
+        if phrase in name:
+            return "the name says it is a warrant, not the share"
+    ticker = (symbol or "").strip().upper()
+    for suffix in WARRANT_SUFFIXES_WITH_SEPARATOR:
+        if ticker.endswith(suffix) and len(ticker) > len(suffix):
+            return f'the ticker ends in "{suffix}", which is a warrant line'
+    for suffix, exact_length in WARRANT_BARE_SUFFIX_LENGTHS.items():
+        if len(ticker) == exact_length and ticker.endswith(suffix):
+            return (
+                f'the ticker is {exact_length} characters ending in "{suffix}", '
+                "which is how NASDAQ writes a warrant"
+            )
+    return None
+
+
+def right_reason(symbol: str, long_name: str, stock_type: str) -> str | None:
+    """Is this a rights line rather than the share itself?
+
+    A right is a short lived entitlement handed to existing holders. It trades
+    separately and thinly, like a warrant.
+
+    The ticker suffix alone is NOT enough here and never will be. Plenty of
+    ordinary companies have tickers ending in R, so dropping on the letter alone
+    would throw out real businesses. The full name has to say "right" as well,
+    and only then is the name dropped.
+    """
+    name = (long_name or "").upper()
+    says_right = " RIGHT" in name or name.startswith("RIGHT")
+    if not says_right:
+        return None
+    ticker = (symbol or "").strip().upper()
+    for suffix in RIGHT_SUFFIXES:
+        if ticker.endswith(suffix) and len(ticker) > len(suffix):
+            return (
+                f'the name says rights and the ticker ends in "{suffix}", so this '
+                "is the rights line, not the share"
+            )
+    return None
+
+
+def preferred_reason(symbol: str, long_name: str, stock_type: str) -> str | None:
+    """Is this a preferred share?
+
+    Preferred shares pay a fixed dividend and behave far more like bonds than
+    like the ordinary stock. They do not gap and run, so they are not what this
+    strategy is looking for.
+
+    The ticker test wants a separator in front of the PR, as in BAC.PRK or
+    BAC-PRB. Looking for a plain PR anywhere in a ticker would catch PRU,
+    Prudential, which is an ordinary company.
+    """
+    if (stock_type or "").strip().upper() in PREFERRED_STOCK_TYPES:
+        return "IBKR calls it a preferred share"
+    name = (long_name or "").upper()
+    for phrase in PREFERRED_NAME_PHRASES:
+        if phrase in name:
+            return "the name says it is a preferred share"
+    if PREFERRED_TICKER_PATTERN.search((symbol or "").strip().upper()):
+        return "the ticker is a preferred line, not the ordinary share"
+    return None
+
+
+def halt_flag_from_details(detail: Any) -> bool | None:
+    """What IBKR's contract details say about a trading halt.
+
+    Which on this account today is nothing at all. Contract details carry no
+    halt field, so this looks for one on the detail and on the contract inside
+    it and returns None when there is none to find. None means "not known", not
+    "not halted", and the run says so in its warnings rather than pretending it
+    checked. The halt check that really runs is on the order path, in
+    /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py
+    under rule id `halted`, which reads IBKR's tick type 49.
+    """
+    for holder in (detail, getattr(detail, "contract", None)):
+        if holder is None:
+            continue
+        value = getattr(holder, "halted", None)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return value
+        try:
+            # Tick type 49 is a number: 0 is trading, 1 and 2 are halted.
+            return float(value) > 0
+        except (TypeError, ValueError):
+            return bool(value)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +1054,112 @@ def average_dollar_volume(
     return sum(recent) / len(recent), len(recent)
 
 
+def true_range(bar: Any, previous_close: float | None) -> float | None:
+    """How far one session actually travelled, in dollars.
+
+    Not simply high minus low, because that misses the gap. A stock that closed
+    at 20 and opened at 24 and then traded between 24 and 25 only has a one
+    dollar high-to-low range, but anyone holding it overnight lived through a
+    five dollar move. So the true range is the largest of three numbers:
+
+        high minus low
+        the distance from the high to yesterday's close
+        the distance from the low to yesterday's close
+
+    None comes back when the bar has no usable high or low, or when there is no
+    previous close to measure the gap against.
+    """
+    high = getattr(bar, "high", None)
+    low = getattr(bar, "low", None)
+    if high is None or low is None or previous_close is None:
+        return None
+    try:
+        high = float(high)
+        low = float(low)
+        previous_close = float(previous_close)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(high) and math.isfinite(low)
+            and math.isfinite(previous_close)):
+        return None
+    if high <= 0 or low <= 0 or previous_close <= 0 or high < low:
+        return None
+    return max(
+        high - low,
+        abs(high - previous_close),
+        abs(low - previous_close),
+    )
+
+
+def average_true_range(
+    bars: list[Any], days: int = DEFAULT_ATR_DAYS
+) -> tuple[float | None, int]:
+    """The average true range: how far this name moves in a normal session.
+
+    Hand in completed daily bars, oldest first, with today's part-formed bar
+    already taken out. The answer is the plain mean of the true ranges of the
+    last `days` sessions, in dollars, and how many sessions that mean used.
+
+    The very first bar in the list can only ever be a previous close for the
+    second one, because a true range needs the session before it to measure the
+    gap against. So a run of 15 bars yields 14 true ranges.
+
+    Fewer than `days` usable true ranges gets None back along with however many
+    there were. None fails the volatility floor, which is the safe answer: a
+    name we cannot measure is a name we should not trade.
+    """
+    if days < 1:
+        raise ValueError(
+            f"average_true_range was asked for {days} days, and it needs at least one."
+        )
+    ranges: list[float] = []
+    previous_close: float | None = None
+    for bar in bars:
+        value = true_range(bar, previous_close)
+        if value is not None:
+            ranges.append(value)
+        close = getattr(bar, "close", None)
+        try:
+            close = float(close) if close is not None else None
+        except (TypeError, ValueError):
+            close = None
+        if close is not None and math.isfinite(close) and close > 0:
+            previous_close = close
+    recent = ranges[-days:]
+    if len(recent) < days:
+        return None, len(recent)
+    return sum(recent) / len(recent), len(recent)
+
+
+def direction_from_candle(
+    open_price: float | None, close_price: float | None
+) -> str | None:
+    """Which way the 9:30 to 9:35 candle points, which is the entry rule (A5).
+
+    The published strategy takes its side from the sign of that first five
+    minute candle and nothing else: closed above where it opened, go long;
+    closed below, go short; opened and closed at exactly the same price, do not
+    trade it at all. A flat candle is a genuine no, not a shrug, so None here
+    means the name is dropped rather than guessed at.
+
+    None also comes back when either price is missing, for the same reason.
+    """
+    if open_price is None or close_price is None:
+        return None
+    try:
+        open_price = float(open_price)
+        close_price = float(close_price)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(open_price) and math.isfinite(close_price)):
+        return None
+    if close_price > open_price:
+        return DIRECTION_LONG
+    if close_price < open_price:
+        return DIRECTION_SHORT
+    return None
+
+
 def expected_volume_by(
     avg_daily_volume: float | None,
     minutes_elapsed: float,
@@ -852,12 +1229,10 @@ class OpeningMomentumScanner:
         self.skipped_for_budget = 0
         self.scan_diagnostics: dict[str, dict[str, Any]] = {}
         self.scanner_requests = 0
-        self.finviz_report: dict[str, Any] = {
-            "enabled": thresholds.finviz.enabled,
-            "symbols_added": 0,
-            "symbols": [],
-            "note": "",
-        }
+        #: What IBKR's contract details said about a halt, per symbol, when they
+        #: said anything at all. Empty means nothing was on offer, which is the
+        #: normal state on this account and is reported in the warnings.
+        self.halt_flags: dict[str, bool] = {}
 
     # -- plumbing ----------------------------------------------------------
 
@@ -982,8 +1357,8 @@ class OpeningMomentumScanner:
         four, and anything more than one scan flagged floats to the front,
         because two scans agreeing is a stronger signal than one.
 
-        Keyed on the ticker, not the contract id, so a name that arrives from
-        Finviz without a contract id still merges with the same name from a scan.
+        Keyed on the ticker purely so that the same name showing up on two of
+        the four scans merges into one entry instead of two.
         """
         results = await self.run_all_scans()
 
@@ -1017,8 +1392,6 @@ class OpeningMomentumScanner:
                 ranked.append(symbol)
             per_scan.append(ranked)
 
-        self.add_finviz_symbols(by_symbol, per_scan)
-
         # Names more than one source flagged go first, in their best rank order,
         # then take turns down the lists.
         many = sorted(
@@ -1034,84 +1407,6 @@ class OpeningMomentumScanner:
                     seen.add(ranked[position])
                     order.append(ranked[position])
         return [by_symbol[symbol] for symbol in order]
-
-    # -- step 1b: the optional Finviz cross-check --------------------------
-
-    def add_finviz_symbols(self, by_symbol: dict[str, Candidate],
-                           per_scan: list[list[str]]) -> None:
-        """Fold the Finviz Elite export into the union, when it is switched on.
-
-        Off by default, because Mo has not bought Finviz Elite. Off means one
-        line in the log and nothing else: no network call, no signup, no keys
-        read. On means fetching the CSV export, taking the ticker column, and
-        adding those names to the union tagged "finviz" so it is always clear in
-        the output which names IBKR found and which Finviz did.
-        """
-        settings = self.thresholds.finviz
-        if not settings.enabled:
-            log.info(
-                "Finviz cross-check is off (scanner.finviz.enabled is false in %s), "
-                "so nothing was fetched", self.thresholds.source)
-            self.finviz_report["note"] = (
-                "off in scanner.finviz.enabled, nothing was fetched")
-            return
-
-        symbols, note = self.fetch_finviz_symbols(settings)
-        self.finviz_report["note"] = note
-        if not symbols:
-            if "could not" in note or "no " in note:
-                self.note(f"Finviz cross-check: {note}")
-            return
-
-        ranked: list[str] = []
-        added = 0
-        for symbol in symbols:
-            candidate = by_symbol.get(symbol)
-            if candidate is None:
-                candidate = Candidate(symbol=symbol, con_id=0)
-                by_symbol[symbol] = candidate
-                added += 1
-            if FINVIZ_FLAG not in candidate.flagged_by:
-                candidate.flagged_by.append(FINVIZ_FLAG)
-            ranked.append(symbol)
-        per_scan.append(ranked)
-        self.finviz_report["symbols_added"] = added
-        self.finviz_report["symbols"] = list(symbols)
-        log.info(
-            "Finviz cross-check returned %d symbol(s), %d of them new to the union",
-            len(symbols), added)
-
-    def fetch_finviz_symbols(self, settings: FinvizSettings) -> tuple[list[str], str]:
-        """Download the Finviz export and read the ticker column out of it.
-
-        Returns the tickers and one sentence about what happened, which goes into
-        the output either way. Never raises: a cross-check that cannot be reached
-        must not take down a scan that worked.
-        """
-        url = settings.export_url
-        if not url:
-            return [], ("scanner.finviz.enabled is true but no export_url is set, "
-                        "so there was nothing to fetch")
-        if "auth=" not in url:
-            token = read_env_file(SECRETS_DIR / settings.secrets_file).get(
-                settings.auth_token_key, "")
-            if not token:
-                return [], (
-                    f"no {settings.auth_token_key} in "
-                    f"{SECRETS_DIR / settings.secrets_file} and no auth token in the "
-                    "export_url, so Finviz would refuse the request")
-            url = f"{url}{'&' if '?' in url else '?'}auth={token}"
-        try:
-            with urllib.request.urlopen(url, timeout=FINVIZ_TIMEOUT_S) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            # The URL carries the token, so the URL never goes into a message.
-            return [], f"could not reach the Finviz export ({type(exc).__name__})"
-
-        symbols = parse_finviz_csv(body)
-        if not symbols:
-            return [], "the Finviz export came back with no ticker column in it"
-        return symbols[:FINVIZ_MAX_SYMBOLS], f"read {len(symbols)} tickers from Finviz"
 
     # -- step 2: how far into the day is the data? ------------------------
 
@@ -1215,7 +1510,7 @@ class OpeningMomentumScanner:
         return list(bars)
 
     async def load_daily_stats(self, candidate: Candidate) -> None:
-        """Fill in price, gain, today's volume and the two averages.
+        """Fill in price, gain, today's volume, the two averages and the ATR.
 
         Two averages, because they answer two different questions. The dollar
         volume average over 30 sessions says whether the name is liquid enough
@@ -1223,6 +1518,10 @@ class OpeningMomentumScanner:
         share volume average over 20 sessions is the bottom half of the relative
         volume ratio, which is shares against shares and so has to stay in
         shares.
+
+        The average true range comes off the same bars, so it costs no extra
+        data request. It says how far this name travels in a normal session,
+        which is the volatility floor of change A3.
         """
         bars = await self.fetch_bars(
             candidate.contract(),
@@ -1250,6 +1549,8 @@ class OpeningMomentumScanner:
             candidate.last = float(completed[-1].close)
             candidate.volume_today = 0.0
 
+        candidate.completed_sessions = len(completed)
+
         if completed:
             candidate.prev_close = float(completed[-1].close)
 
@@ -1275,10 +1576,31 @@ class OpeningMomentumScanner:
                 candidate.avg_volume_20d = sum(volumes) / len(volumes)
                 candidate.avg_volume_days = len(recent)
 
+            # The volatility floor: how far the name moves in a normal session.
+            candidate.atr, candidate.atr_days_used = average_true_range(
+                completed, self.thresholds.atr_days
+            )
+            if candidate.atr is None:
+                # Not enough sessions to measure the range. Leaving this empty
+                # makes the name fail the volatility floor, which is the safe
+                # answer: a name we cannot measure is one we should not trade.
+                log.debug(
+                    "%s has only %d usable session range(s), too few for an ATR",
+                    candidate.symbol,
+                    candidate.atr_days_used or 0,
+                )
+
         if candidate.last is not None and candidate.prev_close:
             candidate.gain_pct = (
                 (candidate.last - candidate.prev_close) / candidate.prev_close * 100.0
             )
+
+        # The same range said as a share of the price, which is the second half
+        # of the volatility floor. Measured against the current price where
+        # there is one, and yesterday's close otherwise.
+        price = candidate.last or candidate.prev_close
+        if candidate.atr is not None and price:
+            candidate.atr_pct_of_price = candidate.atr / float(price) * 100.0
 
         elapsed = self.session_minutes_elapsed or float(SESSION_MINUTES)
         candidate.rel_volume_minutes_elapsed = elapsed
@@ -1298,14 +1620,34 @@ class OpeningMomentumScanner:
         detail = details[0]
         candidate.long_name = (detail.longName or "").strip()
         candidate.stock_type = (getattr(detail, "stockType", "") or "").strip()
+        # What industry this name is in, for the sector cap in
+        # agent/guardrails.py. IBKR names the same idea three ways and does not
+        # always fill all three in, so take the first one that actually says
+        # something: industry, then category, then subcategory. getattr with a
+        # default because the pinned ib_async may not carry all three fields.
+        candidate.category = str(getattr(detail, "category", "") or "").strip()
+        candidate.subcategory = str(getattr(detail, "subcategory", "") or "").strip()
+        industry = str(getattr(detail, "industry", "") or "").strip()
+        candidate.sector = industry or candidate.category or candidate.subcategory
         candidate.primary_exchange = (
             detail.contract.primaryExchange or candidate.primary_exchange or ""
         )
         candidate.currency = detail.contract.currency or candidate.currency
         candidate.exchange = detail.contract.exchange or candidate.exchange
+        # Contract details carry no halt field on this account, so this almost
+        # always finds nothing and the run says so in its warnings. Nothing here
+        # invents an answer: no field means not known, not "not halted".
+        halted = halt_flag_from_details(detail)
+        if halted is not None:
+            self.halt_flags[candidate.symbol] = halted
 
     async def load_opening_range(self, candidate: Candidate) -> None:
-        """Get the high and low of the first five minutes of trading."""
+        """Get the first five minutes of trading: high, low, open and close.
+
+        The high and low are the entry trigger and one of the two candidates for
+        the stop. The open and the close are what decides long or short under
+        change A5, so they are recorded on the candidate and published.
+        """
         bars = await self.fetch_bars(
             candidate.contract(),
             duration="1 D",
@@ -1332,16 +1674,28 @@ class OpeningMomentumScanner:
         todays_bars.sort(key=lambda pair: pair[0])
         for moment, bar in todays_bars:
             if moment.hour == OPEN_HOUR and moment.minute == OPEN_MINUTE:
-                candidate.opening_range_high = float(bar.high)
-                candidate.opening_range_low = float(bar.low)
+                self.record_opening_bar(candidate, bar)
                 return
         moment, bar = todays_bars[0]
-        candidate.opening_range_high = float(bar.high)
-        candidate.opening_range_low = float(bar.low)
+        self.record_opening_bar(candidate, bar)
         log.warning(
             "%s had no 9:30 bar, used today's first bar at %s instead",
             candidate.symbol,
             moment.strftime("%H:%M"),
+        )
+
+    @staticmethod
+    def record_opening_bar(candidate: Candidate, bar: Any) -> None:
+        """Copy one five minute bar onto the candidate, all four prices."""
+        candidate.opening_range_high = float(bar.high)
+        candidate.opening_range_low = float(bar.low)
+        open_price = getattr(bar, "open", None)
+        close_price = getattr(bar, "close", None)
+        candidate.opening_range_open = (
+            None if open_price is None else float(open_price)
+        )
+        candidate.opening_range_close = (
+            None if close_price is None else float(close_price)
         )
 
     # -- step 4: filters ---------------------------------------------------
@@ -1358,6 +1712,39 @@ class OpeningMomentumScanner:
         for pattern, label in COMPILED_NAME_PATTERNS:
             if pattern.search(name):
                 return f'fund name contains "{label}"'
+        return None
+
+    def exclusion_verdict(self, candidate: Candidate) -> str | None:
+        """The first reason to refuse this name outright, or None to keep it.
+
+        Change A12, approved by Mo on 2026-09-06. These are structural refusals,
+        made before the model ever sees the name: a SPAC, a warrant, a rights
+        line or a preferred share is simply not the thing this strategy trades,
+        whatever its price did this morning. Each switch can be turned off in
+        config/guardrails.yaml, and all of them ship on.
+
+        The leveraged and inverse fund test is separate and older, and it stays
+        where it is in leverage_verdict.
+        """
+        symbol = candidate.symbol
+        name = candidate.long_name
+        stock_type = candidate.stock_type
+
+        checks = []
+        if self.thresholds.exclude_spacs:
+            checks.append(spac_reason)
+        if self.thresholds.exclude_warrants_and_rights:
+            checks.append(warrant_reason)
+            checks.append(right_reason)
+        if self.thresholds.exclude_preferred:
+            checks.append(preferred_reason)
+        for check in checks:
+            reason = check(symbol, name, stock_type)
+            if reason:
+                return reason
+
+        if self.thresholds.exclude_halted and self.halt_flags.get(symbol):
+            return "IBKR reported it as halted"
         return None
 
     def build_reasons(self, candidate: Candidate) -> list[str]:
@@ -1395,6 +1782,18 @@ class OpeningMomentumScanner:
                 f"against a floor of "
                 f"{human_dollars(self.thresholds.min_avg_dollar_volume)}"
             )
+        if candidate.atr is not None:
+            line = (
+                f"Moves about {candidate.atr:.2f} dollars in a normal session, "
+                f"averaged over {candidate.atr_days_used} sessions"
+            )
+            if candidate.atr_pct_of_price is not None:
+                line += (
+                    f", which is {candidate.atr_pct_of_price:.1f} percent of its "
+                    f"price, against floors of {self.thresholds.min_atr_usd:.2f} "
+                    f"dollars and {self.thresholds.min_atr_pct_of_price:.1f} percent"
+                )
+            reasons.append(line)
         if candidate.opening_range_high is not None and candidate.opening_range_low is not None:
             if candidate.direction == DIRECTION_SHORT:
                 reasons.append(
@@ -1411,6 +1810,11 @@ class OpeningMomentumScanner:
                 )
         if candidate.stock_type:
             reasons.append(f"Listed on {candidate.primary_exchange or 'a US venue'} as {candidate.stock_type.lower()}")
+        if candidate.sector:
+            reasons.append(
+                f"IBKR puts it in the {candidate.sector} industry, which is what "
+                "the sector cap counts against"
+            )
         return reasons
 
     def resolve_direction(self, candidate: Candidate) -> str | None:
@@ -1434,19 +1838,23 @@ class OpeningMomentumScanner:
         return None
 
     def compute_score(self, candidate: Candidate) -> float:
-        """The size of the move multiplied by the log of relative volume.
+        """The score is now simply the name's relative volume (change A4).
 
-        A big move on normal volume is suspicious, and heavy volume with no move
-        is not a momentum trade. Multiplying the two rewards names that have both.
+        It used to be the size of the day's move multiplied by the log of
+        relative volume. That was our own invention. The published result this
+        strategy is copying came from ranking candidates by relative volume
+        alone and taking the top few, and it was the ranking that carried the
+        result, not the size of the gap. So the size of the move no longer
+        decides who goes first.
 
-        The size of the move, not the signed move, because a stock down 9 percent
-        on five times its normal volume is as good a short as the mirror image is
-        a long. Ranking on the signed number would sort every short to the bottom
-        of the shortlist and the cap would then throw them all away.
+        The 2 times normal floor has not gone anywhere. It still runs earlier,
+        as a filter: a name below twice its normal pace never reaches this
+        ranking at all. What changed is only the order of the survivors.
+
+        The method keeps its old name so that the rest of this file, and the
+        "score" field in the shortlist that other tools read, carry on working.
         """
-        move = abs(candidate.gain_pct or 0.0)
-        rel = max(candidate.rel_volume or 1.0, 1.0001)
-        return move * math.log(rel)
+        return float(candidate.rel_volume or 0.0)
 
     # -- the whole run -----------------------------------------------------
 
@@ -1482,11 +1890,13 @@ class OpeningMomentumScanner:
         self.counts["capped_for_enrichment"] = len(candidates)
 
         if not candidates:
-            for stage in ("daily_bars_ok", "passed_price_floor",
-                          "passed_dollar_volume", "passed_rel_volume",
-                          "passed_direction_agrees", "passed_us_listing",
-                          "passed_leverage_name_filter", "opening_range_ok",
-                          "final", "final_long", "final_short"):
+            for stage in ("daily_bars_ok", "passed_history", "passed_price_floor",
+                          "passed_dollar_volume", "passed_volatility",
+                          "passed_rel_volume", "passed_direction_agrees",
+                          "passed_us_listing", "passed_leverage_name_filter",
+                          "passed_hard_exclusions", "opening_range_ok",
+                          "passed_direction_candle", "final", "final_long",
+                          "final_short"):
                 self.counts[stage] = 0
             return self.build_output([])
 
@@ -1504,12 +1914,25 @@ class OpeningMomentumScanner:
                 f"No daily bars for {len(missing)} name(s), skipped: {', '.join(missing[:12])}"
             )
 
+        # Enough history to be measured at all. This is what Mo put in place of
+        # the 90 day listing age rule he rejected: rather than asking how old a
+        # listing is, ask whether it has traded long enough for its own numbers
+        # to mean anything. 30 completed sessions is what the dollar volume
+        # average wants, and the 14 the average true range wants sit inside it.
+        enough_history = [
+            c
+            for c in with_data
+            if (c.completed_sessions or 0) >= self.thresholds.min_history_sessions
+        ]
+        self.counts["passed_history"] = len(enough_history)
+        survivors = enough_history
+
         # The price floor. At or above 5 dollars, not strictly above it, which is
         # what "price floor: 5" in docs/STRATEGY.md means. Applied here rather
         # than sent to Gateway as abovePrice, because a filter Gateway can
         # disable without telling us is not a filter.
         survivors = [
-            c for c in with_data if (c.last or 0.0) >= self.thresholds.price_floor
+            c for c in survivors if (c.last or 0.0) >= self.thresholds.price_floor
         ]
         self.counts["passed_price_floor"] = len(survivors)
 
@@ -1522,6 +1945,21 @@ class OpeningMomentumScanner:
             if (c.avg_dollar_volume or 0.0) >= self.thresholds.min_avg_dollar_volume
         ]
         self.counts["passed_dollar_volume"] = len(survivors)
+
+        # The volatility floor (change A3). Both halves have to clear: at least
+        # 50 cents of average daily range AND at least 1.5 percent of the price.
+        # A name whose ATR could not be worked out has no measurable range, so
+        # it fails here, which is the safe answer. Without this filter the
+        # shortlist fills with quiet large caps whose whole five minute range is
+        # noise, and a breakout on noise is not a trade.
+        survivors = [
+            c
+            for c in survivors
+            if c.atr is not None
+            and c.atr >= self.thresholds.min_atr_usd
+            and (c.atr_pct_of_price or 0.0) >= self.thresholds.min_atr_pct_of_price
+        ]
+        self.counts["passed_volatility"] = len(survivors)
 
         # At or above 2 times normal, measured at the 09:35 anchor.
         survivors = [
@@ -1572,21 +2010,54 @@ class OpeningMomentumScanner:
                 f"without being checked: {', '.join(unknown[:12])}"
             )
 
-        us_listed = []
-        for candidate in survivors:
-            if candidate.currency and candidate.currency.upper() != "USD":
-                log.debug(
-                    "Dropped %s, priced in %s not USD", candidate.symbol, candidate.currency
-                )
-                continue
-            venue = (candidate.primary_exchange or "").upper()
-            if venue and venue not in ALLOWED_PRIMARY_EXCHANGES:
-                log.debug("Dropped %s, primary exchange %s", candidate.symbol, venue)
-                continue
-            if not venue:
-                log.debug("Dropped %s, no primary exchange reported", candidate.symbol)
-                continue
-            us_listed.append(candidate)
+        if survivors and self.thresholds.exclude_halted and not self.halt_flags:
+            # Part of change A12. IBKR's contract details carry no halt flag on
+            # this account, so this check cannot be made here and the run says
+            # so out loud rather than implying it looked and found nothing.
+            self.note(
+                "The halt check could not be made from contract details, because "
+                "IBKR does not put a halt flag on them for this account. The live "
+                "halt check is the one on the order path in "
+                "/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/"
+                "guardrails.py, rule id `halted`, which reads IBKR's tick type 49."
+            )
+
+        # The US listing test, gated by universe.require_us_primary_listing.
+        # This is the rule that keeps OTC lines and foreign listings out: a name
+        # priced in anything but dollars, or whose home venue is not one of the
+        # US exchanges, is not a US primary listing and is not traded here.
+        if self.thresholds.require_us_primary_listing:
+            us_listed = []
+            for candidate in survivors:
+                if candidate.currency and candidate.currency.upper() != "USD":
+                    log.debug(
+                        "Dropped %s, priced in %s not USD, so it is not a US primary "
+                        "listing. This is the test that keeps OTC and non-US lines out",
+                        candidate.symbol, candidate.currency,
+                    )
+                    continue
+                venue = (candidate.primary_exchange or "").upper()
+                if venue and venue not in ALLOWED_PRIMARY_EXCHANGES:
+                    log.debug(
+                        "Dropped %s, its home venue is %s, which is not a US primary "
+                        "listing. This is the test that keeps OTC and non-US lines out",
+                        candidate.symbol, venue,
+                    )
+                    continue
+                if not venue:
+                    log.debug(
+                        "Dropped %s, no home venue reported, so it cannot be shown to "
+                        "be a US primary listing. This is the test that keeps OTC and "
+                        "non-US lines out",
+                        candidate.symbol,
+                    )
+                    continue
+                us_listed.append(candidate)
+        else:
+            log.info(
+                "universe.require_us_primary_listing is off, so OTC and non-US "
+                "lines are NOT being kept out")
+            us_listed = list(survivors)
         self.counts["passed_us_listing"] = len(us_listed)
 
         clean = []
@@ -1598,8 +2069,21 @@ class OpeningMomentumScanner:
             clean.append(candidate)
         self.counts["passed_leverage_name_filter"] = len(clean)
 
-        # Rank first, then only fetch opening ranges for the names that will
-        # actually make the shortlist. Saves scarce historical-data requests.
+        # The rest of the hard exclusions (change A12): SPACs, warrants, rights,
+        # preferred shares and anything IBKR said was halted.
+        allowed = []
+        for candidate in clean:
+            verdict = self.exclusion_verdict(candidate)
+            if verdict:
+                log.debug("Dropped %s, %s", candidate.symbol, verdict)
+                continue
+            allowed.append(candidate)
+        clean = allowed
+        self.counts["passed_hard_exclusions"] = len(clean)
+
+        # Rank by relative volume, heaviest first (change A4), then only fetch
+        # opening ranges for the names that will actually make the shortlist.
+        # Fetching last saves scarce historical-data requests.
         for candidate in clean:
             candidate.score = self.compute_score(candidate)
         clean.sort(key=lambda c: c.score, reverse=True)
@@ -1618,6 +2102,58 @@ class OpeningMomentumScanner:
             self.note(
                 f"No opening range for {len(no_range)} shortlisted name(s), so "
                 f"they have no entry trigger: {', '.join(no_range)}"
+            )
+
+        # Direction from the opening candle (change A5), which can only happen
+        # now, once the opening ranges are actually in. The sign of the 9:30 to
+        # 9:35 candle is the published rule and it overrules the scan list and
+        # the day's move for any name whose candle we know. A candle that opened
+        # and closed at exactly the same price is a no trade, so that name comes
+        # off the list rather than falling back to a weaker answer. A name with
+        # no candle yet keeps the direction the earlier cheap check gave it.
+        decided = []
+        flat = []
+        for candidate in shortlist:
+            from_candle = direction_from_candle(
+                candidate.opening_range_open, candidate.opening_range_close
+            )
+            if from_candle is not None:
+                candidate.direction = from_candle
+                decided.append(candidate)
+                continue
+            known_candle = (
+                candidate.opening_range_open is not None
+                and candidate.opening_range_close is not None
+            )
+            if known_candle:
+                flat.append(candidate.symbol)
+                continue
+            decided.append(candidate)
+        shortlist = decided
+        self.counts["passed_direction_candle"] = len(shortlist)
+        if flat:
+            self.note(
+                f"Dropped {len(flat)} name(s) whose 9:30 to 9:35 candle opened and "
+                f"closed at the same price, which is a no trade under the strategy "
+                f"rule: {', '.join(sorted(flat))}"
+            )
+
+        # Numbered after the flat candle drop so the published list reads 1, 2,
+        # 3 with no holes in it. The order is still relative volume, heaviest
+        # first, because the sort above happened first and nothing reorders it.
+        for position, candidate in enumerate(shortlist, start=1):
+            candidate.rank = position
+
+        # A name whose industry IBKR would not name cannot be entered at all:
+        # the sector cap in agent/guardrails.py refuses an order it cannot file
+        # under an industry. So say which names those are rather than letting
+        # them sit on the shortlist looking tradeable.
+        no_sector = sorted(c.symbol for c in shortlist if not c.sector)
+        if no_sector:
+            self.note(
+                f"No industry from IBKR for {len(no_sector)} shortlisted name(s), so "
+                f"the sector cap in agent/guardrails.py will refuse an entry in them: "
+                f"{', '.join(no_sector)}"
             )
 
         for candidate in shortlist:
@@ -1668,7 +2204,6 @@ class OpeningMomentumScanner:
             "control_scan_code": CONTROL_SCAN_CODE,
             "scan_filters_sent": [],
             "scan_diagnostics": dict(self.scan_diagnostics),
-            "finviz": {**self.thresholds.finviz.as_dict(), **self.finviz_report},
             "thresholds": self.thresholds.as_dict(),
             "counts": dict(self.counts),
             "scanner_requests_used": self.scanner_requests,
@@ -1782,11 +2317,17 @@ async def main_async(args: argparse.Namespace) -> int:
     thresholds = load_thresholds(Path(args.config))
     log.info(
         "Thresholds: price at or above %.2f, average daily dollar volume of %s or more "
-        "over %d sessions, relative volume at or above %.2f measured at the %s anchor, "
-        "at most %d names (%s)",
+        "over %d sessions, %d day average true range of at least %.2f dollars and "
+        "%.1f percent of price, at least %d completed sessions of history, relative "
+        "volume at or above %.2f measured at the %s anchor, top %d by relative "
+        "volume (%s)",
         thresholds.price_floor,
         human_dollars(thresholds.min_avg_dollar_volume),
         thresholds.dollar_volume_sessions,
+        thresholds.atr_days,
+        thresholds.min_atr_usd,
+        thresholds.min_atr_pct_of_price,
+        thresholds.min_history_sessions,
         thresholds.rel_volume_min,
         REL_VOLUME_ANCHOR_LABEL,
         thresholds.max_candidates,

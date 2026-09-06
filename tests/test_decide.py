@@ -106,7 +106,10 @@ def packet(candidates=None, positions=None) -> dict:
         "account": {"equity": 100000, "day_start_equity": 100000, "cash": 100000},
         "candidates": candidates if candidates is not None else [
             {"symbol": "AAPL", "opening_range_high": 101.0, "opening_range_low": 99.0,
-             "score": 9.0, "last_close": 100.0, "gain_pct": 4.0}],
+             "opening_range_open": 99.5, "opening_range_close": 100.5,
+             "atr": 2.0, "atr_pct_of_price": 2.0, "rank": 1, "rel_volume": 4.0,
+             "sector": "Technology",
+             "score": 4.0, "last_close": 100.0, "gain_pct": 4.0}],
         "positions": positions or [],
     }
 
@@ -116,8 +119,14 @@ def reply(picks=None, skips=None, no_action=False) -> str:
                        "skips": skips or []})
 
 
-def one_pick(symbol="AAPL", side="long", entry=100.0, stop=98.5, target=103.0,
-             qty_hint=100, confidence=0.7, rationale="clean break on volume") -> dict:
+def one_pick(symbol="AAPL", side="long", entry=100.0, stop=99.8, target=None,
+             qty_hint=None, confidence=0.7, rationale="clean break on volume") -> dict:
+    """One pick in the Momentum v2 shape.
+
+    The stop defaults to 99.80, which is 10 percent of a 2 dollar average true
+    range below a 100 dollar entry, and both target and qty_hint default to null:
+    item A2 took the target away and item A6 moved sizing into the code.
+    """
     return {"symbol": symbol, "side": side, "entry": entry, "stop": stop,
             "target": target, "qty_hint": qty_hint, "confidence": confidence,
             "rationale": rationale}
@@ -163,7 +172,7 @@ def test_a_rejected_reply_writes_a_decision_rejected_row_and_no_rules_picks(stub
     stub(text="sorry, I cannot help with that")
     result = decide()
 
-    rules = decide_mod.rules_only_decision(packet(), {"max_picks": 5}, "pick", "A")
+    rules = decide_mod.rules_only_decision(packet(), {"max_picks": 10}, "pick", "A")
     assert rules.picks, "the fixture has to be one the rules would have picked"
     assert result.picks == []
 
@@ -295,8 +304,8 @@ def test_an_instruction_in_a_rationale_changes_no_order(stub, nasty):
 
     assert len(result.picks) == 1
     assert result.picks[0]["rationale"] == nasty
-    assert result.picks[0]["stop"] == 98.5
-    assert result.picks[0]["qty_hint"] == 100
+    assert result.picks[0]["stop"] == 99.8
+    assert result.picks[0]["qty_hint"] is None
 
 
 def test_an_injected_key_in_the_reply_is_not_carried_through(stub):
@@ -324,47 +333,65 @@ def test_the_packet_never_carries_an_order_field_into_the_message():
 
 
 # ---------------------------------------------------------------------------
-# 5. Six picks are trimmed to five
+# 5. Eleven picks are trimmed to ten (item D1 raised the ceiling from five)
 # ---------------------------------------------------------------------------
 
+#: The momentum ceiling since Momentum v2, item D1, Mo 2026-09-06.
+MOMENTUM_MAX_PICKS = 10
 
-def six_symbols() -> list[str]:
-    return ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+
+def many_symbols(count: int = MOMENTUM_MAX_PICKS + 1) -> list[str]:
+    """AAA, BBB, CCC and so on, as many as a test asks for."""
+    return [chr(ord("A") + i) * 3 for i in range(count)]
 
 
-def test_six_picks_from_the_model_are_trimmed_to_five(stub):
-    stub(text=reply(picks=[one_pick(symbol=s) for s in six_symbols()]))
+def ranked_rows(symbols: list[str]) -> list[dict]:
+    """Candidate rows in Momentum v2 shape, already ranked, all of them longs."""
+    return [
+        {"symbol": symbol, "opening_range_high": 101.0, "opening_range_low": 99.0,
+         "opening_range_open": 99.5, "opening_range_close": 100.5,
+         "atr": 2.0, "rank": index + 1, "rel_volume": 5.0 - index * 0.1,
+         "score": 5.0 - index * 0.1, "sector": "Technology"}
+        for index, symbol in enumerate(symbols)
+    ]
+
+
+def test_eleven_picks_from_the_model_are_trimmed_to_ten(stub):
+    symbols = many_symbols()
+    stub(text=reply(picks=[one_pick(symbol=s) for s in symbols]))
     result = decide()
 
-    assert len(result.picks) == 5
-    assert [p["symbol"] for p in result.picks] == six_symbols()[:5]
+    assert len(result.picks) == MOMENTUM_MAX_PICKS
+    assert [p["symbol"] for p in result.picks] == symbols[:MOMENTUM_MAX_PICKS]
     # The one that was cut is written down as a skip, not lost.
-    assert "FFF" in [s["symbol"] for s in result.skips]
-    assert any("at most 5 names" in s["rationale"] for s in result.skips)
+    assert symbols[-1] in [s["symbol"] for s in result.skips]
+    assert any("at most 10 names" in s["rationale"] for s in result.skips)
     assert any("trimmed 1 pick" in note for note in result.notes)
 
 
-def test_the_rules_only_path_is_trimmed_to_the_same_five(stub):
+def test_the_rules_only_path_is_trimmed_to_the_same_ten(stub):
     """Book B is the control, so it may not pick more names than book A."""
-    rows = [{"symbol": s, "opening_range_high": 101.0, "opening_range_low": 99.0,
-             "score": float(9 - i)} for i, s in enumerate(six_symbols())]
+    rows = ranked_rows(many_symbols())
     result = decide_mod.decide(RULES_BOOK, MOMENTUM_DIR, "pick", packet(candidates=rows))
 
     assert result.model == "none"
-    assert len(result.picks) == 5
+    assert len(result.picks) == MOMENTUM_MAX_PICKS
 
 
-def test_every_strategy_caps_its_picks_at_five():
-    for name in ("momentum_hybrid", "momentum_rules", "insider", "congress"):
+def test_every_strategy_caps_its_picks_at_the_number_in_its_own_yaml():
+    """Ten in the momentum books since item D1, five in the two filing books."""
+    wanted = {"momentum_hybrid": 10, "momentum_rules": 10, "insider": 5, "congress": 5}
+    for name, count in wanted.items():
         params, _ = decide_mod.load_params(REAL_ROOT / "strategies" / name)
-        assert decide_mod.max_picks_for(params) == 5, (
-            f"strategies/{name}/strategy.yaml has no risk.max_picks of 5")
+        assert decide_mod.max_picks_for(params) == count, (
+            f"strategies/{name}/strategy.yaml has no risk.max_picks of {count}")
 
 
-def test_five_picks_are_left_alone(stub):
-    stub(text=reply(picks=[one_pick(symbol=s) for s in six_symbols()[:5]]))
+def test_ten_picks_are_left_alone(stub):
+    stub(text=reply(picks=[one_pick(symbol=s)
+                           for s in many_symbols()[:MOMENTUM_MAX_PICKS]]))
     result = decide()
-    assert len(result.picks) == 5
+    assert len(result.picks) == MOMENTUM_MAX_PICKS
     assert result.skips == []
 
 
@@ -524,13 +551,11 @@ def test_the_adapter_is_given_a_forty_five_second_timeout(monkeypatch):
     assert decide_mod.MODEL_BUDGET_S == 60.0
 
 
-def test_a_model_unavailable_answer_is_still_trimmed_to_five(stub):
+def test_a_model_unavailable_answer_is_still_trimmed_to_ten(stub):
     stub(text="", ok=False, error="connection refused")
-    rows = [{"symbol": s, "opening_range_high": 101.0, "opening_range_low": 99.0,
-             "score": float(9 - i)} for i, s in enumerate(six_symbols())]
-    result = decide(packet=packet(candidates=rows))
+    result = decide(packet=packet(candidates=ranked_rows(many_symbols())))
     assert result.fallback == "model_unavailable"
-    assert len(result.picks) == 5
+    assert len(result.picks) == MOMENTUM_MAX_PICKS
 
 
 # ---------------------------------------------------------------------------

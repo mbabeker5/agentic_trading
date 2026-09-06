@@ -16,7 +16,30 @@
 #   4. runs one tick of agent/loop.py, which is one tick for every enabled book
 #      in config/books.yaml: A, B and E on the momentum clock, C on insider
 #      filings and D on Congress filings
-#   5. writes everything to output/tick_YYYY-MM-DD.log
+#   5. keeps ticking, in this same run, while the loop says it wants looking at
+#      again sooner than launchd will wake it. See THE FAST WINDOW below.
+#   6. writes everything to output/tick_YYYY-MM-DD.log
+#
+# THE FAST WINDOW (Momentum v2, item A14, Mo 2026-09-06)
+# ------------------------------------------------------
+# The momentum books need looking at every 30 seconds between 09:35 and 11:00
+# while they are holding something, because their stop is now measured off the
+# stock's own daily swing and is roughly five times tighter than it used to be.
+# A stop that tight needs sub-minute resolution even with the stop resting at
+# the broker, because the stop child is a stop-limit and a triggered one that
+# does not fill has to be noticed and marketed out inside a minute.
+#
+# launchd cannot be told to speed up half way through a morning. Its timetable
+# is fixed when the job is loaded. So the loop decides instead: at the end of
+# every tick it writes how many seconds it wants to wait into
+# output/next_tick_seconds, which is the smallest number any of the five books
+# asked for, and this script reads it. When it says less than the launchd gap
+# this script sleeps that long and ticks again, in the same run, until the next
+# launchd wake up is due. When it says 300, this run is over and launchd handles
+# the next one exactly as before.
+#
+# So the launchd job stays on its five minute timetable and never changes, and
+# the 30 second cadence costs nothing but this loop below.
 #
 # THERE IS NO --dry-run FLAG HERE ANY MORE, and that is not a loosening. Each
 # book carries its own mode in config/books.yaml and all five say dry_run, so
@@ -115,11 +138,58 @@ export TZ="America/New_York"
 # AGENTIC_TRADING_LIVE_ORDERS stays unset on purpose. Do not export it here.
 unset AGENTIC_TRADING_LIVE_ORDERS
 
+# How long launchd leaves between wake ups. This script must never still be
+# running when the next one starts, so the sub-loop below stops short of it.
+LAUNCHD_GAP_SECONDS="${AGENTIC_TRADING_LAUNCHD_GAP:-300}"
+
+# The most sub-ticks one run may do, as a belt and braces stop. At 30 seconds
+# apiece, nine of them plus the first is four and a half minutes, which is
+# inside the five minute gap with room to spare. If the loop ever wrote a
+# nonsense number this is what stops this script running forever.
+MAX_SUB_TICKS=9
+
+# How soon the loop wants looking at again, in whole seconds, or the launchd gap
+# when it did not say. Anything that is not a plain number is ignored.
+next_tick_seconds() {
+  local raw
+  raw="$(cat "$LOG_DIR/next_tick_seconds" 2>/dev/null | tr -d '[:space:]')"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+    echo "$raw"
+  else
+    echo "$LAUNCHD_GAP_SECONDS"
+  fi
+}
+
 python "$PROJECT/agent/loop.py" >> "$LOG" 2>&1
 STATUS=$?
 
+# The fast window. Only ever entered when the tick above finished cleanly: a
+# loop that fell over should be looked at, not run again nine more times.
+SUB_TICKS=0
+ELAPSED=0
+while [[ $STATUS -eq 0 ]] && (( SUB_TICKS < MAX_SUB_TICKS )); do
+  WAIT="$(next_tick_seconds)"
+  (( WAIT >= LAUNCHD_GAP_SECONDS )) && break
+  (( ELAPSED + WAIT >= LAUNCHD_GAP_SECONDS )) && break
+
+  sleep "$WAIT"
+  ELAPSED=$(( ELAPSED + WAIT ))
+  SUB_TICKS=$(( SUB_TICKS + 1 ))
+
+  # The kill switch is checked again every time round, because a person pulling
+  # the handle should not have to wait out a five minute run.
+  if [[ -f "$LOG_DIR/LOOP_DISABLED" ]]; then
+    say "LOOP_DISABLED appeared, so the fast window stopped after $SUB_TICKS sub-tick(s)."
+    break
+  fi
+
+  say "fast window: sub-tick $SUB_TICKS, $WAIT seconds after the last one"
+  python "$PROJECT/agent/loop.py" >> "$LOG" 2>&1
+  STATUS=$?
+done
+
 if [[ $STATUS -eq 0 ]]; then
-  say "----- tick finished cleanly -----"
+  say "----- tick finished cleanly, $SUB_TICKS extra sub-tick(s) in the fast window -----"
 else
   say "----- tick finished BADLY, exit code $STATUS -----"
 fi
