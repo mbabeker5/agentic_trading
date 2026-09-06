@@ -549,13 +549,17 @@ def every_guardrail(day: date_type) -> Scenario:
                                                  day_start_equity=50_000.0),
                            note="10,000 dollars into a 50,000 dollar book")
 
-        # max_open_positions: five already held, and this would be the sixth.
-        five = {name: gr.PositionInfo(symbol=name, qty=10, avg_cost=100.0,
-                                      market_value=1_000.0)
-                for name in ("MSFT", "NVDA", "TSLA", "AMD", "META")}
+        # max_open_positions: the book's own limit already held, and this would
+        # be one more. The number is read off the settings rather than written
+        # here, because it has already changed once (five to ten on 2026-09-06)
+        # and a hard coded five would have quietly stopped testing the rule.
+        limit = int(context.guard_for("A").money.max_open_positions)
+        full = {f"FULL{n}": gr.PositionInfo(symbol=f"FULL{n}", qty=10,
+                                            avg_cost=100.0, market_value=1_000.0)
+                for n in range(limit)}
         context.probe_rule("A", entry(qty=10, price=100.0),
-                           context.account_state("A", open_positions=five),
-                           note="a sixth position when five is the limit")
+                           context.account_state("A", open_positions=full),
+                           note=f"one position more than the limit of {limit}")
 
         # gross_exposure_cap: the book is already fully invested.
         context.probe_rule("A", entry(qty=10, price=100.0),
@@ -749,7 +753,13 @@ def daily_loss_cap(day: date_type) -> Scenario:
                "block the closing orders",
         day=day, symbols=(target,), build_broker=build,
         book_patches=only("A"),
-        strategy_overlays={"momentum_hybrid": {"schedule": {"pick_time": "10:15"}}},
+        # The pick is moved late so the loss is already on the books when the
+        # first entry of the day is worked out. entries_until has to move with
+        # it: agent/loop.py's phase_for() only calls a tick a pick while the
+        # entry window is still open, and the momentum books close theirs at
+        # 10:15 as of 2026-09-06.
+        strategy_overlays={"momentum_hybrid": {
+            "schedule": {"pick_time": "10:15", "entries_until": "11:00"}}},
         decider=lambda s: StubDecider(
             max_picks=1,
             script=[ScriptedPick(book="A", symbol=target, at="10:15", side="long")]),
@@ -836,12 +846,20 @@ def flatten_at_close(day: date_type) -> Scenario:
         working = [o for o in context.fake.open_orders()["orders"]
                    if o.get("symbol") == resting]
         if working:
+            kinds = ", ".join(f"{o.get('action')} {o.get('remaining')} at "
+                              f"{o.get('orderType')}" for o in working)
             failures.append(
-                f"{len(working)} orders for {resting} were still working at the close, "
-                "and nothing cancelled them. agent/loop.py has no cancel_order call on "
-                "any path, so a momentum book that is meant to be flat by 15:55 can "
-                "still be filled into a position between 15:55 and the close, and the "
-                "book file will not know about it.")
+                f"{len(working)} orders for {resting} were still working at the close "
+                f"({kinds}) and nothing cancelled them. agent/loop.py calls "
+                "cancel_order in exactly one place, move_resting_stop(), when the "
+                "trailing rule tightens a stop. Nothing cancels an entry that never "
+                "filled, and nothing cancels the stop and target children that went "
+                "out with it. So a momentum book that is meant to be flat by 15:55 "
+                "can be filled into a position between the flatten and the close, and "
+                "its two children can fill on their own and sell stock it does not "
+                "own. They are DAY orders and IBKR would expire them at the close, "
+                "which covers the overnight case and not the five minutes that "
+                "matter.")
         else:
             evidence.append("no order was left working at the close")
 
