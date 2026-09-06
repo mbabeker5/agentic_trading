@@ -189,3 +189,123 @@ To see what it would make of a different moment, without waiting for it:
 
 The time in `--now` is read as New York time. That is how the phases were tested
 after the close.
+
+---
+
+# The other two jobs: the watchdog and the pre-flight
+
+Added 2026-09-06. Like the tick job above, **neither of these is loaded.** They
+are definitions sitting in the repo waiting for you to decide.
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.watchdog.plist
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.preflight.plist
+```
+
+Neither can trade. The watchdog opens a read only connection to IB Gateway, so
+it cannot place an order even by accident, and the only thing it can start is
+Gateway itself. The pre-flight reads the account and runs the scanner.
+
+## The watchdog
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/watchdog.py --once
+```
+
+One run is one health check. It looks at six things: is IB Gateway running, is
+port 4002 open, does a read only login come back with the paper account, are SPY
+quotes real time rather than delayed, has the trading loop ticked recently, and
+is there more than a gigabyte of disk free.
+
+**Schedule.** Every five minutes from 09:25 to 16:05 on weekdays, which covers
+the whole trading day plus five minutes either side, and once an hour the rest
+of the time including weekends. That is 533 wake ups a week. The hourly overnight
+runs are the point of the whole thing: on 2026-09-03 Gateway went down at 01:44
+and nobody found out until Saturday.
+
+**What it does when something is wrong.** It messages you once. If Gateway is
+down it also starts it, once, and then leaves it alone. If the same thing is
+still broken half an hour later it says so again, and not more often than that.
+When it comes back you get one message saying so.
+
+It keeps its memory in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/watchdog_state.json`
+and writes one line per run to
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/watchdog.log`.
+
+**Try it without consequences:**
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/watchdog.py --dry-run
+```
+
+That runs every check, prints what it found and what it would have done, and
+sends nothing.
+
+## The pre-flight
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preflight.py
+```
+
+**Schedule.** 09:00 on weekdays, half an hour before the open, five wake ups a
+week. It gets ten minutes to finish because it runs the scanner, which can take
+four minutes when IBKR is slow.
+
+It asks five questions: is Gateway logged into the paper account, are the quotes
+real time, does the scanner run cleanly, do the books and the broker agree on
+what is held, and do the day trade counter files load. If any answer is no it
+writes
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/NO_TRADE_TODAY`,
+which stops the loop opening anything that day, and messages you with the names
+of the failing checks.
+
+**Try it without consequences:**
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preflight.py --dry-run
+```
+
+That writes `output/preflight_dryrun.json` instead of the dated report, creates
+no NO_TRADE_TODAY, and sends no message.
+
+## Switching them on and off
+
+Same two commands as the tick job, with a different label:
+
+```
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.watchdog.plist
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.preflight.plist
+
+launchctl print gui/$(id -u)/com.mtalib.agentic-trading.watchdog
+launchctl print gui/$(id -u)/com.mtalib.agentic-trading.preflight
+
+launchctl bootout gui/$(id -u)/com.mtalib.agentic-trading.watchdog
+launchctl bootout gui/$(id -u)/com.mtalib.agentic-trading.preflight
+```
+
+**Load the watchdog first, before the tick job.** It is the thing that tells you
+the loop has stopped, so it is not much use arriving second.
+
+Their launchd logs, for anything that breaks before the script gets going:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_watchdog.out.log
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_watchdog.err.log
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_preflight.out.log
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_preflight.err.log
+```
+
+## One thing to know about the watchdog and the loop
+
+The watchdog's heartbeat check stays quiet while the tick job is not loaded. It
+has no way to tell a loop that has crashed from a loop that was never switched
+on, so rather than guess it asks launchd whether the tick job exists and says
+nothing when it does not. Load the tick job and the heartbeat check starts
+working on its own.
+
+Everything about what the guards do, what an alert looks like and what to do
+when you get one is in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/OPERATIONS.md`.
