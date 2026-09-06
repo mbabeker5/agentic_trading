@@ -2167,7 +2167,8 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
     state.triggered[symbol]["allowed"] = decision.allowed
     put_the_pick_down(tick, state, symbol, decision)
     if decision.daily_halt:
-        state.halt("a guardrail asked for a halt for the rest of the day")
+        state.halt("a guardrail asked for a halt for the rest of the day",
+                   cause=bs.HALT_LOSS_CAP, at=tick.now.isoformat())
 
 
 def trade_facts(state: bs.BookState, symbol: str,
@@ -3202,7 +3203,8 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
         state.triggered[symbol]["allowed"] = decision.allowed
         put_the_pick_down(tick, state, symbol, decision)
         if decision.daily_halt:
-            state.halt("a guardrail asked for a halt for the rest of the day")
+            state.halt("a guardrail asked for a halt for the rest of the day",
+                   cause=bs.HALT_LOSS_CAP, at=tick.now.isoformat())
 
 
 def flatten_price(quote: dict | None, short: bool) -> float | None:
@@ -3493,8 +3495,15 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
              rules: str, write_ledger: bool, halt_reason: str | None = None,
              quiet: bool = False,
              account_wide: "AccountWide | None" = None,
-             broker_orders: list | None = None) -> tuple[BookTick, bs.BookState]:
-    """One book's whole turn: work out the phase, do it, write the file."""
+             broker_orders: list | None = None,
+             reconciliation_clean: bool | None = None) -> tuple[BookTick, bs.BookState]:
+    """One book's whole turn: work out the phase, do it, write the file.
+
+    reconciliation_clean is what this tick's reconciliation said: True when the
+    books and the broker agreed about everything, False when they did not, None
+    when nobody could ask. It is what lifts a halt that was caused by a
+    disagreement which no longer exists.
+    """
     tick = BookTick(book, now, rules, write_ledger, quiet=quiet)
     plan = plan_for(book, guard)
     day = now.date()
@@ -3510,10 +3519,18 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         if closed:
             tick.say(f"The kill switch flattened {closed} position(s) in this book. "
                      "They are marked closed rather than treated as a mismatch.")
+            # Not a mismatch, so the reconciliation halt is dropped. It is still
+            # a halt: somebody pulled the handle, and a book that starts opening
+            # positions again five minutes later has not understood why.
             halt_reason = None
+            state.halt(f"the kill switch flattened {closed} position(s) in this "
+                       "book at the broker",
+                       cause=bs.HALT_KILL_SWITCH, at=now.isoformat())
 
     if halt_reason:
-        state.halt(halt_reason)
+        state.halt(halt_reason, cause=bs.HALT_RECONCILIATION, at=now.isoformat())
+
+    clear_halts_that_are_over(tick, state, guards, reconciliation_clean)
 
     bs.mark_positions(state, broker_positions)
     if not state.day_start_equity:
@@ -3616,6 +3633,62 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         print(f"  {tick.would_be_orders} would be orders, {tick.approved} allowed, "
               f"{tick.refused} refused, {tick.sent} sent | state {path}")
     return tick, state
+
+
+def clear_halts_that_are_over(tick: BookTick, state: bs.BookState, guards: Guards,
+                             reconciliation_clean: bool | None) -> None:
+    """Lift a halt whose reason has gone away. Nothing did this before 2026-09-06.
+
+    A halt was written into the book file and no code path anywhere ever cleared
+    one, so a twenty minute Gateway outage or a single bad tick cost the rest of
+    the trading day. What clears each kind is decided by why it was set:
+
+        reconciliation  the moment the books and the broker agree again. The
+                        thing that was wrong is no longer wrong, and holding the
+                        book back afterwards protects nobody.
+        kill_switch     only once output/LOOP_DISABLED is gone, which means a
+                        person ran agent/reenable.sh, AND reconciliation is
+                        clean. Two conditions, because the handle is pulled for
+                        a reason and because the account was emptied under the
+                        book's feet.
+        loss_cap        not here. A loss cap is measured over a day, so it
+                        clears when the day does, which agent/book_state.py's
+                        load_state() does by starting a new day with no halts.
+        other           the same: it clears with the day.
+
+    A book halted for two reasons at once stays halted until both have gone,
+    which is why the cause is kept on each reason rather than in one flag.
+    """
+    if not state.halted:
+        return
+    causes = state.halt_causes()
+
+    if bs.HALT_RECONCILIATION in causes and reconciliation_clean is True:
+        for row in state.clear_halt(bs.HALT_RECONCILIATION):
+            tick.say(f"  the halt from {str(row.get('at') or '')[11:16]} is lifted: "
+                     "the books and the broker agree again")
+            tick.rule("halt_cleared",
+                      f"book {state.book_id}: {row.get('reason')}",
+                      "lifted, because this tick's reconciliation was clean")
+
+    causes = state.halt_causes()
+    if bs.HALT_KILL_SWITCH in causes and reconciliation_clean is True \
+            and not guards.loop_disabled_present:
+        for row in state.clear_halt(bs.HALT_KILL_SWITCH):
+            tick.say("  the kill switch halt is lifted: the loop has been "
+                     "re-enabled by hand and reconciliation is clean")
+            tick.rule("halt_cleared",
+                      f"book {state.book_id}: {row.get('reason')}",
+                      "lifted, because agent/reenable.sh has run and this tick's "
+                      "reconciliation was clean")
+
+    if not state.halted:
+        tick.alert(
+            "info", f"Book {state.book_id} is trading again",
+            f"Book {state.book_id} was halted and is not any more, because the "
+            "reason has gone away rather than because anybody overrode it.\n\n"
+            "It opens positions again from this tick.",
+            key="halt_cleared")
 
 
 def snapshot_book_positions(tick: BookTick, state: bs.BookState) -> None:
@@ -4164,7 +4237,8 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                                broker_positions, rules, args.write_ledger,
                                halt_reason=halts.get(book.book_id),
                                account_wide=account_wide,
-                               broker_orders=broker_orders)
+                               broker_orders=broker_orders,
+                               reconciliation_clean=outcome.ok)
         # Fold this book's own answer back in before the next one takes its
         # turn, so one ticker, one book is a rule about right now rather than a
         # rule about how the day started. Without this, book B is told nobody is

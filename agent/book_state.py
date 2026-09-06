@@ -89,6 +89,39 @@ class Position:
         return self.side == "short" or self.qty < 0
 
 
+#: Why a book is halted. The cause matters because it decides what clears it,
+#: and until 2026-09-06 nothing cleared anything at all.
+#:
+#:   reconciliation  the books and the broker disagreed. Clears itself the
+#:                   moment they agree again, because the thing that was wrong
+#:                   is no longer wrong.
+#:   loss_cap        the book is down to a limit. Clears at the next trading
+#:                   day, which is what the limits are measured over.
+#:   kill_switch     somebody pulled the handle, or the dead man's handle did.
+#:                   Clears only once output/LOOP_DISABLED is gone, which means
+#:                   a person ran agent/reenable.sh, AND reconciliation is
+#:                   clean. Two conditions, because the handle is pulled for a
+#:                   reason and the account was emptied under the books' feet.
+#:   other           anything else, including a guardrail asking for one.
+#:                   Clears at the next trading day.
+HALT_RECONCILIATION = "reconciliation"
+HALT_LOSS_CAP = "loss_cap"
+HALT_KILL_SWITCH = "kill_switch"
+HALT_OTHER = "other"
+
+#: How many halt reasons are kept. The five most recent, oldest dropped.
+#:
+#: This used to be an ever growing string. halt() appended to it and
+#: reconciliation calls it on every tick, so the same sentence ended up stored
+#: eighty times over in the book file and quoted in full in every log line that
+#: mentioned it. The first replay gate run found one reason 2,276 characters
+#: long, on a day when exactly one thing had gone wrong.
+MAX_HALT_REASONS = 5
+
+#: And how long any one of them may be. A reason nobody can read is not a reason.
+HALT_REASON_MAX_CHARS = 200
+
+
 @dataclass
 class BookState:
     """Everything one book carries from one tick to the next."""
@@ -110,7 +143,12 @@ class BookState:
     entries_opened_today: int = 0
     realized_pnl_today: float = 0.0
     halted: bool = False
+    #: One readable sentence: the most recent reason, plus how many earlier ones
+    #: there were. Bounded, because everything that quotes a halt quotes this.
     halt_reason: str | None = None
+    #: The five most recent reasons, newest last, each with the time it happened
+    #: and what kind of halt it is. This is what decides whether a halt clears.
+    halt_reasons: list = field(default_factory=list)
     decisions: list = field(default_factory=list)
     swept_at: dict = field(default_factory=dict)
     last_manage_at: str | None = None
@@ -156,10 +194,62 @@ class BookState:
             "rules_commit": rules_commit,
         })
 
-    def halt(self, reason: str) -> None:
-        """Stop this book opening anything else today, and say why in plain words."""
+    def halt(self, reason: str, cause: str = HALT_OTHER, at: Any = None) -> None:
+        """Stop this book opening anything else, and say why in plain words.
+
+        The same reason twice in a row is not written down twice. Reconciliation
+        calls this on every tick while a disagreement stands, so without that
+        one mismatch would fill the list in half an hour and push out every
+        other reason the book had.
+        """
+        reason = str(reason or "").strip()[:HALT_REASON_MAX_CHARS] or "no reason given"
+        cause = str(cause or HALT_OTHER)
+        when = str(at) if at is not None else datetime.now().astimezone().isoformat()
+
         self.halted = True
-        self.halt_reason = reason if not self.halt_reason else f"{self.halt_reason}; {reason}"
+        rows = [row for row in self.halt_reasons if isinstance(row, dict)]
+        if not (rows and rows[-1].get("reason") == reason
+                and rows[-1].get("cause") == cause):
+            rows.append({"at": when, "cause": cause, "reason": reason})
+        self.halt_reasons = rows[-MAX_HALT_REASONS:]
+        self.halt_reason = self._halt_sentence()
+
+    def clear_halt(self, cause: str | None = None) -> list[dict]:
+        """Lift the halts of one cause, or all of them. Returns what was lifted.
+
+        A book halted for two different reasons stays halted until both are
+        gone, which is the point of keeping the cause on each one rather than a
+        single flag and a growing sentence.
+        """
+        rows = [row for row in self.halt_reasons if isinstance(row, dict)]
+        if cause is None:
+            lifted, kept = rows, []
+        else:
+            lifted = [row for row in rows if row.get("cause") == cause]
+            kept = [row for row in rows if row.get("cause") != cause]
+        self.halt_reasons = kept
+        self.halted = bool(kept)
+        self.halt_reason = self._halt_sentence() if kept else None
+        return lifted
+
+    def halt_causes(self) -> set:
+        """Which kinds of halt are holding this book right now."""
+        return {str(row.get("cause")) for row in self.halt_reasons
+                if isinstance(row, dict)}
+
+    def _halt_sentence(self) -> str:
+        """The most recent reason and a count, short enough to quote anywhere."""
+        rows = [row for row in self.halt_reasons if isinstance(row, dict)]
+        if not rows:
+            return ""
+        latest = rows[-1]
+        clock = str(latest.get("at") or "")[11:16] or "an unknown time"
+        line = (f"{latest.get('reason')} "
+                f"(at {clock}, {latest.get('cause', HALT_OTHER)})")
+        if len(rows) > 1:
+            line += (f", and {len(rows) - 1} earlier reason(s) today, the last "
+                     f"{MAX_HALT_REASONS} kept in halt_reasons in this file")
+        return line
 
 
 # ---------------------------------------------------------- loading, saving
@@ -206,6 +296,7 @@ def load_state(book_id: str, order_ref: str, day: date_type, capital: float = 0.
         fresh.working_orders = dict(previous.working_orders)
         fresh.halted = False           # a new day, a new chance
         fresh.halt_reason = None
+        fresh.halt_reasons = []        # which is what clears a loss cap halt
         fresh.day_start_equity = 0.0   # filled in by the first tick from the marks
         fresh.account_id = previous.account_id
     return fresh
