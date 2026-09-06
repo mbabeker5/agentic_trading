@@ -9,17 +9,24 @@
 #   /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/run_tick.sh
 #
 # What it does, in order:
-#   1. checks IB Gateway is listening on port 4002, the paper port
-#   2. checks the MCP server answers on http://127.0.0.1:8765/mcp, and starts it
+#   1. refuses to run at all while output/LOOP_DISABLED exists
+#   2. checks IB Gateway is listening on port 4002, the paper port
+#   3. checks the MCP server answers on http://127.0.0.1:8765/mcp, and starts it
 #      with agent/start_mcp.sh if it does not
-#   3. runs one tick of agent/loop.py in dry run
-#   4. writes everything to output/tick_YYYY-MM-DD.log
+#   4. runs one tick of agent/loop.py, which is one tick for every enabled book
+#      in config/books.yaml: A, B and E on the momentum clock, C on insider
+#      filings and D on Congress filings
+#   5. writes everything to output/tick_YYYY-MM-DD.log
 #
-# DRY RUN IS HARDCODED below. Nothing this script runs can place an order.
-# Changing that is a deliberate, separate act: replace --dry-run with --live on
-# the MODE line, and the loop will still refuse unless the environment variable
-# AGENTIC_TRADING_LIVE_ORDERS is set to yes and the account id starts with DU.
-# Do not change it until Mo has approved the numbers in docs/STRATEGY.md.
+# THERE IS NO --dry-run FLAG HERE ANY MORE, and that is not a loosening. Each
+# book carries its own mode in config/books.yaml and all five say dry_run, so
+# the loop writes down the order it would have sent and stops. A book cannot
+# even be set to tiny or full without a promoted_on date and a rules_commit
+# hash from the hub beside it, which is a hand edit by Mo.
+#
+# AGENTIC_TRADING_LIVE_ORDERS IS DELIBERATELY NOT SET BELOW. It is the second
+# of the four locks on the live order path, and this script must never set it.
+# See the note at the top of agent/loop.py for all four.
 
 set -uo pipefail
 
@@ -32,9 +39,6 @@ GATEWAY_HOST="127.0.0.1"
 GATEWAY_PORT="4002"          # IB Gateway paper. Live is 4001 and must never appear here.
 MCP_URL="http://127.0.0.1:8765/mcp"
 
-# The one line that decides whether this can trade. Leave it as --dry-run.
-MODE="--dry-run"
-
 mkdir -p "$LOG_DIR"
 
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] $*" >> "$LOG"; }
@@ -42,7 +46,7 @@ say() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] $*" >> "$LOG"; }
 # Kill switch. agent/kill_switch.sh writes this file; while it exists no tick runs at all.
 [[ -f "$LOG_DIR/LOOP_DISABLED" ]] && { say "LOOP_DISABLED exists, so this tick did nothing. Clear it with $PROJECT/agent/reenable.sh"; exit 0; }
 
-say "----- tick starting, mode $MODE -----"
+say "----- tick starting, all enabled books, dry run per books.yaml -----"
 
 # A live port here would mean real money. Refuse outright.
 if [[ "$GATEWAY_PORT" == "4001" || "$GATEWAY_PORT" == "7496" ]]; then
@@ -105,7 +109,10 @@ source "$VENV/bin/activate"
 cd "$PROJECT" || { say "STOPPING: cannot enter $PROJECT"; exit 1; }
 export TZ="America/New_York"
 
-python "$PROJECT/agent/loop.py" $MODE >> "$LOG" 2>&1
+# AGENTIC_TRADING_LIVE_ORDERS stays unset on purpose. Do not export it here.
+unset AGENTIC_TRADING_LIVE_ORDERS
+
+python "$PROJECT/agent/loop.py" >> "$LOG" 2>&1
 STATUS=$?
 
 if [[ $STATUS -eq 0 ]]; then

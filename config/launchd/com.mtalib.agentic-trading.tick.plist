@@ -1,13 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  The five minute trading loop, run by launchd.
+  The five minute trading loop, run by launchd. One wake up is one tick for all
+  five books in config/books.yaml.
 
   It wakes /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/run_tick.sh
-  every five minutes from 09:25 to 16:00, Monday to Friday. That is 80 wake ups a
-  day and 400 entries below, one per weekday per time. 09:25 is five minutes before
-  the market opens, so the first tick has already checked that IB Gateway and the
-  MCP server are up before anything matters.
+  every five minutes from 09:25 to 16:05, Monday to Friday, plus three extra
+  times a day for the filing sweeps. That is 84 wake ups a day and 420 entries
+  below, one per weekday per time. 09:25 is five minutes before the market
+  opens, so the first tick has already checked that IB Gateway and the MCP
+  server are up before anything matters.
+
+  The three extra times, and which book each is for:
+
+    07:00  book C sweeps SEC Form 4 filings, agent/sweep_insider.py
+    07:30  book D sweeps Congress disclosures, agent/sweep_congress.py
+    16:30  book C sweeps again for tomorrow morning
+
+  The five minute run now ends at 16:05 rather than 16:00, because the tick at
+  or after the close is the one that writes each book's end of day line, and a
+  job that fires exactly on the close can land a second early.
 
   launchd works in this Mac's own time zone, not in a time zone you can set here.
   This Mac is in Eastern (checked with `date +%Z` on 2026-09-02, which said EDT),
@@ -19,8 +31,9 @@
   Loading it, unloading it and checking that it ran are all in
   /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md.
 
-  What it runs is dry run only. run_tick.sh hardcodes --dry-run, so a loaded job
-  works out what it would trade and sends nothing.
+  What it runs is dry run only. Every book in config/books.yaml is in dry_run
+  mode, so a loaded job works out what each of them would trade and sends
+  nothing. run_tick.sh unsets AGENTIC_TRADING_LIVE_ORDERS before every tick.
 -->
 <plist version="1.0">
 <dict>
@@ -69,6 +82,18 @@
 
     <key>StartCalendarInterval</key>
     <array>
+      <!-- Monday is 1 and Friday is 5. Weekday 1: the two morning sweeps, then
+           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
+      <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>0</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
       <dict>
         <key>Weekday</key><integer>1</integer>
         <key>Hour</key><integer>9</integer>
@@ -470,6 +495,28 @@
         <key>Minute</key><integer>0</integer>
       </dict>
       <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>5</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <!-- Monday is 1 and Friday is 5. Weekday 2: the two morning sweeps, then
+           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
+      <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>0</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <dict>
         <key>Weekday</key><integer>2</integer>
         <key>Hour</key><integer>9</integer>
         <key>Minute</key><integer>25</integer>
@@ -870,6 +917,28 @@
         <key>Minute</key><integer>0</integer>
       </dict>
       <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>5</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <!-- Monday is 1 and Friday is 5. Weekday 3: the two morning sweeps, then
+           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
+      <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>0</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <dict>
         <key>Weekday</key><integer>3</integer>
         <key>Hour</key><integer>9</integer>
         <key>Minute</key><integer>25</integer>
@@ -1270,6 +1339,28 @@
         <key>Minute</key><integer>0</integer>
       </dict>
       <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>5</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <!-- Monday is 1 and Friday is 5. Weekday 4: the two morning sweeps, then
+           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
+      <dict>
+        <key>Weekday</key><integer>4</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>0</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>4</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <dict>
         <key>Weekday</key><integer>4</integer>
         <key>Hour</key><integer>9</integer>
         <key>Minute</key><integer>25</integer>
@@ -1670,6 +1761,28 @@
         <key>Minute</key><integer>0</integer>
       </dict>
       <dict>
+        <key>Weekday</key><integer>4</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>5</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>4</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <!-- Monday is 1 and Friday is 5. Weekday 5: the two morning sweeps, then
+           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
+      <dict>
+        <key>Weekday</key><integer>5</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>0</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>5</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <dict>
         <key>Weekday</key><integer>5</integer>
         <key>Hour</key><integer>9</integer>
         <key>Minute</key><integer>25</integer>
@@ -2068,6 +2181,16 @@
         <key>Weekday</key><integer>5</integer>
         <key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>0</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>5</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>5</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>5</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>30</integer>
       </dict>
     </array>
 </dict>
