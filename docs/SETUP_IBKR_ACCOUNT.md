@@ -45,6 +45,10 @@ That folder is gitignored, so it never reaches GitHub. Do not paste the credenti
 - **Only one login can hold market data at a time.** IBKR allows one market data session per user, and live and paper share it. While Gateway runs the paper account during market hours, do not keep a quote screen, Client Portal watchlist or the mobile app streaming prices on the live login. It will steal the data session from the agent and its quotes will go stale (Gateway reports error 10197).
 - **Subscriber status.** Mo's status showed Professional on 2026-09-02 and IBKR asked for the Non-Professional questionnaire. Professional status triples data fees and can change which feeds are shared to paper. Complete the questionnaire on the live login under Settings, User Settings, Market Data Subscriptions. The smoke test on 2026-09-03 records whether quotes come back flagged professional.
 
+## 4c. Log of checks
+
+- **2026-09-06 11:45 ET (Saturday).** Gateway had been down since Thursday 2026-09-03 01:44 ET: the IBC log shows it stuck at "Connecting to server" through the 2 AM restart window and then exiting. Restarted by hand, logged in again without a two-factor prompt. Live quote request returned error 10197, "No market data during competing live session": the sharing toggle has taken effect, but a live-login session (Client Portal or the mobile app on mbabeker5) was holding the data session, so real-time versus delayed could not be judged. Re-check scheduled for Tuesday 2026-09-08 after 9:30 AM ET. Market-on-open paper order 4 placed to sell the 1 SPY test share at Tuesday's open, Mo's approval via the hub.
+
 ## 5. Two-factor authentication
 
 IBKR sends a two-factor prompt to the IBKR Mobile app on most logins. Paper accounts are usually gentler about it, and the auto-login helper (IBC) holds the session and restarts it daily. If the prompt keeps coming back, enable IBKR Mobile Authentication (IB Key) in the app and keep the phone nearby.
