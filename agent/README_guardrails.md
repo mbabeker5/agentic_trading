@@ -75,6 +75,8 @@ often each one fired over a month.
 | `max_position_pct` | No single stock may grow past 15 percent of the book (5 percent in the insider and Congress books). What we already hold and what is sitting unfilled on order both count towards that. |
 | `max_open_positions` | At most 5 stocks held at once in the momentum books, 10 in the other two. Buying more of something we already hold does not count as one more. |
 | `wrong_book` | Five books share one paper account, so every order says which book it came from. One tagged for another book is refused, and this is the only rule that refuses a closing order too, because selling another book's position is worse than a missed exit. |
+| `symbol_exclusive` | Two books may never hold, or have a working order in, the same ticker. IBKR nets positions by symbol inside the one shared account, so a second book in the same name would disappear into the first book's line and neither could be reconciled afterwards. Blocks any entry, and any other order that would open or increase a position, in a name another book already has. Getting out of this book's own position is never blocked. Ties go first come, first served. |
+| `halted` | Nothing goes out into a name that cannot be traded. While IBKR's halted tick says the name is halted only an exit or a flatten goes through. While it is sitting in a limit-up limit-down band, the step just before a volatility halt, no new position is opened. And if nobody could say whether the name is halted, no new position is opened either, because deciding to buy something without knowing whether it is even trading is the failure this rule exists to prevent. |
 
 A few things the code does besides refusing orders:
 
@@ -330,7 +332,7 @@ enforce the limit.
 
 Five books share one paper account, so the tag on an order is the only thing
 tying a fill to the book that asked for it. This is the check that it still adds
-up, and it enforces four rules:
+up, and it enforces five rules:
 
 1. For every symbol at least one book claims, what the books claim has to add up
    to exactly what the broker reports. Whole shares, tolerance of zero.
@@ -338,6 +340,12 @@ up, and it enforces four rules:
    book, and that book has to know about the order.
 3. Every working order a book believes in has to exist at the broker.
 4. A position no book claims at all is an orphan.
+5. No two books may claim the same symbol, whatever the quantities come to.
+   Both of them stop, with kind `symbol_shared`. This is the other half of the
+   `symbol_exclusive` guardrail above: that rule stops the second book getting
+   in, and this one catches it if it ever did. It is checked separately from
+   rule one because two wrong claims can still add up to the right number, so
+   rule one can be perfectly happy while this is broken.
 
 The paper account already holds 1 share of SPY from a manual test, so the loop
 passes it in as an expected orphan and it is not treated as a problem until it
@@ -432,6 +440,23 @@ modes and day trades:
   afternoon has that buy back counted as a day trade, where a broker might not
   count it. That errs towards counting one too many, which is the safe direction
   for a limit.
+
+Two more, added on 2026-09-06 with the review team's two blocking findings:
+
+- **A halted name still takes an exit and a flatten, but not a fresh stop.**
+  That is the same answer the kill switch gives, for the same reason: a halted
+  agent, or a halted stock, should be got out of rather than have new orders
+  parked against it at a price nobody can see. The alternative was to let stop
+  orders through on the grounds that a stop is a way out, and it was rejected
+  because a stop sent into a halt is really a bet on the reopen price.
+- **An unknown halt status blocks an entry, but the field defaults to false.**
+  Passing `None` means the loop asked IBKR and got no answer, and that refuses
+  the entry with a sentence saying the halt status was not available. The
+  default of `false` is a compatibility default rather than a judgement: it
+  keeps every check written before halts were tracked behaving as it did. **The
+  loop must always pass what the broker actually said, `None` included.** If it
+  quietly stops setting the fields, this rule stops protecting anything, which
+  is the one weak spot in it and is written down here rather than hidden.
 
 ## Shorting, and where it stands now
 

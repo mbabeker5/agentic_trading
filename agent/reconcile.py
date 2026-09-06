@@ -19,7 +19,7 @@ collects what each book believes, hands all of it to reconcile() and acts on the
 report that comes back. That is why this can be tested in under a second with no
 account open.
 
-The four rules
+The five rules
 --------------
 
 1. Position quantities. For every symbol at least one book claims, the
@@ -39,6 +39,17 @@ The four rules
    The paper account already holds 1 share of SPY left over from a manual test,
    so the trading loop passes expected_orphans={"SPY": 1} and that one share is
    not treated as a problem until it is sold.
+
+5. One symbol, one book. No two books may claim the same symbol, whatever the
+   quantities add up to. IBKR nets positions by symbol inside the one shared
+   account, so once two books are in the same name the broker reports a single
+   line and there is no way left to say whose shares are whose. Rule one can
+   even be satisfied while this is broken, because two wrong claims can still
+   total the right number, which is exactly why it is checked separately. Both
+   books stop trading. Added 2026-09-06 at the review team's request, as the
+   other half of the symbol_exclusive guardrail in agent/guardrails.py: that
+   rule stops the second book getting in, and this one catches it if it ever
+   did.
 
 Three deliberate decisions
 --------------------------
@@ -70,6 +81,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 __all__ = [
     "KIND_POSITION_QTY",
+    "KIND_SYMBOL_SHARED",
     "KIND_UNKNOWN_ORDER_REF",
     "KIND_ORDER_NOT_IN_BOOK",
     "KIND_MISSING_WORKING_ORDER",
@@ -86,6 +98,7 @@ __all__ = [
 # way the guardrail rule ids are stable, so the ledger can count how often each
 # one turns up without reading the English.
 KIND_POSITION_QTY = "position_qty"
+KIND_SYMBOL_SHARED = "symbol_shared"
 KIND_UNKNOWN_ORDER_REF = "unknown_order_ref"
 KIND_ORDER_NOT_IN_BOOK = "order_not_in_book"
 KIND_MISSING_WORKING_ORDER = "missing_working_order"
@@ -236,6 +249,7 @@ def reconcile(
 
     mismatches: list[Mismatch] = []
     mismatches.extend(_check_position_quantities(claims, broker_qty))
+    mismatches.extend(_check_shared_symbols(claims))
     mismatches.extend(_check_broker_orders(claims, working_orders, orders))
     mismatches.extend(_check_book_working_orders(working_orders, orders))
     mismatches.sort(key=_mismatch_sort_key)
@@ -288,6 +302,43 @@ def _check_position_quantities(
                 Mismatch(
                     book_id=book_id,
                     kind=KIND_POSITION_QTY,
+                    symbol=symbol,
+                    order_id=None,
+                    line=line,
+                )
+            )
+    return found
+
+
+def _check_shared_symbols(claims: dict[str, dict[str, int]]) -> list[Mismatch]:
+    """Rule five: a symbol belongs to one book, and only ever to one book.
+
+    Rule one asks whether the books add up to the broker. This asks the separate
+    question of whether they should be adding up at all. Two books in the same
+    name can total exactly what the broker reports and still be wrong, because
+    IBKR nets positions by symbol: the broker shows one line, and nothing in the
+    account says which book owns which part of it. From there neither book can
+    be reconciled, and a book that cannot be reconciled will size its next order
+    off a number that is not true.
+
+    So both books stop. There is no sense in which one of them is the innocent
+    party once the position is already netted together.
+    """
+    found: list[Mismatch] = []
+    for symbol in sorted(_claimed_symbols(claims)):
+        holders = [
+            (book_id, claims[book_id][symbol])
+            for book_id in sorted(claims)
+            if claims[book_id].get(symbol)
+        ]
+        if len(holders) < 2:
+            continue
+        line = _shared_symbol_line(symbol, holders)
+        for book_id, _ in holders:
+            found.append(
+                Mismatch(
+                    book_id=book_id,
+                    kind=KIND_SYMBOL_SHARED,
                     symbol=symbol,
                     order_id=None,
                     line=line,
@@ -439,6 +490,22 @@ def _position_line(
         sentence += f", which is {_total_words(total)} between them"
     sentence += f", but the broker reports {_broker_words(theirs)}."
     return f"{sentence} {_halt_words([book_id for book_id, _ in holders])}"
+
+
+def _shared_symbol_line(symbol: str, holders: list[tuple[str, int]]) -> str:
+    """The one sentence that explains two books being in the same name."""
+    clauses = [
+        _claim_clause(book_id, qty, symbol=symbol, first=index == 0)
+        for index, (book_id, qty) in enumerate(holders)
+    ]
+    named = [book_id for book_id, _ in holders]
+    return (
+        f"{_join_with_and(clauses)}, and two books may never be in the same name "
+        f"at once. IBKR nets positions by symbol inside the one shared account, so "
+        f"the broker reports a single line of {symbol} and there is no way left to "
+        f"say whose shares are whose. Neither book can be reconciled from here. "
+        f"{_halt_words(named)}"
+    )
 
 
 def _claim_clause(book_id: str, qty: int, symbol: str, first: bool) -> str:

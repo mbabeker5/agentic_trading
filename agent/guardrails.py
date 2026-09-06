@@ -94,6 +94,8 @@ __all__ = [
     "max_shares_for",
     "BOOK_MODES_ALLOWED",
     "BOOK_MODES_THAT_SEND_ORDERS",
+    "HALT_ALLOWED_PURPOSES",
+    "SYMBOL_TIE_BREAK",
     "DEFAULT_TINY_CAPITAL_USD",
     "DEFAULT_MIN_AVG_DOLLAR_VOLUME",
     "DEFAULT_DOLLAR_VOLUME_SESSIONS",
@@ -116,6 +118,24 @@ CLOSING_PURPOSES = ("exit", "stop", "flatten")
 # CLOSING_PURPOSES on purpose: with the stop file in place the agent may close a
 # position itself, but it may not send fresh stop orders.
 KILL_SWITCH_ALLOWED_PURPOSES = ("exit", "flatten")
+
+# What a halted or limit-state name still lets through. A trading halt is the
+# same shape of problem as the kill switch, so it gets the same answer: the
+# agent may still get itself out, but it may not park a fresh stop order in a
+# name whose next printed price nobody knows. Added 2026-09-06 at the review
+# team's request.
+HALT_ALLOWED_PURPOSES = ("exit", "flatten")
+
+# How a tie is settled when two books want the same symbol on the same tick.
+# First come, first served: whoever registered the symbol first keeps it, and a
+# same-tick tie goes to whichever book comes first in config/books.yaml.
+#
+# That resolution belongs to the trading loop, which is the only thing that sees
+# all five books at once. This module only ever sees one book's order plus the
+# map of what the other books already have, so the constant is here to name the
+# rule and to give the loop one stable string to point at. Nothing in this file
+# implements it.
+SYMBOL_TIE_BREAK = "first_come_first_served"
 
 VALID_PURPOSES = ("entry", "exit", "stop", "flatten")
 VALID_SIDES = ("BUY", "SELL")
@@ -601,6 +621,12 @@ class AccountState:
                            way it points. Left as None it is worked out from
                            open_positions instead.
     entries_opened_today   how many brand new names the book has opened today
+    symbols_held_elsewhere which symbols the other books have already taken,
+                           written as {symbol: the book id that has it}. The
+                           loop fills it by reading every book's state, because
+                           only the loop sees all five books at once. Empty
+                           means nothing is taken and the symbol_exclusive rule
+                           has nothing to say.
     """
 
     equity: float
@@ -615,6 +641,7 @@ class AccountState:
     book_id: str | None = None
     gross_exposure: float | None = None
     entries_opened_today: int = 0
+    symbols_held_elsewhere: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.now, datetime):
@@ -639,6 +666,9 @@ class AccountState:
                 "AccountState.entries_opened_today cannot be negative, but it is "
                 f"{self.entries_opened_today}."
             )
+        self.symbols_held_elsewhere = _clean_symbol_owners(
+            self.symbols_held_elsewhere
+        )
 
     @property
     def total_pnl_today(self) -> float:
@@ -687,6 +717,15 @@ class AccountState:
     def is_short(self, symbol: str) -> bool:
         return self.position_direction(symbol) == "short"
 
+    def symbol_owner(self, symbol: str) -> str | None:
+        """Which other book already has this symbol, or None when nobody has.
+
+        "Has" covers both a position and a working entry order, because a book
+        with an order sitting at the broker is as committed to the name as a
+        book already holding it.
+        """
+        return self.symbols_held_elsewhere.get(_clean_symbol(symbol, "symbol"))
+
     def gross_exposure_now(self) -> float:
         """Every position added up, ignoring which way it points.
 
@@ -732,6 +771,25 @@ class OrderIntent:
     shares_available_to_borrow
              how many shares the broker says are available to borrow right now.
              None is treated the same way, as a refusal.
+
+    The last two say whether the name is tradeable at all right now. The loop
+    fills them from IBKR just before the order goes out, and it passes on what
+    the broker actually said, unknowns included:
+
+    halted   true when IBKR's halted tick, tick type 49, says this name is not
+             trading. None means the loop asked and got no answer, and an
+             unknown halt status stops an entry rather than being read as fine.
+    limit_state
+             true when the name is sitting in a limit-up limit-down band, which
+             is the state a stock enters just before it is halted for
+             volatility. None means unknown, and is treated the same way as an
+             unknown halt.
+
+    Both start as false rather than None, which is the one place this file lets
+    a missing answer mean a clean one. It is a compatibility default, not a
+    judgement: every check written before halts were tracked at all goes on
+    behaving as it did. The loop must always pass what IBKR said, and must pass
+    None when IBKR said nothing, because None is what the rule refuses on.
     """
 
     symbol: str
@@ -746,9 +804,13 @@ class OrderIntent:
     shortable_level: float | None = None
     borrow_fee_pct_annual: float | None = None
     shares_available_to_borrow: int | None = None
+    halted: bool | None = False
+    limit_state: bool | None = False
 
     def __post_init__(self) -> None:
         self.symbol = _clean_symbol(self.symbol, "OrderIntent.symbol")
+        self.halted = _optional_flag(self.halted, "OrderIntent.halted")
+        self.limit_state = _optional_flag(self.limit_state, "OrderIntent.limit_state")
         if self.book_id is not None:
             self.book_id = _clean_book_id(self.book_id, "OrderIntent.book_id")
         if not isinstance(self.shortable, bool):
@@ -1795,6 +1857,43 @@ def _clean_symbol(symbol: str, label: str) -> str:
     return symbol.strip().upper()
 
 
+def _optional_flag(value, label: str):
+    """A yes, a no, or a plain "nobody told us". Anything else is a mistake.
+
+    None matters here rather than being tidied away: for a halt, not knowing is
+    a different answer from knowing the name is fine, and the rules treat it as
+    such.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    raise GuardrailUsageError(
+        f"{label} has to be true, false, or left unset when nobody knows, but it "
+        f"is {value!r}."
+    )
+
+
+def _clean_symbol_owners(owners, label: str = "AccountState.symbols_held_elsewhere"):
+    """The map of which other book has which symbol, with both ends tidied up.
+
+    Comes in as {symbol: book id} and goes out the same shape, with the symbols
+    upper-cased the way every other symbol in this file is and the book ids run
+    through the same check an order's book id gets. None means an empty map.
+    """
+    if owners is None:
+        return {}
+    if not isinstance(owners, dict):
+        raise GuardrailUsageError(
+            f"{label} has to be a list of which book has which symbol, such as "
+            '{"AAPL": "B"}, but it is a ' + f"{type(owners).__name__}."
+        )
+    return {
+        _clean_symbol(symbol, f"a symbol in {label}"): _clean_book_id(
+            book_id, f"the book id for {symbol} in {label}"
+        )
+        for symbol, book_id in owners.items()
+    }
+
+
 def _clean_book_id(book_id: str, label: str) -> str:
     """Book ids are short and upper case, so A and " a " mean the same book."""
     if not isinstance(book_id, str) or not book_id.strip():
@@ -2178,6 +2277,8 @@ def check_order(g: Guardrails, state: AccountState, intent: OrderIntent) -> Deci
     _check_account(g, state, decision)
     _check_book(g, state, intent, decision)
     _check_kill_switch(g, state, intent, decision)
+    _check_symbol_exclusivity(g, state, intent, decision)
+    _check_halt_state(g, state, intent, decision)
     _check_instrument(g, intent, decision)
     _check_shorting(g, state, intent, decision)
     _check_short_discipline(g, state, intent, decision)
@@ -2262,6 +2363,133 @@ def _check_kill_switch(
         f"positions. This order is a {intent.purpose} order. Delete that file to "
         "let the agent trade again.",
     )
+
+
+def _opens_or_increases_position(state: AccountState, intent: OrderIntent) -> bool:
+    """True when this order would leave the book with a bigger bet on the symbol.
+
+    Buying 100 back against a 100 share short is a cover and changes nothing;
+    buying 150 leaves 50 shares of brand new length. Selling 100 out of a 100
+    share holding is an exit; selling 150 leaves 50 shares borrowed. Either way,
+    only the part that goes past flat counts as opening something.
+    """
+    held = state.held_qty(intent.symbol)
+    if intent.side == "BUY":
+        return intent.qty > max(0, -held)
+    return intent.qty > max(0, held)
+
+
+def _check_symbol_exclusivity(
+    g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
+) -> None:
+    """Two books may never be in the same name at the same time.
+
+    IBKR nets positions by symbol inside the one shared paper account. If book A
+    is long 100 AAPL and book B buys 100 more, the broker reports one line of
+    200 shares and there is no way left to say whose is whose. Reconciliation
+    would be guessing, and a book that has lost track of what it holds sizes its
+    next order off a number that is not true. So the second book does not get
+    in. Added 2026-09-06 at the review team's request, as a blocking finding.
+
+    Getting out is never blocked by this rule. An exit, a stop or a flatten that
+    reduces this book's own position goes through untouched, because refusing
+    the way out of a trade is worse than any duplication this rule prevents.
+    """
+    owner = state.symbol_owner(intent.symbol)
+    if owner is None:
+        return
+
+    # If the map names this book itself, there is nobody to be exclusive
+    # against. That happens when the loop hands in every book's holdings
+    # including our own, which is an easy mistake to make and a harmless one.
+    ours = {
+        book_id
+        for book_id in (g.book_id, state.book_id, intent.book_id)
+        if book_id is not None
+    }
+    if owner in ours:
+        return
+
+    if intent.purpose != "entry" and not _opens_or_increases_position(state, intent):
+        return
+
+    decision.add(
+        "symbol_exclusive",
+        f"Book {owner} already holds {intent.symbol} or has a working order in it, "
+        f"so {_pot_words(g.book_id)} may not open a position in it as well. IBKR "
+        "nets positions by symbol inside the one shared paper account, so the "
+        "second book's shares would disappear into the first book's line and "
+        f"neither book could be reconciled afterwards. Book {owner} got there "
+        "first, and first come, first served is how that is settled. Getting out "
+        "of something this book already holds is never blocked by this rule.",
+    )
+
+
+def _halt_unknown_fields(intent: OrderIntent) -> list[str]:
+    """Which of the two halt facts the loop did not manage to report."""
+    missing: list[str] = []
+    if intent.halted is None:
+        missing.append("whether the name is halted")
+    if intent.limit_state is None:
+        missing.append("whether it is sitting in a limit-up limit-down band")
+    return missing
+
+
+def _check_halt_state(
+    g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
+) -> None:
+    """Is this name tradeable at all right now?
+
+    Three refusals live under the one rule id, because they are one question
+    asked three ways. A halted name takes nothing but a way out. A name in a
+    limit-up limit-down band takes no new positions, because that band is the
+    step immediately before a volatility halt. And a name whose halt status
+    nobody could tell us takes no new positions either.
+
+    That last one is the point of the rule (review team, 2026-09-06). Deciding
+    to buy a name without knowing whether it is even trading is the failure they
+    named, and reading a missing answer as "fine" is how it would happen. So an
+    unknown status is refused the same way an unknown borrow cost is.
+    """
+    if intent.halted is True and intent.purpose not in HALT_ALLOWED_PURPOSES:
+        decision.add(
+            "halted",
+            f"Trading in {intent.symbol} is halted, so this {intent.purpose} order "
+            "cannot be sent. While a name is halted the agent may only get out of "
+            f"it, which means an {' or a '.join(HALT_ALLOWED_PURPOSES)} order. "
+            "Parking a fresh order in a name whose next printed price nobody knows "
+            "is how a halt turns into a bad fill on the reopen.",
+        )
+
+    if intent.purpose != "entry":
+        return
+
+    if intent.limit_state is True:
+        decision.add(
+            "halted",
+            f"{intent.symbol} is sitting in a limit-up limit-down band, which is the "
+            "step immediately before a volatility halt, so no new position is opened "
+            "in it. Getting out of one is still allowed.",
+        )
+
+    missing = _halt_unknown_fields(intent)
+    if missing:
+        decision.add(
+            "halted",
+            f"This order would open a position in {intent.symbol}, and the halt "
+            f"status was not available: nobody told this check "
+            f"{_join_with_and(missing)}. An unknown halt status is refused rather "
+            "than read as a clean name, because deciding to buy something without "
+            "knowing whether it is even trading is the failure this rule exists to "
+            "prevent. Getting out of a position is never blocked by it.",
+        )
+
+
+def _join_with_and(parts: list[str]) -> str:
+    """A, B and C, the way a person writes a list."""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 def _check_instrument(g: Guardrails, intent: OrderIntent, decision: Decision) -> None:

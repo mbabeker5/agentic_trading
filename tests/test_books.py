@@ -1474,3 +1474,256 @@ def test_a_book_config_is_a_plain_readable_record():
     ) == ("A", "BOOK_A", "strategies/momentum_hybrid", 100000.0, True, "dry_run")
     assert book.model == "openrouter/anthropic/claude-fable-5.1"
     assert copy.copy(book) == book
+
+
+# ---------------------------------------------------------------------------
+# Cross-book symbol exclusivity, and halted names
+#
+# Both rules were added on 2026-09-06 at the review team's request, and both are
+# blocking findings rather than nice to have. The first says two books may never
+# be in the same name at once, because IBKR nets positions by symbol inside the
+# one shared paper account. The second says an order never goes out into a name
+# that is halted, is in a limit-up limit-down band, or whose halt status nobody
+# could tell us.
+# ---------------------------------------------------------------------------
+
+
+def state_with_others(book_id: str, others: dict[str, str], **kwargs) -> AccountState:
+    """One book's snapshot, plus a map of what the other books already have.
+
+    The loop builds that map by reading every book's state, because only the
+    loop sees all five books at once. Here it is written out by hand.
+    """
+    return dataclasses.replace(
+        book_state(book_id, **kwargs), symbols_held_elsewhere=others
+    )
+
+
+def closing(
+    book_id: str,
+    symbol: str = "AAPL",
+    qty: int = 100,
+    purpose: str = "exit",
+    **kwargs,
+) -> OrderIntent:
+    """An order that gets the book out of something it already holds."""
+    return OrderIntent(
+        symbol=symbol, side="SELL", qty=qty, purpose=purpose, book_id=book_id, **kwargs
+    )
+
+
+def reason_for(decision, rule_id: str) -> str:
+    """The sentence written for one rule, so a test can read what it says."""
+    for reason, fired in zip(decision.reasons, decision.rule_ids):
+        if fired == rule_id:
+            return reason
+    raise AssertionError(f"{rule_id} did not fire: {decision.rule_ids}")
+
+
+# --- Rule one: one symbol, one book -----------------------------------------
+
+
+def test_a_name_another_book_already_has_is_closed_to_this_book():
+    """Book B has AAPL, so book A does not get in, however sensible the trade."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        state_with_others("A", {"AAPL": "B"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert decision.allowed is False
+    assert "symbol_exclusive" in decision.rule_ids
+
+    reason = reason_for(decision, "symbol_exclusive")
+    assert "Book B" in reason and "AAPL" in reason
+    assert "first come, first served" in reason
+
+
+def test_getting_out_of_our_own_position_is_never_blocked_by_the_exclusivity_rule():
+    """Book A holds AAPL and book B has it too. A may still sell its own out."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    state = state_with_others(
+        "A", {"AAPL": "B"}, positions={"AAPL": position("AAPL", 100, 50.0)}
+    )
+    for purpose in ("exit", "stop", "flatten"):
+        decision = check_order(momentum, state, closing("A", "AAPL", 100, purpose))
+        assert decision.allowed is True, (purpose, decision.summary)
+        assert "symbol_exclusive" not in decision.rule_ids
+
+
+def test_an_entry_in_a_name_no_other_book_has_goes_straight_through():
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        state_with_others("A", {"MSFT": "B", "NVDA": "E"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert decision.allowed is True, decision.summary
+
+
+def test_an_empty_map_of_other_books_shuts_nobody_out():
+    """The rule is silent until the loop actually hands it something."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    for others in ({}, None):
+        decision = check_order(
+            momentum,
+            state_with_others("A", others),
+            buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+        )
+        assert decision.allowed is True, (others, decision.summary)
+
+
+def test_a_book_is_never_shut_out_of_a_name_by_its_own_row_in_the_map():
+    """A loop that hands in every book's holdings, ours included, is harmless."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        state_with_others("A", {"AAPL": "A"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert decision.allowed is True, decision.summary
+
+
+def test_the_map_of_other_books_is_read_however_it_is_typed():
+    """Symbols and book ids are tidied the same way they are everywhere else."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        state_with_others("A", {" aapl ": " b "}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert decision.allowed is False
+    assert "symbol_exclusive" in decision.rule_ids
+
+
+def test_a_nonsense_entry_in_the_map_of_other_books_is_refused_at_the_door():
+    with pytest.raises(GuardrailUsageError, match="not a book id"):
+        state_with_others("A", {"AAPL": "book B"})
+
+
+def test_the_tie_break_between_two_books_is_named_and_left_to_the_loop():
+    """The constant is the contract. Nothing in the guardrails implements it."""
+    from agent.guardrails import SYMBOL_TIE_BREAK
+
+    assert SYMBOL_TIE_BREAK == "first_come_first_served"
+
+
+# --- Rule two: halted and limit-state names ---------------------------------
+
+
+def test_a_halted_name_takes_nothing_but_a_way_out():
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    state = book_state("A", positions={"AAPL": position("AAPL", 100, 50.0)})
+
+    entry = check_order(
+        momentum, state, buy("A", symbol="AAPL", qty=10, limit_price=50.0, halted=True)
+    )
+    assert entry.allowed is False
+    assert "halted" in entry.rule_ids
+    assert "halted" in reason_for(entry, "halted")
+
+    # A fresh stop order is not a way out, it is an order parked in a name whose
+    # next printed price nobody knows, so it is refused with everything else.
+    stop = check_order(momentum, state, closing("A", "AAPL", 100, "stop", halted=True))
+    assert stop.allowed is False
+    assert "halted" in stop.rule_ids
+
+    for purpose in ("exit", "flatten"):
+        out = check_order(
+            momentum, state, closing("A", "AAPL", 100, purpose, halted=True)
+        )
+        assert out.allowed is True, (purpose, out.summary)
+
+
+def test_a_name_in_a_limit_up_limit_down_band_takes_no_new_position():
+    """The band is the step before a volatility halt, so nothing new goes in."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    state = book_state("A", positions={"AAPL": position("AAPL", 100, 50.0)})
+
+    entry = check_order(
+        momentum,
+        state,
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0, limit_state=True),
+    )
+    assert entry.allowed is False
+    assert "halted" in entry.rule_ids
+    assert "limit-up limit-down" in reason_for(entry, "halted")
+
+    # Unlike a halt, a band stops new bets only. Every way out still works.
+    for purpose in ("exit", "stop", "flatten"):
+        out = check_order(
+            momentum, state, closing("A", "AAPL", 100, purpose, limit_state=True)
+        )
+        assert out.allowed is True, (purpose, out.summary)
+
+
+def test_an_unknown_halt_status_stops_an_entry_and_says_exactly_that():
+    """Not knowing is a different answer from knowing the name is fine."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    state = book_state("A")
+
+    decision = check_order(
+        momentum, state, buy("A", symbol="AAPL", qty=10, limit_price=50.0, halted=None)
+    )
+    assert decision.allowed is False
+    assert "halted" in decision.rule_ids
+    assert "halt status was not available" in reason_for(decision, "halted")
+
+
+def test_an_unknown_limit_band_stops_an_entry_the_same_way():
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0, limit_state=None),
+    )
+    assert decision.allowed is False
+    assert "halt status was not available" in reason_for(decision, "halted")
+
+
+def test_an_unknown_halt_status_never_blocks_the_way_out():
+    """Refusing an exit because nobody answered would be the worse mistake."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    state = book_state("A", positions={"AAPL": position("AAPL", 100, 50.0)})
+    for purpose in ("exit", "stop", "flatten"):
+        out = check_order(
+            momentum,
+            state,
+            closing("A", "AAPL", 100, purpose, halted=None, limit_state=None),
+        )
+        assert out.allowed is True, (purpose, out.summary)
+
+
+def test_a_halt_flag_that_is_neither_true_nor_false_is_refused_at_the_door():
+    for field in ("halted", "limit_state"):
+        with pytest.raises(GuardrailUsageError, match="true, false, or left unset"):
+            OrderIntent(
+                symbol="AAPL",
+                side="BUY",
+                qty=10,
+                limit_price=50.0,
+                book_id="A",
+                **{field: "no idea"},
+            )
+
+
+def test_both_new_rule_ids_can_block_an_order():
+    """One scenario each, so neither of them can quietly stop working."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    scenarios = {
+        "symbol_exclusive": (
+            state_with_others("A", {"AAPL": "B"}),
+            buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+        ),
+        "halted": (
+            book_state("A"),
+            buy("A", symbol="AAPL", qty=10, limit_price=50.0, halted=True),
+        ),
+    }
+    for rule_id, (state, intent) in scenarios.items():
+        decision = check_order(momentum, state, intent)
+        assert decision.allowed is False, rule_id
+        assert rule_id in decision.rule_ids, (rule_id, decision.rule_ids)
+        # Plain language check: every reason is a real sentence, not a code.
+        for reason in decision.reasons:
+            assert reason.endswith(".") and len(reason.split()) >= 6, reason
