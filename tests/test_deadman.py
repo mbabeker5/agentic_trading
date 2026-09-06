@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -141,6 +141,57 @@ def test_a_holiday_is_not_a_trading_day():
     schedule = dm.Schedule(holidays=("2026-09-08",))
     assert not dm.in_market_hours(at(11, 0), schedule), (
         "the loop is meant to be quiet on a holiday")
+
+
+# ------------------------------------------------- how long a silence has to be
+
+def test_the_silence_is_three_ticks_of_whatever_the_cadence_is():
+    """Three missed ticks, and never less than fifteen minutes.
+
+    The number used to be written out as a constant. A book moved to a thirty
+    minute clock would then have been called dead twenty five minutes into a
+    perfectly normal gap between two of its own ticks.
+    """
+    assert dm.Schedule(loop_minutes=5).stale_after == timedelta(minutes=15)
+    assert dm.Schedule(loop_minutes=10).stale_after == timedelta(minutes=30)
+    assert dm.Schedule(loop_minutes=30).stale_after == timedelta(minutes=90)
+
+
+def test_the_fifteen_minute_floor_holds_under_a_fast_cadence():
+    """Half a minute times three is a minute and a half, and that is far too jumpy."""
+    assert dm.Schedule(loop_minutes=1).stale_after == dm.STALE_FLOOR
+    assert dm.Schedule(loop_minutes=1).stale_after == timedelta(minutes=15)
+    assert dm.Schedule(loop_minutes=0).stale_after == timedelta(minutes=15), (
+        "a cadence of zero is nonsense and must not divide the limit to nothing")
+
+
+def test_the_real_settings_file_gives_the_fifteen_minutes_this_file_always_used():
+    schedule = dm.load_schedule()
+    assert schedule.loop_minutes == 5
+    assert schedule.stale_after == timedelta(minutes=15)
+
+
+def test_a_look_with_no_limit_given_takes_it_from_the_settings(sent, home):
+    """Nobody passes stale_after in production, so the settings have to decide."""
+    touch(home, "heartbeat", at(11, 0))
+
+    class ExplodingBroker:
+        def portfolio(self, *a, **k):
+            raise AssertionError("a healthy loop must not cost a broker call")
+
+        def open_orders(self, *a, **k):
+            raise AssertionError("a healthy loop must not cost a broker call")
+
+    verdict = dm.look(ExplodingBroker(), at(11, 20), home,
+                      schedule=dm.Schedule(loop_minutes=10))
+    assert not verdict.stale, (
+        "twenty minutes is inside three ticks of a ten minute cadence")
+    assert "30 minute limit" in verdict.reason
+
+    broker = FakeBroker(bars={"SPY": bars_from(700.0)}, account_id="DUT077572",
+                        now=at(9, 30))
+    verdict = dm.look(broker, at(11, 20), home, schedule=dm.Schedule(loop_minutes=5))
+    assert verdict.stale, "twenty minutes is past three ticks of five minutes"
 
 
 # ----------------------------------------------------- whose position is that

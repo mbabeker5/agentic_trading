@@ -20,7 +20,10 @@ WHAT IT DOES
 Every five minutes between 09:30 and 16:00 on a weekday it asks three questions,
 in this order, and stops at the first no:
 
-    1. Is the loop's heartbeat older than fifteen minutes?
+    1. Is the loop's heartbeat older than three of its own ticks?
+       That is schedule.loop_minutes in config/guardrails.yaml times three,
+       and never less than fifteen minutes. On today's five minute cadence
+       it is fifteen; move the cadence and this moves with it.
     2. Is the market actually open right now?
     3. Does the broker hold any position, or any working order, that carries a
        BOOK_ order reference?
@@ -40,17 +43,19 @@ it is listed in the output and named in the alert, and it never causes an order.
 Only a book's own exposure counts, because only a book's exposure was being
 managed by the thing that died.
 
-Questions 1 and 2 have to be answered together. Outside market hours a fifteen
-minute silence is not a fault, it is a Tuesday evening.
+Questions 1 and 2 have to be answered together. Outside market hours a quarter
+of an hour of silence is not a fault, it is a Tuesday evening.
 
 WHERE THE HEARTBEAT COMES FROM
 ------------------------------
 The newest change time among these, all under output/:
 
     heartbeat              if this file exists at all, it wins outright and
-                           nothing else is looked at. Nothing writes it today.
-                           It is here so that when the loop starts touching one
-                           file per tick, this reads that and stops guessing.
+                           nothing else is looked at. agent/loop.py touches it
+                           at the very end of every tick that got all the way
+                           through, so it is the real answer rather than a
+                           guess: a log line can be written by a tick that then
+                           fell over, and this file cannot.
     loop.log               one line per book per tick, appended every tick
     tick_YYYY-MM-DD.log    everything one day's ticks printed
     state_BOOK_*_*.json    one file per book per day, rewritten every tick
@@ -119,10 +124,24 @@ from paths import config_dir, output_dir, project_root  # noqa: E402
 
 EASTERN = ZoneInfo("America/New_York")
 
-#: How long the loop may be quiet during market hours before this counts it as
-#: dead. Three missed ticks at five minutes each. The watchdog shouts at two
-#: missed ticks, so Mo always hears about it before anything is traded.
-STALE_AFTER = timedelta(minutes=15)
+#: The shortest silence that ever counts as dead, whatever the cadence says.
+#: Fifteen minutes. Below this the handle would be firing on the ordinary jitter
+#: of a Mac that was busy for a moment, and a kill switch pulled by mistake costs
+#: more than one late tick.
+STALE_FLOOR = timedelta(minutes=15)
+
+#: How many missed ticks make a silence. Three, against the watchdog's two, so
+#: Mo hears the watchdog shouting before this thing flattens anything.
+MISSED_TICKS = 3
+
+#: The default when nobody has read config/guardrails.yaml: three missed ticks at
+#: the five minute cadence, which is the floor anyway. The real number comes from
+#: Schedule.stale_after below, so a cadence change in the settings moves this
+#: without anybody remembering to edit it here. That is the whole point: it used
+#: to be fifteen minutes written out as a constant, and a book moved to a thirty
+#: minute clock would have been called dead twenty five minutes into a normal
+#: gap between its ticks.
+STALE_AFTER = STALE_FLOOR
 
 #: The one file that wins outright when it exists.
 HEARTBEAT_NAME = "heartbeat"
@@ -186,11 +205,29 @@ def heartbeat(root: Path | None = None) -> Heartbeat:
 
 @dataclass(frozen=True)
 class Schedule:
-    """When the market is open, read from config/guardrails.yaml."""
+    """When the market is open and how often the loop wakes, from guardrails.yaml."""
 
     open_at: clock_time = clock_time(9, 30)
     close_at: clock_time = clock_time(16, 0)
     holidays: tuple = ()
+    loop_minutes: int = 5
+
+    @property
+    def stale_after(self) -> timedelta:
+        """How long a silence has to run before the loop counts as dead.
+
+        Three missed ticks at whatever cadence schedule.loop_minutes says, and
+        never less than the fifteen minute floor. So the ordinary five minute
+        cadence gives the fifteen minutes this file has always used, and moving
+        the cadence to ten minutes moves this to thirty on its own rather than
+        leaving a hard coded number behind that calls a healthy loop dead.
+
+        agent/watchdog.py works out its own limit the same way at two missed
+        ticks rather than three, so Mo hears it shouting before this thing
+        flattens anything.
+        """
+        interval = max(1, int(self.loop_minutes or 5))
+        return max(STALE_FLOOR, timedelta(minutes=MISSED_TICKS * interval))
 
 
 def load_schedule() -> Schedule:
@@ -216,10 +253,16 @@ def load_schedule() -> Schedule:
         except (TypeError, ValueError):
             return fallback
 
+    try:
+        minutes = int(block.get("loop_minutes") or default.loop_minutes)
+    except (TypeError, ValueError):
+        minutes = default.loop_minutes
+
     return Schedule(
         open_at=parse(block.get("scan_start"), default.open_at),
         close_at=parse(block.get("market_close"), default.close_at),
         holidays=tuple(str(day) for day in (block.get("holidays") or [])),
+        loop_minutes=minutes,
     )
 
 
@@ -374,14 +417,21 @@ class Verdict:
 
 
 def look(broker, now: datetime, root: Path | None = None,
-         stale_after: timedelta = STALE_AFTER,
+         stale_after: timedelta | None = None,
          schedule: Schedule | None = None) -> Verdict:
     """Work out whether the loop is dead and whether that matters. Trades nothing.
 
     The broker is only asked anything when the first two answers are already
     yes. A healthy loop means this job never touches IB Gateway at all, which is
     the point: seventy-eight wake ups a day should cost nothing.
+
+    stale_after left out means the settings decide: three missed ticks at
+    schedule.loop_minutes, never under fifteen minutes. Pass one to override it,
+    which is what a test does.
     """
+    schedule = schedule or load_schedule()
+    if stale_after is None:
+        stale_after = schedule.stale_after
     beat = heartbeat(root)
     market_hours = in_market_hours(now, schedule)
     age = beat.age(now)
