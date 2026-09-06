@@ -2,7 +2,9 @@
 
 Runs half an hour before the market opens, once, on weekdays. It asks five
 questions, writes the answers down, and if any of them is a no it creates the
-file output/NO_TRADE_TODAY and tells Mo which check failed.
+file output/NO_TRADE_TODAY and tells Mo which check failed. It asks a sixth
+question too, about whether IBKR's scanner filters work on this account, but
+that one only ever records an answer and can never stop the day.
 
     /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
       /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preflight.py
@@ -22,8 +24,8 @@ things remove it: agent/reenable.sh, and deleting it by hand. It is not cleared
 automatically at midnight, on purpose. A morning that failed its checks should
 need a person to look before the agent trades again.
 
-The five checks
----------------
+The five checks that can stop the day
+-------------------------------------
 
 1. gateway_login   IB Gateway is running, port 4002 is open, and a read only
                    connection comes back with the paper account DUT077572.
@@ -34,13 +36,34 @@ The five checks
 3. scanner         agent/scanner.py runs to completion and exits cleanly. At
                    9 AM the shortlist is usually empty, because the market has
                    not opened, and that is fine. It is the run that has to work,
-                   not the result.
+                   not the result. Two things make it a hard failure: exit code
+                   3, which is the scanner refusing to believe its own scan, and
+                   any IBKR error 162, 165 or 365 sitting in the scan
+                   diagnostics of the file it wrote.
 4. reconcile       What the books think they hold matches what the broker says
                    they hold, symbol by symbol. With no book state files yet,
                    this reports "no books active" and passes.
 5. day_trades      Every day trade counter file present can be read.
                    agent/pdt.py writes one per book as output/pdt_BOOK_A.json.
                    Missing files pass; a corrupt one fails.
+
+The sixth question, which never fails the day
+---------------------------------------------
+
+6. scanner_filters_enabled
+
+   One filtered scan, priceAbove 5, run through the same truth check as the real
+   scans, purely to record whether IBKR's scanner filters work on this account
+   today. On 2026-09-06 they did not: every filter made the scan return zero
+   rows with error 162, "Scanner filter X is disabled", so agent/scanner.py
+   stopped sending filters entirely and now does all its filtering in our own
+   code. Mo has since paid for market data, and this probe is how the morning
+   log answers whether that changed anything, without anyone having to remember
+   to check by hand.
+
+   It passes whatever it finds. A false here is the state the scanner is already
+   built for, and a true would be good news, not an emergency. Read the answer
+   in facts.filters_enabled in the day's report.
 
 What it writes
 --------------
@@ -79,8 +102,28 @@ EASTERN = ZoneInfo("America/New_York")
 #: 201 (scanner) and 250 (watchdog).
 CLIENT_ID = 251
 
+#: A second id for the scanner filter probe, which opens its own short lived
+#: read only connection so it cannot disturb the one above.
+FILTER_PROBE_CLIENT_ID = 252
+
 #: The scanner can take a few minutes when IBKR is slow. Past this it is broken.
 SCANNER_TIMEOUT_SECONDS = 300
+
+#: agent/scanner.py returns this when a scan could not be trusted. Distinct from
+#: 1, which means it could not reach Gateway at all.
+SCANNER_EXIT_SCAN_FAILURE = 3
+
+#: The single line of JSON agent/scanner.py prints on stderr when it exits 3.
+SCAN_FAILURE_MARKER = "SCAN_FAILURE_JSON "
+
+#: IBKR codes that mean a scan result cannot be believed. 162 is "Scanner filter
+#: X is disabled", 165 is the scanner service refusing the query, 365 is "no
+#: scanner subscription found". Any of them in a scan's diagnostics fails the
+#: morning, even if the scanner itself exited 0.
+SCAN_HARD_ERROR_CODES = (162, 165, 365)
+
+#: The one benign 162. IBKR sends it to confirm a finished one-shot scan closed.
+BENIGN_162_TEXT = "scanner subscription cancelled"
 
 #: How far the books and the broker may disagree on a share count before it is a
 #: problem. Shares are whole numbers, so this is only here to absorb the way
@@ -90,11 +133,15 @@ POSITION_TOLERANCE = 0.001
 CHECK_GATEWAY = "gateway_login"
 CHECK_MARKET_DATA = "market_data"
 CHECK_SCANNER = "scanner"
+CHECK_SCANNER_FILTERS = "scanner_filters_enabled"
 CHECK_RECONCILE = "reconcile"
 CHECK_DAY_TRADES = "day_trades"
 
 CHECK_ORDER = (CHECK_GATEWAY, CHECK_MARKET_DATA, CHECK_SCANNER,
-               CHECK_RECONCILE, CHECK_DAY_TRADES)
+               CHECK_SCANNER_FILTERS, CHECK_RECONCILE, CHECK_DAY_TRADES)
+
+#: Checks that record an answer and never stop the day, whatever they find.
+INFORMATIONAL_CHECKS = frozenset({CHECK_SCANNER_FILTERS})
 
 
 @dataclass
@@ -139,14 +186,70 @@ def check_gateway_and_data() -> tuple[Result, Result]:
     return login, market
 
 
+def read_scan_failure(stderr: str) -> dict:
+    """The scanner's own account of why it refused to believe a scan.
+
+    agent/scanner.py prints one line of JSON on stderr before it exits 3, so the
+    error codes and messages survive the trip between the two processes and end
+    up in the alert instead of being lost in a log nobody opens.
+    """
+    for line in reversed((stderr or "").splitlines()):
+        line = line.strip()
+        if line.startswith(SCAN_FAILURE_MARKER):
+            try:
+                loaded = json.loads(line[len(SCAN_FAILURE_MARKER):])
+            except json.JSONDecodeError:
+                return {}
+            return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+def hard_scan_errors(diagnostics) -> list[dict]:
+    """Every 162, 165 or 365 sitting in a written scan_diagnostics block.
+
+    Belt and braces. agent/scanner.py already refuses to write a file when a scan
+    carries one of these, so finding one here means either an older file or a
+    path through the scanner nobody thought of. Either way the morning stops.
+
+    The one 162 that is skipped is "API scanner subscription cancelled", which
+    IBKR sends to confirm a finished one-shot scan has closed. It arrives on
+    every healthy run, so treating it as a failure would stop every morning.
+    """
+    found: list[dict] = []
+    if not isinstance(diagnostics, dict):
+        return found
+    for scan_code, block in diagnostics.items():
+        if not isinstance(block, dict):
+            continue
+        for entry in block.get("errors") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                code = int(entry.get("code"))
+            except (TypeError, ValueError):
+                continue
+            message = str(entry.get("message") or "")
+            if code not in SCAN_HARD_ERROR_CODES:
+                continue
+            if code == 162 and BENIGN_162_TEXT in message.lower():
+                continue
+            found.append({"scan_code": scan_code, "code": code, "message": message})
+    return found
+
+
 def check_scanner(out_path: Path) -> Result:
     """Run agent/scanner.py as its own process and insist it exits cleanly.
 
     Its own process because the scanner talks to IBKR's scanner service, which
     can hang, and a hung scanner must not take the pre-flight down with it.
 
-    An empty shortlist at 9 AM is normal and passes. Only a crash, a timeout or
-    a non zero exit code fails.
+    An empty shortlist at 9 AM is normal and passes: the market has not opened,
+    so nothing has gapped yet. What must never pass is an empty shortlist that
+    came from a broken scan, and there are two ways of catching that. Exit code
+    3 is the scanner itself saying it did not believe its own scan, and it wrote
+    nothing rather than leave an empty file behind. Error 162, 165 or 365 in the
+    scan diagnostics of a file it did write is the same thing found afterwards.
+    Both fail the morning and both name the codes in the alert.
     """
     script = agent_dir() / "scanner.py"
     python = venv_python()
@@ -167,6 +270,26 @@ def check_scanner(out_path: Path) -> Result:
     except Exception as exc:                                      # noqa: BLE001
         return Result(CHECK_SCANNER, False, f"The scanner would not start: {exc}.")
 
+    if finished.returncode == SCANNER_EXIT_SCAN_FAILURE:
+        failure = read_scan_failure(finished.stderr or "")
+        codes = failure.get("codes") or []
+        errors = failure.get("errors") or []
+        spoken = "; ".join(
+            f"IBKR {e.get('code')}: {str(e.get('message') or '').strip()}"
+            for e in errors if isinstance(e, dict)) or str(
+                failure.get("message") or "no detail was given")
+        return Result(
+            CHECK_SCANNER, False,
+            "The scanner did not believe its own scan and wrote nothing, so "
+            f"{out_path.name} still holds whatever was there before. "
+            f"{spoken}. An empty shortlist and a broken scanner must never look "
+            "the same, which is why this stops the day.",
+            facts={"exit_code": SCANNER_EXIT_SCAN_FAILURE,
+                   "error_codes": codes,
+                   "errors": errors,
+                   "scan_diagnostics": failure.get("scan_diagnostics") or {},
+                   "wrote_shortlist": False})
+
     if finished.returncode != 0:
         tail = (finished.stderr or finished.stdout or "").strip().splitlines()
         return Result(CHECK_SCANNER, False,
@@ -175,9 +298,12 @@ def check_scanner(out_path: Path) -> Result:
                       facts={"exit_code": finished.returncode})
 
     found = 0
+    diagnostics: dict = {}
     try:
         written = json.loads(out_path.read_text(encoding="utf-8"))
         if isinstance(written, dict):
+            raw = written.get("scan_diagnostics")
+            diagnostics = raw if isinstance(raw, dict) else {}
             for key in ("candidates", "shortlist", "results", "rows"):
                 if isinstance(written.get(key), list):
                     found = len(written[key])
@@ -189,10 +315,137 @@ def check_scanner(out_path: Path) -> Result:
                       f"The scanner exited cleanly but {out_path} is missing or "
                       "not readable JSON.")
 
+    bad = hard_scan_errors(diagnostics)
+    if bad:
+        spoken = "; ".join(
+            f"{e['scan_code']} got IBKR {e['code']}: {e['message'].strip()}"
+            for e in bad)
+        return Result(
+            CHECK_SCANNER, False,
+            "The scanner exited cleanly but its own diagnostics carry errors "
+            f"that mean the results cannot be believed. {spoken}. A shortlist "
+            "built on those is not evidence of anything.",
+            facts={"exit_code": 0, "candidates": found,
+                   "error_codes": sorted({e["code"] for e in bad}),
+                   "errors": bad,
+                   "scan_diagnostics": diagnostics})
+
+    scans = ", ".join(sorted(diagnostics)) or "none recorded"
     return Result(CHECK_SCANNER, True,
                   f"The scanner ran cleanly and wrote {found} candidates to "
-                  f"{out_path.name}. An empty list before the open is normal.",
-                  facts={"candidates": found, "exit_code": 0})
+                  f"{out_path.name}. An empty list before the open is normal. "
+                  f"Scans run: {scans}.",
+                  facts={"candidates": found, "exit_code": 0,
+                         "scan_diagnostics": diagnostics})
+
+
+#: The filters the probe tries, and nothing else. priceAbove is the headline one,
+#: because it is the filter the scanner used to send. stVolume5MinAbove is here
+#: because it is the one a 9:35 gap scan would actually want, and because on
+#: 2026-09-06 the two gave different answers on the same account within the same
+#: minute: priceAbove worked and stVolume5MinAbove returned nothing. A single
+#: filter is not evidence about the rest of them.
+FILTER_PROBES = (("priceAbove", "5"), ("stVolume5MinAbove", "100000"))
+
+
+def check_scanner_filters() -> Result:
+    """Do IBKR's scanner filters work on this account today? Record, never block.
+
+    Runs a filtered scan through the same truth check the real scans go through,
+    and writes down true or false for each filter tried. On the morning of
+    2026-09-06 the answer was false for every filter: they all returned zero rows
+    with error 162, "Scanner filter X is disabled", while the unfiltered control
+    returned 50. By that afternoon, after Mo paid for market data, priceAbove and
+    volumeAbove had started working while stVolume5MinAbove and marketCapAbove
+    still returned nothing.
+
+    That mixed answer is the reason this probe exists and the reason
+    agent/scanner.py still sends no filters at all. A filter set where some
+    entries work and some silently return an empty list, with no way to tell
+    which from the outside, is worse than one that is plainly off. Nothing here
+    changes what the scanner does. It records what IBKR is doing today so the
+    change is noticed the day it happens rather than a month later.
+
+    It always passes. There is no state of the world where this probe alone
+    should stop the agent trading.
+    """
+    facts: dict = {"filters_enabled": None, "probes": {},
+                   "filter_tried": f"{FILTER_PROBES[0][0]} {FILTER_PROBES[0][1]}"}
+    try:
+        from ib_async import IB, ScannerSubscription, TagValue
+
+        from scan_truth import ScanFailure, checked_scan
+    except Exception as exc:                                      # noqa: BLE001
+        facts["note"] = f"could not load the scanner libraries: {exc}"
+        return Result(CHECK_SCANNER_FILTERS, True,
+                      "Could not run the filter probe, so today's log has no "
+                      f"answer about IBKR's scanner filters: {exc}.", facts=facts)
+
+    ib = IB()
+    try:
+        ib.connect(wd.GATEWAY_HOST, wd.GATEWAY_PORT,
+                   clientId=FILTER_PROBE_CLIENT_ID, readonly=True, timeout=20)
+    except Exception as exc:                                      # noqa: BLE001
+        facts["note"] = f"could not connect: {exc}"
+        return Result(CHECK_SCANNER_FILTERS, True,
+                      "Could not reach Gateway for the scanner filter probe, so "
+                      f"today's log has no answer: {exc}.", facts=facts)
+
+    def subscription():
+        return ScannerSubscription(instrument="STK", locationCode="STK.US.MAJOR",
+                                   scanCode="TOP_PERC_GAIN", numberOfRows=50)
+
+    try:
+        for tag, value in FILTER_PROBES:
+            answer: dict = {"tag": tag, "value": value}
+            try:
+                filtered, control = checked_scan(
+                    ib, subscription, [TagValue(tag, value)])
+            except ScanFailure as failure:
+                answer["enabled"] = False
+                answer["rows"] = 0
+                answer["errors"] = [{"code": code, "message": message}
+                                    for code, message in failure.errors]
+                answer["note"] = str(failure)
+            else:
+                answer["enabled"] = True
+                answer["rows"] = len(filtered.rows)
+                answer["control_rows"] = len(control.rows)
+            facts["probes"][tag] = answer
+    except Exception as exc:                                      # noqa: BLE001
+        facts["note"] = f"the probe itself failed: {exc}"
+        return Result(CHECK_SCANNER_FILTERS, True,
+                      f"The scanner filter probe failed on its own: {exc}. No "
+                      "answer today.", facts=facts)
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    headline = facts["probes"].get(FILTER_PROBES[0][0], {})
+    facts["filters_enabled"] = headline.get("enabled")
+    working = sorted(t for t, a in facts["probes"].items() if a.get("enabled"))
+    broken = sorted(t for t, a in facts["probes"].items() if a.get("enabled") is False)
+
+    if working and broken:
+        detail = (f"IBKR's scanner filters are half on for this account: {', '.join(working)} "
+                  f"returned rows and {', '.join(broken)} returned nothing at all. "
+                  "That mixture is worse than all of them being off, because there "
+                  "is no way to tell from a result which kind you got. The scanner "
+                  "sends no filters and does its own filtering, so nothing is "
+                  "broken by this.")
+    elif working:
+        detail = (f"IBKR's scanner filters now work on this account: {', '.join(working)} "
+                  "each returned rows against an unfiltered control. Worth telling "
+                  "Mo, because the scanner has been doing all its filtering itself "
+                  "since 2026-09-06.")
+    else:
+        detail = ("IBKR's scanner filters are still off for this account: "
+                  f"{', '.join(broken)} returned nothing but errors against a healthy "
+                  "unfiltered control. The scanner does not send filters, so nothing "
+                  "is broken by this. Recorded for the record.")
+    return Result(CHECK_SCANNER_FILTERS, True, detail, facts=facts)
 
 
 def newest_book_files(folder: Path) -> list[Path]:
@@ -385,8 +638,8 @@ def check_day_trade_counters() -> Result:
 
 def run_checks(scan_out: Path) -> list[Result]:
     login, market = check_gateway_and_data()
-    return [login, market, check_scanner(scan_out), check_reconcile(),
-            check_day_trade_counters()]
+    return [login, market, check_scanner(scan_out), check_scanner_filters(),
+            check_reconcile(), check_day_trade_counters()]
 
 
 def report_path(now: datetime, dry_run: bool) -> Path:
@@ -429,13 +682,24 @@ def main(argv: list[str] | None = None) -> int:
     verdict = "fail" if failed else "pass"
 
     for result in results:
-        print(f"  [{'pass' if result.passed else 'FAIL'}] {result.name}: {result.detail}")
+        if result.name in INFORMATIONAL_CHECKS:
+            label = "note"
+        else:
+            label = "pass" if result.passed else "FAIL"
+        print(f"  [{label}] {result.name}: {result.detail}")
 
+    by_name = {r.name: r for r in results}
+    filters = by_name.get(CHECK_SCANNER_FILTERS)
     report = {
         "run_at": now.isoformat(),
         "verdict": verdict,
         "dry_run": args.dry_run,
         "failed_checks": failed,
+        # Lifted to the top so Tuesday's log answers the question without anyone
+        # having to dig through the checks block. true, false, or null when the
+        # probe could not run at all.
+        "scanner_filters_enabled": (
+            (filters.facts or {}).get("filters_enabled") if filters else None),
         "checks": {r.name: asdict(r) for r in results},
         "scan_file": str(scan_out),
     }
