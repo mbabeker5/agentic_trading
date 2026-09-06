@@ -1,6 +1,6 @@
 # Strategy spec: opening momentum, month one
 
-Status: draft for Mo's approval, written 2026-09-02, shorting added the same day at Mo's request, position cap raised to 15% on 2026-09-06. Nothing here trades until Mo says the numbers are right. This strategy runs as three of the five month-one books: A (hybrid, Claude Fable via OpenRouter), B (rules only, no model), E (hybrid, GPT-6 Astra via OpenRouter).
+Status: draft for Mo's approval, written 2026-09-02, position cap raised to 15% on 2026-09-06. **Shorting deferred to month two pending review** (review team, 2026-09-06): the short side described below stays switched off in the code until the hub's consolidated critique lands. Nothing here trades until Mo says the numbers are right. This document stands on its own: everything needed to understand and run the strategy is written here.
 
 ## The idea in one paragraph
 
@@ -27,7 +27,7 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 
 | Parameter | Proposed | Notes |
 |---|---|---|
-| Paper starting balance | $100,000 | Paper account reset to this on day one |
+| Book size | $100,000 | A virtual book: its own capital, positions and limits, tracked separately inside the shared paper account. Every order carries an IBKR order reference tag so fills are attributed to this book |
 | Max per position | 15% of book equity (Mo, 2026-09-06) | About $15,000 at the start |
 | Max open positions | 5 | So at most 75% of the book is deployed at once |
 | Stop loss | 1.5% below entry, or the opening range low if closer | Hard, attached to the order as a bracket |
@@ -40,9 +40,9 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | Liquidity floor (Mo, 2026-09-06) | $20,000,000 average daily dollar volume over 30 sessions | Replaces the old 1,000,000 share floor. A census on 2026-09-04 found about 2,700 US names above $20M dollar volume against about 1,950 above 1M shares, so the new floor is wider and better matched to how much we can trade. Script and data in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/liquidity_census/` |
 | Relative volume floor (Mo, 2026-09-06) | 2x normal by 9:35 | Volume traded by 9:35 must be at least twice the stock's usual volume for that time of day. Below 2x the name is skipped |
 | Shortlist size | 20 at most | |
-| Shorting | Allowed (Mo, 2026-09-02) | Same caps as longs, stop 1.5% above entry or the range high if closer, price floor $10, and the easy-to-borrow rule below |
+| Shorting | Deferred to month two pending review | Off in the code (`allow_shorts: false`). When switched on: same caps as longs, stop 1.5% above entry or the range high if closer, price floor $10, and the easy-to-borrow rule below |
 | Easy-to-borrow rule (Mo, 2026-09-06) | All three must hold at the moment of entry | IBKR shortable indicator at the easy-to-borrow level; borrow fee under 1% a year; at least 10 times our intended share count available to borrow. Any miss and the short is skipped, logged with the reason |
-| Gross exposure cap | 100% of book equity | Longs plus shorts added together may never exceed the book's value. No margin borrowing for longs. With 5 positions at 15% the natural ceiling is 75%, so this is a backstop |
+| Gross exposure cap | 100% of book equity | All positions added together may never exceed the book's value. No margin borrowing. With 5 positions at 15% the natural ceiling is 75%, so this is a backstop |
 | Options | Not in month one | |
 | Order types | Limit entries, bracket stops, market exits at close | |
 
@@ -56,7 +56,7 @@ US regulators call anyone who makes four or more round-trip day trades in five b
 
 The paper account is exempt because it holds simulated money, and IBKR does not apply the rule there. That is fine for testing the logic, but it means month one says nothing about whether the strategy survives the rule with real money.
 
-Mo's decision (2026-09-06): assume $25,000 of live account equity as the safe minimum. Every book keeps a rolling five-business-day day-trade counter in the ledger. Books C (insider) and D (Congress) are held to a hard limit of three day trades per five business days, because they are meant to hold for weeks and a day trade there is a mistake. The momentum books are not blocked, since day trading is the strategy, but the code logs every trade the rule would have blocked so the live-money cost of the rule is measured, not guessed.
+Mo's decision (2026-09-06): assume $25,000 of live account equity as the safe minimum. This strategy keeps a rolling five-business-day day-trade counter in the ledger. It is not blocked by the counter, since day trading is the whole strategy, but the code logs every trade the rule would have blocked so the live-money cost of the rule is measured, not guessed.
 
 ## How we judge month one
 

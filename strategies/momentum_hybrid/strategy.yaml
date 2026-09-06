@@ -71,7 +71,7 @@ universe:
   min_avg_volume: 1000000     # DEPRECATED, kept as an alias so an older file
                               # still loads. The scanner ignores it.
   allow_options: false        # no options in month one
-  allow_shorts: true          # shorting a gap down is the mirror of buying a
+  allow_shorts: false   # shorting deferred to month two pending review (2026-09-06); flip only after the hub confirms
                               # gap up (Mo, 2026-09-02). Switched on here, and
                               # only here, now that the mirrored stop, the
                               # gross exposure cap and the borrow check exist.
@@ -102,10 +102,29 @@ universe:
   blacklist: []               # symbols this book may never trade
 
 scanner:
+  # The scanner sends NO filters to IB Gateway (Mo, 2026-09-06). Every filter we
+  # tried on this account made the scan return zero rows while Gateway logged
+  # "Scanner filter X is disabled" into a callback nobody reads, which looks
+  # exactly like a morning when nothing gapped. The same scan with no filters
+  # returns 50 rows in under a second. So every number in this file is applied
+  # in our own code against real daily bars, where nothing can switch it off.
+  # Four unfiltered scans feed the shortlist: TOP_PERC_GAIN and TOP_PERC_LOSE
+  # for the moves, HOT_BY_VOLUME and HIGH_STVOLUME_5MIN for the volume. Gainers
+  # become long candidates and fallers become short ones, each row tagged with
+  # its direction. See agent/README_scanner.md.
   rel_volume_min: 2.0         # a candidate must be trading at least this many
-                              # times its normal pace for the time of day
+                              # times its normal pace for the time of day,
+                              # measured at 09:35. At or above, not above.
   max_candidates: 20          # the shortlist handed to the model is capped here
   exclude_leveraged_etfs: true  # no 2x or 3x or inverse products
+
+  finviz:
+    # The optional Finviz Elite cross-check, off because Mo has not bought it
+    # (39.50 dollars a month). The scanner run is shared by books A, B and E, so
+    # this switch only has an effect in config/guardrails.yaml, which is where
+    # the scanner reads it from. It is written out here too so a book's settings
+    # can be read in one place.
+    enabled: false
 
 schedule:
   timezone: America/New_York  # every time below is New York time

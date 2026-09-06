@@ -1,10 +1,17 @@
 # Strategy spec: insider buying
 
-Status: draft for Mo's approval, written 2026-09-06. Nothing here trades until Mo says the numbers are right. Companion to `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md`, which describes the shared machinery.
+Status: draft for Mo's approval, written 2026-09-06. Nothing here trades until Mo says the numbers are right. This document stands on its own: everything needed to understand and run the strategy is written here.
 
 ## The idea in one paragraph
 
 Executives and directors must tell the SEC within two business days whenever they trade their own company's stock. Sales tell you little, people sell for houses and taxes. Open-market buys are different: someone already paid in salary and options chose to put more of their own cash in. When several do it in the same week, or the CEO buys big relative to what they hold, the stock has historically beaten the market over the following months. This book buys those situations, holds for days to weeks, and exits on a stop or a clock.
+
+## Who does what
+
+The code does the rule-bound work and enforces every hard limit. Claude does the judgment in between and writes down why. Neither side can skip the other.
+
+- **Code:** sweeps the SEC filings, filters and scores them, checks each open position every 30 minutes, refuses any order that breaks a limit in the table below, and writes every fill and decision to the ledger.
+- **Claude:** reviews the shortlist each morning, picks up to three names, sets each one's limit price, and through the day decides whether a position is still worth holding. Every decision, including "do nothing", gets a one-line reason in the ledger.
 
 ## The signal
 
@@ -22,7 +29,9 @@ SEC EDGAR is free, needs no account, and publishes a filing to its feeds within 
 2. **The Form 4 XML document** inside each filing. It is structured, not a PDF, so transaction code, price, share count, the 10b5-1 checkbox, the insider's title and post-trade holdings all parse cleanly.
 3. **The submissions API** at data.sec.gov for each company, to fetch recent history and count the cluster.
 
-Optional paid signal source, off until Mo buys it: Quiver Quantitative (API Hobbyist $30 a month, Trader $75, has an official MCP, no quotes) behind a config flag. Free official sources stay primary. EDGAR allows ten requests a second with a descriptive User-Agent header. The free OpenInsider screener shows the same purchases and is a handy cross-check, but it is a website, not an API, so the code does not depend on it.
+EDGAR allows ten requests a second with a descriptive User-Agent header. Optional paid signal source, off until Mo buys it: Quiver Quantitative (API Hobbyist $30 a month, Trader $75, official MCP, no quotes) behind a config flag. The free official source stays primary.
+
+Prices and volumes for the shortlist come from IBKR, the broker we trade through. Decisions are always priced off IBKR's own quotes, because IBKR fills paper orders against its own data, and the ledger records the gap between the price a decision was made at and the fill.
 
 ## The day
 
@@ -34,36 +43,37 @@ Optional paid signal source, off until Mo buys it: Quiver Quantitative (API Hobb
 
 **4:30 PM, afternoon sweep.** Same parse for filings accepted during the day. Anything that qualifies waits for the next morning's review. No after-hours orders.
 
-This book holds overnight and for weeks. **It is exempt from the 3:55 PM flat rule** that governs the opening-momentum book. Its risk lives in the per-position stop and the book-level daily loss cap instead.
+**This book holds positions overnight and for weeks.** It is not closed out at the end of each day. Its risk is controlled by the per-position stops and the daily loss cap in the table below, not by being flat at the close.
 
 ## Every parameter and its proposed value
 
 | Parameter | Proposed | Notes |
 |---|---|---|
-| Book size | $100,000 | Virtual book inside the paper account |
-| Position size | 5% of book, about $5,000 | Smaller than the day-trading book because positions are held through news and overnight gaps |
+| Book size | $100,000 | A virtual book: its own capital, positions and limits, tracked separately inside the shared paper account |
+| Position size | 5% of book, about $5,000 | Small, because positions are held through news and overnight gaps |
 | Max open positions | 10 | Half the book invested at full load |
 | New entries per day | 3 at most | Keeps Claude choosing rather than collecting |
-| Hard stop | 8% below entry | Held overnight, so wider than intraday |
+| Hard stop | 8% below entry | Held overnight, so wider than an intraday stop would be |
 | Trailing stop | 10% below the highest close since entry, active once the position is up 8% | Lets a winner run, locks in part of it |
 | Target | None fixed | The trailing stop and the time stop do the exiting |
 | Time stop | 30 trading days | Out regardless of price, the edge decays |
-| Daily loss cap | 2% of this book, per book | Halts new entries for the day and closes what is open |
+| Daily loss cap | 2% of this book's equity, measured per book | Once hit, the code halts new entries for the day and closes what is open in this book |
 | Price floor | $5 | |
-| Liquidity floor | 500,000 shares average daily volume | Insider buys skew small, so this is lower than the momentum book's floor |
+| Liquidity floor | 500,000 shares average daily volume | Insider buys skew to smaller companies, so this is a modest floor |
 | Minimum buy size to count | $25,000 per filing, or $10,000 each inside a cluster | Filters token purchases |
 | Shorting | No, long only | Insider selling is not a usable signal |
+| Day trades | Hard limit of three per five business days | A day trade is buying and selling the same stock the same day. This book is meant to hold for weeks, so a day trade here is a mistake. US rules require $25,000 of account equity for anyone making four or more in five business days, so the limit also keeps a live account clear of that rule |
 | Order types | Limit entries, stop orders held in code, market exits on time stop | |
 
 ## What the code enforces versus what Claude decides
 
-**Code:** the sweep, filters, scoring, every cap above, the stops, the time stop, the daily loss cap, the order reference tag, the ledger. Nothing Claude says can move a number in the table.
+**Code:** the sweep, filters, scoring, every cap above, the stops, the time stop, the daily loss cap, the day-trade limit, the order reference tag, the ledger. Nothing Claude says can move a number in the table.
 
 **Claude:** which qualifying names to buy today and why; whether a filing looks like conviction or a director topping up to meet an ownership guideline; whether a headline explains the buy away. Every pick and skip gets a written reason.
 
-## How this book fits the virtual-book design
+## How this book is kept separate
 
-Its folder is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/insider/`, holding `strategy.yaml` (every number above, plus `holds_overnight: true`), `prompt.md` (the judgment layer, with the yaml values injected), and a `model` field naming the brain, for example `anthropic/claude-fable-5-1`. Every order carries the IBKR order reference `INSIDER`, so fills are attributed to this book and never confused with the others sharing the paper account. Its equity, positions and daily loss cap are tracked separately in the ledger.
+Several strategies share one IBKR paper account. Each runs as a virtual book with its own folder: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/insider/`, holding `strategy.yaml` (every number in the table above, plus `holds_overnight: true`), `prompt.md` (the judgment layer, with the yaml values injected so the two cannot disagree), and a `model` field naming the brain, for example `openrouter/anthropic/claude-fable-5.1`. Every order carries the IBKR order reference `BOOK_C`, so fills are attributed to this book and never confused with another. Its equity, positions, day-trade count and daily loss cap are tracked separately in the ledger, and every ledger row carries the git commit of the rules that produced it.
 
 ## Known weaknesses
 
@@ -74,6 +84,8 @@ Its folder is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strat
 
 ## How we judge month one
 
-Operations first, exactly as in the main spec: every sweep ran, no cap breached, every fill and decision in the ledger with a reason, positions reconciled daily against the broker.
+Operations first, returns second. A month is too short to know whether an edge is real. It is plenty to know whether the machine works.
 
-Returns second, with a caveat: 30-day holds mean most positions are still open at month end. Judge on mark-to-market equity against SPY and the other books, and on pick quality (how many stopped out fast). Carrying this book into month two should not require it to have beaten the day-trading book in four weeks.
+**Operations, must all pass:** every sweep ran; no cap breached; every fill and decision in the ledger with a reason; positions reconciled daily against the broker; no phantom or missing positions.
+
+**Returns, reported honestly:** 30-day holds mean most positions are still open at month end. Judge on mark-to-market equity against SPY over the same days, and on pick quality (how many stopped out fast, how many the insider was right about on a longer view). Carrying this book into month two should not require it to have beaten anything in four weeks; it should require that the machine ran clean and the picks were defensible.

@@ -385,6 +385,9 @@ def test_no_trade_today_stops_entries_and_leaves_exits_alone(sandbox):
 
     # An exit still goes through the checks, which is the half that matters.
     guard = guard_for("B")
+    # shorts are switched off for month one, so let this closing sale be judged as an
+    # exit rather than a short: the point of the test is the STOP and NO_TRADE gates
+    guard = dataclasses.replace(guard, universe=dataclasses.replace(guard.universe, allow_shorts=True))
     guards = loop.read_guards()
     exit_intent = gr.OrderIntent(symbol="AAPL", side="SELL", qty=10,
                                  limit_price=100.0, purpose="exit", book_id="B")

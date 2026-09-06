@@ -16,6 +16,7 @@ Run them with:
 """
 
 from __future__ import annotations
+import dataclasses
 
 import copy
 from datetime import date, datetime
@@ -243,8 +244,11 @@ def temp_project(
 
 @pytest.fixture()
 def momentum() -> Guardrails:
-    """Book A: opening momentum, hybrid, as it actually ships."""
-    return load_book_guardrails(BOOKS_YAML, "A")
+    """Book A: opening momentum, hybrid, as it ships, with shorting switched on so the
+    short-side rules below can be exercised. Shorting is deferred to month two in the
+    shipped yaml (allow_shorts false); the deferral is asserted separately."""
+    g = load_book_guardrails(BOOKS_YAML, "A")
+    return dataclasses.replace(g, universe=dataclasses.replace(g.universe, allow_shorts=True))
 
 
 @pytest.fixture()
@@ -492,7 +496,7 @@ def test_the_momentum_books_match_their_spec(book_id: str):
     assert g.universe.min_avg_dollar_volume == 20_000_000
     assert g.universe.dollar_volume_sessions == 30
     assert g.universe.min_avg_volume == 1000000, "kept only as a deprecated alias"
-    assert g.universe.allow_shorts is True
+    assert g.universe.allow_shorts is False, "shorting deferred to month two pending review"
     assert g.universe.short_price_floor == 10
     assert g.universe.require_shortable is True
     assert g.universe.max_borrow_fee_pct == 1.0
