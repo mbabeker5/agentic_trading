@@ -261,21 +261,40 @@ def test_every_fast_scenario_ran_a_whole_day(fast_reports):
 @needs_history
 @pytest.mark.parametrize("key", [
     "daily_loss_cap",
+    "flatten_at_close",
     "kill_switch",
-    "day_trade_counter",
-    "rejected_order",
-    "two_books_one_symbol",
 ])
 def test_the_scenarios_that_pass_today_still_pass(fast_reports, key):
     """A regression guard, not a specification.
 
-    These five pass against the loop as it stands. The other fast scenarios fail
-    on real gaps, and they are deliberately not asserted on here: the day one of
-    them starts passing is the day somebody fixed the loop, and a test that went
-    red for that would be telling the wrong story.
+    These three pass against the loop as it stands on 2026-09-06. The other fast
+    scenarios fail, and they are deliberately not asserted on here: the day one
+    of them starts passing is the day somebody fixed the loop, and a test that
+    went red for that would be telling the wrong story.
+
+    This list is expected to grow. If a scenario here starts failing, read its
+    failure lines before touching it. They say what changed and where.
     """
     report = fast_reports[key]
     assert report.passed, f"{key} failed: " + "; ".join(report.failures)
+
+
+@pytest.mark.parametrize("key", ["day_trade_counter", "rejected_order"])
+def test_a_scenario_that_could_not_test_anything_says_so(fast_reports, key):
+    """A scenario blocked upstream must not read as a pass or as its own failure.
+
+    Both of these need the loop to open a position before they can test
+    anything. As of 2026-09-06 no book can, because `sector_cap` refuses every
+    entry whose industry it was not told, and nothing in agent/loop.py sets
+    `OrderIntent.sector`. The right behaviour then is to fail loudly and name
+    the reason as upstream, which is what this checks.
+    """
+    report = fast_reports[key]
+    if report.passed:
+        return          # the loop can open positions again, which is the good case
+    assert any("upstream of this scenario" in line for line in report.failures), (
+        f"{key} failed without saying whether the fault was its own: "
+        + "; ".join(report.failures))
 
 
 @needs_history

@@ -72,16 +72,32 @@ GUARDRAIL_RULE_IDS = (
     "paper_only", "wrong_account", "wrong_book", "kill_switch", "symbol_exclusive",
     "halted", "sec_type", "currency", "blacklist", "whitelist", "no_shorts",
     "short_price_floor", "shortable_required", "entry_window",
-    "outside_market_hours", "flatten_time", "daily_loss_cap", "max_order_notional",
+    "outside_market_hours", "flatten_time", "daily_loss_cap", "weekly_loss_cap",
+    "monthly_loss_cap", "losing_streak_pause", "max_order_notional",
     "max_position_pct", "max_open_positions", "gross_exposure_cap",
-    "entries_per_day",
+    "account_symbol_cap", "sector_cap", "entries_per_day",
 )
 
 #: Rules whose facts agent/loop.py does not yet gather, so the loop cannot reach
 #: them however the day goes. They are proven here by probe and the report says
 #: so, because a rule that only a probe can reach is a rule with nothing behind
 #: it in production.
-NOT_WIRED_UP = ("symbol_exclusive", "halted")
+#:
+#: Every one of these reads a field on AccountState or OrderIntent that
+#: agent/book_state.py's account_state_for() and agent/loop.py's _entry_intent()
+#: do not set, and every one of those fields defaults to a value meaning all
+#: clear. They are checked against the loop rather than written out by hand, in
+#: _not_wired_up() below, so this list cannot go stale on its own.
+NOT_WIRED_UP_FIELDS = {
+    "symbol_exclusive": "symbols_held_elsewhere",
+    "halted": "halted and limit_state",
+    "weekly_loss_cap": "week_pnl",
+    "monthly_loss_cap": "month_pnl",
+    "losing_streak_pause": "consecutive_losing_days",
+    "sector_cap": "sector",
+    "account_symbol_cap": "symbol_exposure_all_books and account_equity",
+}
+NOT_WIRED_UP = tuple(NOT_WIRED_UP_FIELDS)
 
 #: The five minute grid a crafted day is written on, 09:25 to 16:05.
 CRAFTED_START = clock_time(9, 25)
@@ -309,6 +325,48 @@ def _halt_reason(text: str, width: int = 150) -> str:
     return joined[:width] + ("..." if len(joined) > width else "")
 
 
+def _stacked_orders(context: RunContext) -> list[str]:
+    """Orders the loop sent again while an identical one was still working.
+
+    agent/loop.py never asks whether it already has an order out for a name
+    before sending another. Every phase works from the book's positions, not
+    from the account's working orders, so a closing order that does not fill is
+    sent again on the next tick, and again, for as long as the position is open
+    and the rule keeps firing.
+
+    Grouped by book, symbol, side and order type, because a bracket leaves a
+    stop and a target resting on purpose and those two differ by type.
+    """
+    groups: dict[tuple, int] = {}
+    for order in context.fake.open_orders().get("orders") or []:
+        key = (str(order.get("orderRef")), str(order.get("symbol")),
+               str(order.get("action")), str(order.get("orderType")))
+        groups[key] = groups.get(key, 0) + 1
+    return [f"{count} identical {key[2]} {key[3]} orders for {key[1]} from {key[0]}"
+            for key, count in sorted(groups.items(), key=lambda kv: -kv[1])
+            if count > 1]
+
+
+def _why_no_entry(context: RunContext, book_id: str | None = None) -> str:
+    """Which rule refused this book's entries, when none of them got out.
+
+    Several scenarios need a position to exist before they can test anything.
+    When the entry never happens they should say which rule stopped it rather
+    than report the thing they were actually testing as broken.
+    """
+    counts: dict[str, int] = {}
+    for row in context.ledger.rule_hits:
+        if book_id and row.book_id != str(book_id).upper():
+            continue
+        rule_id = str(row.payload.get("rule_id"))
+        if rule_id in GUARDRAIL_RULE_IDS:
+            counts[rule_id] = counts.get(rule_id, 0) + 1
+    if not counts:
+        return "no guardrail refused anything, so the entry was never worked out"
+    worst = sorted(counts.items(), key=lambda kv: -kv[1])
+    return "the guardrails refused " + ", ".join(f"{r} ({n} times)" for r, n in worst[:3])
+
+
 def _every_tick_ran(context: RunContext) -> tuple[bool, str]:
     bad = [t.at for t in context.ticks if t.exit_code != 0]
     if bad:
@@ -378,17 +436,21 @@ def clean_day(day: date_type, fill_bridge: bool = True) -> Scenario:
             shared = [t for t in context.ticks
                       if "same name" in context.text(t.at)]
             if shared:
+                line = next((ln.strip() for ln in context.text(shared[0].at).splitlines()
+                             if "same name" in ln), "")
                 failures.append(
-                    "THE HEADLINE: books A, B and E run the same strategy off the "
-                    "same shortlist, so they pick the same names, and since commit "
-                    "e653508 one ticker belongs to one book. On this recorded day "
-                    f"they collided at {shared[0].at} and reconciliation halted "
-                    "every book that shared a name, for the rest of the day. The "
-                    "guardrail written to prevent it, symbol_exclusive, cannot fire, "
-                    "because nothing in agent/loop.py fills "
-                    "AccountState.symbols_held_elsewhere. Until the loop either "
-                    "gives each book its own shortlist or feeds that field, the five "
-                    "book arrangement stops itself on any ordinary day.")
+                    "THE HEADLINE: two books landed in the same ticker, and since "
+                    "commit e653508 a ticker belongs to one book only. It happened "
+                    f"at {shared[0].at}, reconciliation named them both and halted "
+                    "them both for the rest of the day, and it will happen on any "
+                    "ordinary day, because the books that share a strategy also "
+                    "share a shortlist and rank it the same way. The guardrail "
+                    "written to prevent exactly this, symbol_exclusive, cannot fire: "
+                    "nothing in agent/loop.py or agent/book_state.py fills "
+                    "AccountState.symbols_held_elsewhere, so every book believes it "
+                    "is the only one in the account. Until the loop feeds that field "
+                    "or gives each book its own shortlist, the five book "
+                    f"arrangement stops itself. The line was: {line[:180]}")
             long_reason = max((len(str(why)) for why in halted.values()), default=0)
             if long_reason > 400:
                 failures.append(
@@ -399,6 +461,31 @@ def clean_day(day: date_type, fill_bridge: bool = True) -> Scenario:
                     "in every log line that quotes it.")
         else:
             evidence.append("no book halted")
+
+        stacked = _stacked_orders(context)
+        if stacked:
+            failures.append("the loop sent the same order again while an identical "
+                            "one was still working: " + "; ".join(stacked[:3]))
+        else:
+            evidence.append("no order was left stacked on top of an identical one")
+
+        # A rule that refuses every entry every book ever works out is not a
+        # guardrail doing its job, it is a stopped machine, and the clean day is
+        # where that shows up first.
+        blanket = {}
+        for row in context.ledger.rule_hits:
+            rule_id = str(row.payload.get("rule_id"))
+            if rule_id in GUARDRAIL_RULE_IDS:
+                blanket[rule_id] = blanket.get(rule_id, 0) + 1
+        for rule_id, count in sorted(blanket.items(), key=lambda kv: -kv[1]):
+            if count >= 10:
+                failures.append(
+                    f"{rule_id} refused {count} orders on a day that was supposed to "
+                    "be ordinary. A guardrail that stops everything has stopped the "
+                    "machine rather than protected it. Check whether the loop "
+                    "actually gives that rule the fact it reads before deciding "
+                    "which of the two is broken.")
+                break
 
         for order_ref in ("BOOK_A", "BOOK_B", "BOOK_E"):
             held = _positions(context, order_ref)
@@ -574,6 +661,34 @@ def every_guardrail(day: date_type) -> Scenario:
             context.account_state("A", symbols_held_elsewhere={"NVDA": "B"}),
             note="a name book B already holds")
 
+        # The three caps that look beyond one day, and the losing streak pause.
+        # All four read a field the loop does not fill, so all four are probes.
+        context.probe_rule("A", entry(),
+                           context.account_state("A", week_pnl=-20_000.0),
+                           note="a book well into its weekly loss cap")
+        context.probe_rule("A", entry(),
+                           context.account_state("A", month_pnl=-40_000.0),
+                           note="a book well into its monthly loss cap")
+        context.probe_rule("A", entry(),
+                           context.account_state("A", consecutive_losing_days=10),
+                           note="a book that has finished down ten days running")
+
+        # sector_cap: the book is already full of one sector, and this order is
+        # in the same one.
+        context.probe_rule(
+            "A", entry(sector="Technology"),
+            context.account_state("A", sector_exposure={"Technology": 100_000.0}),
+            note="another technology name in a book already full of them")
+
+        # account_symbol_cap: the other books have already put the whole account
+        # into this name.
+        context.probe_rule(
+            "A", entry(symbol="NVDA"),
+            context.account_state(
+                "A", account_equity=500_000.0,
+                symbol_exposure_all_books={"NVDA": 500_000.0}),
+            note="a name the five books between them have already filled up on")
+
         # halted, in all three of its shapes: the name is halted, the name is
         # in a limit band, and the halt status could not be read at all.
         context.probe_rule("A", entry(halted=True), context.account_state("A"),
@@ -607,17 +722,18 @@ def every_guardrail(day: date_type) -> Scenario:
             failures.append("these rule ids never fired, so they are untested rather "
                             "than proven: " + ", ".join(missing))
 
-        stranded = [r for r in NOT_WIRED_UP if r in probed]
+        stranded = sorted(r for r in NOT_WIRED_UP if r in probed)
         if stranded:
             evidence.append(
-                "NOT WIRED UP: " + ", ".join(stranded) + ". The rules work, and "
-                "nothing in agent/loop.py or agent/book_state.py fills the facts "
-                "they read. account_state_for() never sets "
-                "symbols_held_elsewhere and _entry_intent() never sets halted or "
-                "limit_state, both of which default to a value that means 'all "
-                "clear'. Until the loop passes what the broker actually said, "
-                "these two guardrails cannot fire in production however the day "
-                "goes.")
+                "NOT WIRED UP, and this is the important line in this scenario: "
+                + ", ".join(f"{r} reads {NOT_WIRED_UP_FIELDS[r]}" for r in stranded)
+                + ". Every one of those fields is left at the value that means all "
+                "clear, because agent/book_state.py's account_state_for() and "
+                "agent/loop.py's _entry_intent() never set them. The rules work "
+                "when a probe hands them the facts. In production they cannot fire "
+                "however the day goes, so what looks like "
+                f"{len(GUARDRAIL_RULE_IDS)} guardrails is "
+                f"{len(GUARDRAIL_RULE_IDS) - len(stranded)}.")
 
         for rule_id in ("blacklist", "whitelist", "no_shorts", "daily_loss_cap",
                         "entries_per_day"):
@@ -1226,6 +1342,13 @@ def day_trade_counter(day: date_type) -> Scenario:
         counts = {ref: context.fake.day_trade_count(ref)
                   for ref in ("BOOK_A", "BOOK_C")}
         evidence.append(f"the broker's own round trip count for the day: {counts}")
+        for book_id, ref in (("A", "BOOK_A"), ("C", "BOOK_C")):
+            if _entries_placed(context, book_id):
+                continue
+            failures.append(
+                f"book {book_id} never opened a position at all, so nothing about "
+                f"its day trade allowance was tested: {_why_no_entry(context, book_id)}"
+                ". The reason is upstream of this scenario.")
 
         return not failures, evidence, failures
 
@@ -1545,8 +1668,12 @@ def rejected_order(day: date_type) -> Scenario:
                             f"{first.symbol} at {first.at[11:16]}, "
                             f"{str(first.error)[:80]}")
         else:
-            failures.append("the reject_next_order fault was injected and no order "
-                            "came back rejected, so this scenario tested nothing")
+            failures.append(
+                "the reject_next_order fault was injected and no order came back "
+                "rejected, because the loop never sent one: "
+                + _why_no_entry(context, "A")
+                + ". Nothing about a rejection was tested, and the reason is "
+                  "upstream of this scenario.")
             return False, evidence, failures
 
         symbol = rejected[0].symbol
@@ -1707,6 +1834,22 @@ def two_books_one_symbol(day: date_type) -> Scenario:
         else:
             failures.append("two books shared a symbol and these halted: "
                             + (", ".join(sorted(halted)) or "none"))
+
+        stacked = _stacked_orders(context)
+        if stacked:
+            failures.append(
+                "the loop stacked the same order over and over: "
+                + "; ".join(stacked[:3])
+                + ". Book B is short a name whose price rises all day, so the fade "
+                "rule fires on every manage tick, and every tick sends a fresh "
+                "limit order to cover without ever asking whether the last one is "
+                "still working. Nothing in agent/loop.py reads open_orders() before "
+                "sending, and nothing cancels. In a live account that is the whole "
+                "position resting at the broker once for every five minutes of the "
+                "day, and they would all fill together on the first dip.")
+        else:
+            evidence.append("no order was ever sent twice while an identical one was "
+                            "still working")
 
         entries = _entries_placed(context)
         if entries:

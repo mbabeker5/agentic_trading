@@ -904,6 +904,12 @@ class RunContext:
         #: them. Kept apart from the rest so a report can never claim the loop
         #: reached a rule it cannot actually reach.
         self.probed: set[str] = set()
+        #: Every rule id the ledger held before the first probe ran, which is
+        #: the honest answer to "what did the loop reach on its own". Taking it
+        #: as everything minus the probed ones would be wrong: a rule that
+        #: fired in the day AND under a probe would be counted as a probe only,
+        #: and the report would understate the loop.
+        self.rules_before_probes: set[str] | None = None
 
     # -- reading the day back ---------------------------------------------
 
@@ -1023,6 +1029,8 @@ class RunContext:
 
     def in_play_rule_ids(self) -> set[str]:
         """Rule ids the loop's own order flow reached, with no probe behind them."""
+        if self.rules_before_probes is not None:
+            return set(self.rules_before_probes)
         return self.rule_ids() - self.probed
 
 
@@ -1421,6 +1429,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
             if scenario.after_tick is not None:
                 scenario.after_tick(context, moment)
 
+        context.rules_before_probes = set(ledger.rule_ids())
         if scenario.finish is not None:
             scenario.finish(context)
 
