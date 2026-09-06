@@ -165,6 +165,21 @@ def ramp(day: date_type, first: float, last: float):
     return price_at
 
 
+def widen_opening(rows: list[dict], low: float, bars: int = 2) -> list[dict]:
+    """Put a wick on the first bars, so the opening range is a real range.
+
+    The stop a book opens with is the nearer of its percentage stop and the
+    opening range low (risk.use_opening_range_low_if_tighter). A crafted day
+    that only climbs has an opening range low equal to its own open, so the rule
+    stop lands a cent under the entry and the position stops out on the first
+    tick that dips. Real days do not look like that, so the crafted ones get a
+    wick rather than a degenerate range.
+    """
+    for row in rows[:bars]:
+        row["low"] = min(float(row["low"]), float(low))
+    return rows
+
+
 def daily_history(day: date_type, closes: dict[str, float],
                   sessions: int = 40) -> dict[str, list[dict]]:
     """Forty flat daily bars behind a crafted day, so a prior close exists.
@@ -252,6 +267,48 @@ def _entries_placed(context: RunContext, book_id: str | None = None) -> list:
     return rows
 
 
+def _closings_placed(context: RunContext, book_id: str | None = None,
+                     symbol: str | None = None) -> list:
+    """Every order the loop actually sent in order to CLOSE a position.
+
+    Read the same way as _entries_placed above, off the loop's own decision
+    line, because a bracket's stop and target children are sells too and they
+    went out with the entry rather than as a decision to get out.
+    """
+    rows = []
+    for row in context.ledger.rows:
+        if row.payload.get("kind") != "decision":
+            continue
+        text = str(row.payload.get("decision") or "")
+        if not text.startswith("placed"):
+            continue
+        if "purpose: exit" not in text and "purpose: flatten" not in text:
+            continue
+        if book_id and row.book_id != str(book_id).upper():
+            continue
+        if symbol and str(symbol).upper() not in text:
+            continue
+        rows.append(row)
+    return rows
+
+
+def _halt_reason(text: str, width: int = 150) -> str:
+    """One book's halt reason, deduped and cut short.
+
+    agent/book_state.py's halt() appends to halt_reason every time it is called,
+    and reconciliation calls it on every tick, so after a whole day the reason
+    is the same sentence eighty times over. That is a defect of its own and it
+    is reported, but a report that quoted it whole would be unreadable.
+    """
+    seen: list[str] = []
+    for part in str(text or "").split("; "):
+        part = part.strip()
+        if part and part not in seen:
+            seen.append(part)
+    joined = "; ".join(seen)
+    return joined[:width] + ("..." if len(joined) > width else "")
+
+
 def _every_tick_ran(context: RunContext) -> tuple[bool, str]:
     bad = [t.at for t in context.ticks if t.exit_code != 0]
     if bad:
@@ -303,14 +360,43 @@ def clean_day(day: date_type, fill_bridge: bool = True) -> Scenario:
             evidence.append("reconciliation said everything matched on every one of "
                             f"the {len(context.ticks)} ticks")
         else:
-            failures.append("reconciliation disagreed on "
-                            f"{len(bad)} ticks, first at {bad[0]}: "
-                            f"{context.ticks[[t.at for t in context.ticks].index(bad[0])].reconcile_note}")
+            first_bad = next(t for t in context.ticks if t.at == bad[0])
+            first_line = ""
+            for line in context.text(bad[0]).splitlines():
+                if line.startswith("  Book "):
+                    first_line = line.strip()
+                    break
+            failures.append(f"reconciliation disagreed on {len(bad)} of "
+                            f"{len(context.ticks)} ticks, first at {bad[0]}: "
+                            f"{first_bad.reconcile_note}. {first_line[:220]}")
 
         halted = context.halted_books()
         if halted:
             failures.append("these books halted on a clean day: "
-                            + ", ".join(f"{b} ({why})" for b, why in halted.items()))
+                            + "; ".join(f"{b}: {_halt_reason(why)}"
+                                        for b, why in sorted(halted.items())))
+            shared = [t for t in context.ticks
+                      if "same name" in context.text(t.at)]
+            if shared:
+                failures.append(
+                    "THE HEADLINE: books A, B and E run the same strategy off the "
+                    "same shortlist, so they pick the same names, and since commit "
+                    "e653508 one ticker belongs to one book. On this recorded day "
+                    f"they collided at {shared[0].at} and reconciliation halted "
+                    "every book that shared a name, for the rest of the day. The "
+                    "guardrail written to prevent it, symbol_exclusive, cannot fire, "
+                    "because nothing in agent/loop.py fills "
+                    "AccountState.symbols_held_elsewhere. Until the loop either "
+                    "gives each book its own shortlist or feeds that field, the five "
+                    "book arrangement stops itself on any ordinary day.")
+            long_reason = max((len(str(why)) for why in halted.values()), default=0)
+            if long_reason > 400:
+                failures.append(
+                    f"one halt reason is {long_reason} characters long. "
+                    "agent/book_state.py's halt() appends to halt_reason every time "
+                    "it is called and reconciliation calls it on every tick, so the "
+                    "same sentence is stored eighty times over in the book file and "
+                    "in every log line that quotes it.")
         else:
             evidence.append("no book halted")
 
@@ -414,7 +500,10 @@ def every_guardrail(day: date_type) -> Scenario:
         day_at = lambda h, m: datetime.combine(context.day, clock_time(h, m),
                                                tzinfo=EASTERN)
 
-        def entry(symbol="AAPL", qty=10, price=100.0, **extra):
+        # SPY on purpose: a probe must not use the name book A blacklists, or
+        # blacklist would look like a rule only a probe can reach when the loop
+        # reaches it perfectly well on its own.
+        def entry(symbol="SPY", qty=10, price=100.0, **extra):
             return gr.OrderIntent(symbol=symbol, side="BUY", qty=qty,
                                   limit_price=price, purpose="entry",
                                   book_id="A", **extra)
@@ -426,7 +515,7 @@ def every_guardrail(day: date_type) -> Scenario:
 
         # wrong_book: book A's limits, an order tagged for book B.
         context.probe_rule(
-            "A", gr.OrderIntent(symbol="AAPL", side="BUY", qty=10, limit_price=100.0,
+            "A", gr.OrderIntent(symbol="SPY", side="BUY", qty=10, limit_price=100.0,
                                 purpose="entry", book_id="B"),
             context.account_state("A"), note="an order tagged for the wrong book")
 
@@ -546,9 +635,8 @@ def every_guardrail(day: date_type) -> Scenario:
     return Scenario(
         key="every_guardrail",
         title="Every guardrail rule id refuses an order and is written down",
-        proves="that all twenty rule ids in agent/guardrails.py can block an order "
-               "and that the block reaches the ledger with the rule id and the book "
-               "on it",
+        proves="that every rule id agent/guardrails.py can emit blocks an order and "
+               "reaches the ledger with the rule id and the book on it",
         day=day, slow=True,
         strategy_overlays={
             # Books A and E. A is scripted onto the blacklisted name.
@@ -789,17 +877,33 @@ def phantom_position(day: date_type) -> Scenario:
     Two shapes, one after the other, because agent/reconcile.py treats them very
     differently and only one of them halts anybody.
 
-    10:30  the account holds more SPY than book A claims. That is a quantity
+    10:30  the account holds more OWNED than book A claims. That is a quantity
            mismatch with book A's name on it, so book A halts and book B does
            not, which is the behaviour docs/REPLAY.md asks for.
-    11:35  the account holds DELL, which no book has ever claimed. That is an
+    11:35  the account holds GHOST, which no book has ever claimed. That is an
            orphan, and an orphan carries no book id, so agent/reconcile.py names
            nobody to halt and the loop halts nobody.
+
+    Crafted bars and no picks, so the only thing that changes across the day is
+    the fault. Neither book trades: a scenario about reconciliation should not
+    also be a scenario about the shortlist.
     """
+    owned, ghost = "OWNED", "GHOST"
+    watch: dict[str, dict] = {}
+
+    def build(scenario: Scenario):
+        series = {owned: crafted_bars(day, ramp(day, 100.0, 101.0)),
+                  ghost: crafted_bars(day, flat(120.0))}
+        return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
 
     def setup(context: RunContext) -> None:
-        seed_book_position(context, "A", "SPY", 100, 640.0, stop=600.0, target=800.0,
-                           opened_on=f"{day - timedelta(days=7):%Y-%m-%d}")
+        seed_book_position(context, "A", owned, 100, 100.0, stop=90.0, target=500.0,
+                           opened_on=f"{day:%Y-%m-%d}")
+
+    def after_tick(context: RunContext, moment: datetime) -> None:
+        at = f"{moment:%H:%M}"
+        if at in ("10:25", "10:35", "11:40"):
+            watch[at] = dict(context.halted_books())
 
     def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
         evidence: list[str] = []
@@ -810,49 +914,49 @@ def phantom_position(day: date_type) -> Scenario:
         if not ok:
             failures.append(line)
 
-        halted_at = {}
-        for tick in context.ticks:
-            for book in tick.halted_books:
-                halted_at.setdefault(book, tick.at)
-
-        if halted_at.get("A") and halted_at["A"] >= "10:30":
-            evidence.append(f"book A halted at {halted_at['A']}, the first tick after "
-                            "the phantom appeared in a name it claims")
+        clean = watch.get("10:25", {})
+        if clean:
+            failures.append(f"books were already halted before the fault: {clean}")
         else:
-            failures.append("the account held 50 more SPY than book A claimed and "
-                            "book A was not halted for it: halts were "
-                            f"{halted_at or 'none'}")
+            evidence.append("nothing was halted before the phantom appeared")
 
-        before_orphan = [t for t in context.ticks if "10:30" <= t.at < "11:35"]
-        b_halted_early = any("B" in t.halted_books for t in before_orphan)
-        if b_halted_early:
+        mismatch_note = next((t.reconcile_note for t in context.ticks
+                              if t.at == "10:35"), "")
+        halted_after = watch.get("10:35", {})
+        if "A" in halted_after:
+            evidence.append(f"book A halted on the first tick after the phantom "
+                            f"appeared in a name it claims: {mismatch_note}")
+        else:
+            failures.append("the account and book A disagreed about how much "
+                            f"{owned} they held and book A was not halted: "
+                            f"reconciliation said {mismatch_note!r}")
+
+        if "B" in halted_after:
             failures.append("book B was halted for a mismatch that belonged to book "
                             "A, so the halt is not confined to the affected book")
         else:
-            evidence.append("book B kept trading through book A's mismatch, so the "
-                            "halt landed on the affected book only")
+            evidence.append("book B was not halted, so the halt landed on the "
+                            "affected book only")
 
-        notes = [t.reconcile_note for t in context.ticks if t.at >= "11:35"]
-        if any("orphan" in n or "no book to blame" in n for n in notes):
-            evidence.append("the unclaimed DELL position was reported: "
-                            + next(n for n in notes if n))
-        elif any(n != "everything matched" for n in notes):
-            evidence.append("reconciliation refused the day after the orphan appeared: "
-                            + next(n for n in notes if n != "everything matched"))
+        orphan_note = next((t.reconcile_note for t in context.ticks
+                            if t.at == "11:40"), "")
+        if orphan_note and orphan_note != "everything matched":
+            evidence.append(f"the unclaimed {ghost} position was noticed: "
+                            f"{orphan_note}")
         else:
-            failures.append("a position no book claims appeared at the broker and "
+            failures.append(f"the account held 100 {ghost} that no book claims and "
                             "reconciliation said everything matched")
 
-        after_orphan = [t for t in context.ticks if t.at >= "11:35"]
-        if after_orphan and not any("B" in t.halted_books for t in after_orphan):
+        halted_late = watch.get("11:40", {})
+        if "B" not in halted_late:
             failures.append(
-                "the account held 100 DELL that no book claims and no book halted "
-                "for it. agent/reconcile.py gives an orphan no book id, "
-                "agent/loop.py only halts the books reconcile names, and its "
-                "catch all at run_reconciliation() is skipped whenever orphans "
-                "were found. So the loop carried on trading around a position "
-                "nobody understands, which is exactly what docs/REPLAY.md says it "
-                "must not do.")
+                f"the account held 100 {ghost} that no book claims and no book was "
+                "halted for it. agent/reconcile.py gives an orphan no book id, "
+                "agent/loop.py halts only the books reconcile names, and the catch "
+                "all in run_reconciliation() that would halt everybody is skipped "
+                "whenever any orphan was found. So the loop carries on trading "
+                "around a position nobody understands, which is what "
+                "docs/REPLAY.md says it must not do.")
 
         if context.alerts.alerts:
             evidence.append("alerts raised: "
@@ -860,8 +964,15 @@ def phantom_position(day: date_type) -> Scenario:
         else:
             failures.append(
                 "nothing was alerted. agent/loop.py does not import agent/alerts.py "
-                "at all and contains no alert call on any path, so a reconciliation "
-                "halt is written to the ledger and to a log file and nobody is told.")
+                "at all and has no alert call on any path, so a reconciliation halt "
+                "is written to the ledger and to a log file and nobody is told.")
+
+        evidence.append(
+            "worth knowing: the fake broker reports the phantom as a second row for "
+            "the same symbol, and agent/loop.py's read_broker_facts() keys its "
+            "positions by symbol, so the second row replaces the first instead of "
+            "being added to it. The mismatch is still caught, and the share count in "
+            "the message is the phantom's rather than the total.")
 
         return not failures, evidence, failures
 
@@ -870,17 +981,17 @@ def phantom_position(day: date_type) -> Scenario:
         title="A position nobody claims halts the book it belongs to, and alerts",
         proves="that a quantity mismatch halts only the book it belongs to, that an "
                "unclaimed holding is noticed, and that somebody is told",
-        day=day, symbols=("SPY", "QQQ", "DELL"),
+        day=day, symbols=(ghost,), build_broker=build,
         book_patches=only("A", "B"),
         faults=(
             Fault(at="10:30", action="inject", kind="phantom_position",
-                  options={"symbol": "SPY", "quantity": 50, "avg_cost": 640.0}),
+                  options={"symbol": owned, "quantity": 50, "avg_cost": 100.0}),
             Fault(at="11:30", action="clear", kind="phantom_position"),
             Fault(at="11:35", action="inject", kind="phantom_position",
-                  options={"symbol": "DELL", "quantity": 100, "avg_cost": 120.0}),
+                  options={"symbol": ghost, "quantity": 100, "avg_cost": 120.0}),
         ),
-        decider=lambda s: StubDecider(max_picks=1),
-        setup=setup, check=check,
+        decider=lambda s: StubDecider(max_picks=1, pick_nothing_for=("A", "B")),
+        setup=setup, after_tick=after_tick, check=check,
     )
 
 
@@ -1056,14 +1167,23 @@ def day_trade_counter(day: date_type) -> Scenario:
                             "and its fourth closing order was not refused. pdt_limit "
                             f"rows for C: {len(by_book.get('C', []))}")
 
-        c_sells = _orders(context, "BOOK_C", side="SELL", symbol=name)
-        c_exit_sells = [o for o in c_sells if o.purpose != "stop"]
-        if c_exit_sells:
-            failures.append(f"book C sent {len(c_exit_sells)} closing orders for "
+        c_exits = _closings_placed(context, "C", name)
+        if c_exits:
+            failures.append(f"book C sent {len(c_exits)} closing orders for "
                             f"{name} even though the day trade rule refused them")
         else:
             evidence.append(f"book C sent no closing order for {name}, so the refusal "
                             "held all the way to the broker")
+
+        if context.fake.day_trade_count("BOOK_C"):
+            evidence.append(
+                "WORTH ESCALATING: book C made a round trip in "
+                f"{name} anyway. Its stop was already resting at the broker as the "
+                "child of the entry bracket, and a resting stop fires whatever the "
+                "day trade counter says. So the pdt hard limit on books C and D can "
+                "refuse the loop's own closing order and still not stop the round "
+                "trip happening. Since the bracket work landed, that rule protects "
+                "less than it reads as protecting.")
 
         flagged = [r for r in by_book.get("A", [])
                    if "allowed here" in str(r.payload.get("action"))]
@@ -1077,12 +1197,12 @@ def day_trade_counter(day: date_type) -> Scenario:
                             f"pdt_limit row was written. Rows for A: "
                             f"{len(by_book.get('A', []))}")
 
-        a_sells = _orders(context, "BOOK_A", side="SELL", symbol=name)
-        if a_sells:
-            evidence.append(f"book A sent {len(a_sells)} sell orders for {name}, so "
+        a_exits = _closings_placed(context, "A", name)
+        if a_exits:
+            evidence.append(f"book A sent {len(a_exits)} closing orders for {name}, so "
                             "the flag did not stop it trading")
         else:
-            failures.append(f"book A never sold {name}, so the flag blocked it when "
+            failures.append(f"book A never closed {name}, so the flag blocked it when "
                             "it should only have been written down")
 
         counts = {ref: context.fake.day_trade_count(ref)
@@ -1114,11 +1234,32 @@ def gateway_down(day: date_type) -> Scenario:
     docs/REPLAY.md asks four things of this: survive it, do not conclude the
     account is empty just because it cannot be read, do not double up when the
     connection comes back, and reconcile before trading again.
+
+    Crafted bars and one book, so that the only thing changing across the outage
+    is the outage. Both names climb gently, so no stop, target or fade fires and
+    anything the book loses across the twenty minutes was lost by the outage.
     """
+    held, opened = "HOLD", "NEWBUY"
+
+    def build(scenario: Scenario):
+        series = {held: crafted_bars(day, ramp(day, 100.0, 101.0)),
+                  opened: crafted_bars(day, ramp(day, 50.0, 50.5))}
+        return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
+
+    watch: dict[str, dict] = {}
 
     def setup(context: RunContext) -> None:
-        seed_book_position(context, "A", "SPY", 50, 640.0, stop=600.0, target=800.0,
-                           opened_on=f"{day - timedelta(days=7):%Y-%m-%d}")
+        # Opened today, because a momentum book's time stop is one trading day
+        # and anything dated earlier is closed on the first manage tick.
+        seed_book_position(context, "A", held, 100, 100.0, stop=90.0, target=500.0,
+                           opened_on=f"{day:%Y-%m-%d}")
+
+    def after_tick(context: RunContext, moment: datetime) -> None:
+        # What the book believed at each edge of the outage. Reading it at the
+        # end of the day would only show the 15:55 flatten.
+        at = f"{moment:%H:%M}"
+        if at in ("10:55", "11:15", "11:20", "11:30"):
+            watch[at] = _positions(context, "BOOK_A")
 
     def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
         evidence: list[str] = []
@@ -1147,28 +1288,34 @@ def gateway_down(day: date_type) -> Scenario:
         else:
             failures.append("reconciliation never matched again after the Gateway "
                             "came back: "
-                            + "; ".join(sorted({t.reconcile_note for t in after}))[:200])
+                            + "; ".join(sorted({t.reconcile_note for t in after}))[:220])
 
-        held = _positions(context, "BOOK_A")
-        if held.get("SPY") == 50:
-            evidence.append("book A still knew it held 50 SPY on the other side of "
-                            "the outage, so nothing was lost from the book file")
+        before = watch.get("10:55", {}).get(held)
+        during = watch.get("11:15", {}).get(held)
+        after_it = watch.get("11:30", {}).get(held)
+        if before and during == before and after_it == before:
+            evidence.append(f"book A held {before} {held} before the outage, still "
+                            "said so on the last blind tick, and still said so "
+                            "afterwards, so it never concluded it held nothing just "
+                            "because it could not ask")
         else:
-            failures.append("book A held 50 SPY before the outage and holds "
-                            f"{held.get('SPY')} after it")
+            failures.append(f"book A's own record of {held} went {before} before the "
+                            f"outage, {during} during it and {after_it} after it")
 
-        duplicates: list[str] = []
-        seen: dict[tuple, int] = {}
-        for order in context.broker.orders:
-            key = (order.order_ref, order.symbol, order.side, order.qty,
-                   order.order_type)
-            seen[key] = seen.get(key, 0) + 1
-        for key, count in seen.items():
-            if count > 1:
-                duplicates.append(f"{key[0]} {key[2]} {key[3]} {key[1]} sent {count} times")
-        if duplicates:
-            evidence.append("orders repeated across the day (which a resting entry "
-                            "and its stop legitimately are): " + "; ".join(duplicates[:3]))
+        after_orders = [o for o in context.broker.orders if o.at[11:16] > "11:15"]
+        repeated = [o for o in after_orders
+                    if o.side == "BUY" and o.symbol in (held, opened)
+                    and o.purpose != "stop"]
+        entries_after = _entries_placed(context, "A")
+        late_entries = [r for r in entries_after if str(r.at)[11:16] > "11:15"]
+        if late_entries:
+            failures.append(
+                f"{len(late_entries)} new positions were opened after the connection "
+                "came back, in names the book already held, which is the double up "
+                "this scenario exists to catch")
+        else:
+            evidence.append(f"the {len(repeated)} buy orders after the recovery opened "
+                            "nothing new, so the loop did not buy what it already had")
 
         halted = context.halted_books()
         if halted:
@@ -1177,9 +1324,9 @@ def gateway_down(day: date_type) -> Scenario:
                 + " and nothing ever un-halted them. agent/loop.py's "
                 "read_broker_facts() catches the ConnectionError and hands "
                 "reconciliation an empty account, so a book that holds something "
-                "looks like a book that has lost it. The halt is written into the "
-                "book file and no code path anywhere clears it, so a twenty minute "
-                "Gateway outage costs the whole trading day.")
+                "looks exactly like a book that has lost it. The halt is written "
+                "into the book file and no code path anywhere clears it, so a "
+                "twenty minute Gateway outage costs the whole trading day.")
         else:
             evidence.append("no book was halted by the outage")
 
@@ -1191,12 +1338,14 @@ def gateway_down(day: date_type) -> Scenario:
         proves="that the loop survives four dead ticks, keeps its own record of what "
                "it holds, sends nothing while blind, and reconciles before trading "
                "again",
-        day=day, symbols=("SPY", "QQQ", "AAPL"),
-        book_patches=only("A", "B"),
+        day=day, symbols=(opened,), build_broker=build,
+        book_patches=only("A"),
         faults=(Fault(at="11:00", action="inject", kind="gateway_down"),
                 Fault(at="11:20", action="clear", kind="gateway_down")),
-        decider=lambda s: StubDecider(max_picks=1),
-        setup=setup, check=check,
+        decider=lambda s: StubDecider(
+            max_picks=1,
+            script=[ScriptedPick(book="A", symbol=opened, at="09:35", side="long")]),
+        setup=setup, after_tick=after_tick, check=check,
     )
 
 
@@ -1213,11 +1362,46 @@ def competing_session_and_delayed_data(day: date_type) -> Scenario:
     the loop must halt and alert rather than trade on stale numbers.
 
     From 10:35, every snapshot reports market data type 3. The loop must either
-    refuse to open a position on delayed prices or record loudly that it did.
-    Quietly trading on delayed quotes is the failure, and it is worth saying
-    that the paper account is served delayed data all the time today, so this is
-    the normal state of the world rather than an exotic fault.
+    refuse to open a position on delayed prices or record loudly that it opened
+    them on delayed prices. Quietly trading on delayed quotes is the failure,
+    and it is worth saying that the paper account is served delayed data all the
+    time today, so this is the normal state of the world rather than an exotic
+    fault.
+
+    One book, and a name that climbs all day, so the position is still there for
+    every manage tick to ask a quote about. With two momentum books the day ends
+    before 10:00 for a different reason: they pick from the same shortlist, land
+    in the same ticker and halt each other. See the clean day for that.
     """
+    name = "RISER"
+    watch: dict[str, dict] = {}
+
+    def build(scenario: Scenario):
+        series = {name: widen_opening(crafted_bars(day, ramp(day, 100.0, 102.0)), 97.0),
+                  "OTHER": crafted_bars(day, flat(60.0))}
+        return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
+
+    def after_tick(context: RunContext, moment: datetime) -> None:
+        at = f"{moment:%H:%M}"
+        if at in ("09:55", "10:30", "11:00"):
+            watch[at] = dict(context.halted_books())
+            watch.setdefault("held", {})[at] = _positions(context, "BOOK_A")
+
+    def _book_lines(context: RunContext, since: str) -> str:
+        """Only the lines the loop wrote about a book, not its own header.
+
+        The header names the sandbox folder, and the sandbox folder is named
+        after this scenario, so a plain search for the word delayed finds the
+        path rather than anything the loop noticed.
+        """
+        out = []
+        for tick in context.ticks:
+            if tick.at < since:
+                continue
+            for line in context.text(tick.at).splitlines():
+                if line.strip().startswith("[BOOK_"):
+                    out.append(line.strip())
+        return "\n".join(out).lower()
 
     def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
         evidence: list[str] = []
@@ -1228,26 +1412,39 @@ def competing_session_and_delayed_data(day: date_type) -> Scenario:
         if not ok:
             failures.append(line)
 
-        competing = [t for t in context.ticks if "10:00" <= t.at <= "10:30"]
-        text = "\n".join(context.text(t.at) for t in competing)
-        if "10197" in text:
+        holdings = watch.get("held", {})
+        if holdings.get("09:55"):
+            evidence.append(f"book A held {holdings['09:55']} going into the outage, "
+                            "so every tick of it asked the broker for a quote")
+        else:
+            failures.append("book A held nothing when the competing session began, so "
+                            "no snapshot was asked for and this scenario tested "
+                            "nothing. Fix the scenario, not the loop.")
+
+        during = _book_lines(context, "10:00")
+        if "10197" in during:
             evidence.append("the competing session error reached the loop's own log "
-                            "for the ticks between 10:00 and 10:30")
+                            "for the ticks between 10:00 and 10:30, as a note beside "
+                            "the book that could not get a quote")
         else:
             failures.append("the snapshots raised IBKR code 10197 for six ticks and "
                             "nothing about it reached the loop's log")
 
-        halted_during = {b for t in competing for b in t.halted_books}
-        if halted_during:
+        before = watch.get("09:55", {})
+        mid = watch.get("10:30", {})
+        if before:
+            failures.append(f"books were already halted before the fault: {before}")
+        if not before and mid:
             evidence.append("books halted while another session held the account: "
-                            + ", ".join(sorted(halted_during)))
-        else:
+                            + ", ".join(sorted(mid)))
+        elif not mid:
             failures.append(
                 "a competing session took the account for half an hour and no book "
-                "halted. agent/loop.py catches every snapshot failure in "
+                "halted. agent/loop.py catches every snapshot failure inside "
                 "snapshot_by_symbol() and turns it into a note, so IBKR code 10197 "
                 "is handled exactly like a quote that did not arrive. Nothing reads "
-                "the code and nothing halts.")
+                "the code and nothing halts, so the loop went on managing positions "
+                "off the last price it happened to have.")
 
         if context.alerts.alerts:
             evidence.append("alerts raised: "
@@ -1256,39 +1453,46 @@ def competing_session_and_delayed_data(day: date_type) -> Scenario:
             failures.append("nobody was told about the competing session, because "
                             "agent/loop.py has no alert call on any path")
 
-        delayed_ticks = [t for t in context.ticks if t.at >= "10:35"]
-        delayed_text = "\n".join(context.text(t.at) for t in delayed_ticks).lower()
-        entries_after = [o for o in context.broker.orders
-                         if o.at[11:16] >= "10:35" and o.side == "BUY"]
-        said_so = "delayed" in delayed_text
-        if said_so:
-            evidence.append("the loop wrote down that the data was delayed")
-        if entries_after and not said_so:
+        after = _book_lines(context, "10:35")
+        noticed = "market data type" in after or "delayed" in after
+        entries_after = [r for r in _entries_placed(context)
+                         if str(r.at)[11:16] >= "10:35"]
+        if noticed:
+            evidence.append("the loop wrote down that the quotes it was working from "
+                            "were delayed")
+        else:
             failures.append(
-                f"{len(entries_after)} buy orders were worked out on delayed prices "
-                "and nothing anywhere says so. Nothing in agent/loop.py reads "
-                "marketDataType off a snapshot: snapshot_price() looks at last, "
-                "marketPrice and close and no other field, so delayed and live "
-                "quotes are indistinguishable to the loop.")
-        elif not entries_after:
-            evidence.append("no new position was opened once the data went delayed, "
-                            "though that is because the entry window had closed, not "
-                            "because the loop noticed")
+                "from 10:35 every quote came back as market data type 3 and the loop "
+                "never said so once. Nothing in agent/loop.py reads marketDataType "
+                "off a snapshot: snapshot_price() looks at last, marketPrice and "
+                "close and no other field, so a delayed quote and a live one are the "
+                "same thing to it. That matters more than it sounds, because this "
+                "paper account is served delayed data every day.")
+        if entries_after:
+            evidence.append(f"{len(entries_after)} positions were opened after the "
+                            "feed went delayed")
+        else:
+            evidence.append("no position was opened after the feed went delayed, "
+                            "though that is because the day's entry was already made "
+                            "at 09:35 and not because the loop noticed")
 
         return not failures, evidence, failures
 
     return Scenario(
-        key="competing_session_and_delayed_data",
+        key="competing_session_delayed_data",
         title="A competing session, then delayed data",
         proves="that IBKR code 10197 halts the day, and that a position is never "
                "quietly opened on a delayed quote",
-        day=day, symbols=("SPY", "QQQ", "AAPL", "MSFT"),
-        book_patches=only("A", "B"),
+        day=day, symbols=(name,), build_broker=build,
+        book_patches=only("A"),
         faults=(Fault(at="10:00", action="inject", kind="competing_session"),
                 Fault(at="10:35", action="clear", kind="competing_session"),
                 Fault(at="10:35", action="inject", kind="delayed_data")),
-        decider=lambda s: StubDecider(max_picks=2),
-        check=check,
+        decider=lambda s: StubDecider(
+            max_picks=1,
+            script=[ScriptedPick(book="A", symbol=name, at="09:35", side="long",
+                                 entry=100.50, stop_pct=1.5)]),
+        after_tick=after_tick, check=check,
     )
 
 

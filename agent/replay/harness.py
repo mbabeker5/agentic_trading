@@ -529,17 +529,31 @@ class ReplayBroker:
                              else "open_orders" if working else "neither"),
         }
 
+    #: How agent/replay/fake_broker.py spells a refused order.
+    REJECTED_STATUS = "Rejected"
+
     def _remember(self, raw: dict, order_ref: str, purpose: str = "") -> None:
-        """Write one order into the gate's own record of what went past."""
+        """Write one order into the gate's own record of what went past.
+
+        The rejected flag has to be worked out twice over. place_order puts it
+        on the answer, but Order.as_dict() does not carry it, and a bracket's
+        legs are read back out of the broker's own order book rather than off
+        the answer. So the status is the fallback, and it is the same fact.
+        """
+        status = str(raw.get("status") or "")
+        rejected = bool(raw.get("rejected")) or status == self.REJECTED_STATUS
+        error = raw.get("error")
+        if error is None and rejected:
+            notes = [str(n) for n in (raw.get("notes") or [])]
+            error = notes[-1] if notes else "the broker rejected this order"
         self.orders.append(PlacedOrder(
             at=self._now_text(), book_id=str(order_ref or "").replace("BOOK_", ""),
             order_ref=str(order_ref or ""), symbol=str(raw.get("symbol") or ""),
             side=str(raw.get("side") or ""), qty=int(_number(raw.get("totalQuantity"))),
             order_type=str(raw.get("orderType") or ""),
             limit_price=raw.get("lmtPrice"),
-            order_id=raw.get("orderId"), status=str(raw.get("status") or ""),
-            rejected=bool(raw.get("rejected")), error=raw.get("error"),
-            purpose=purpose))
+            order_id=raw.get("orderId"), status=status,
+            rejected=rejected, error=error, purpose=purpose))
 
     def bracket_order(self, contract: dict, entry: dict, stop: dict,
                       target: dict | None = None, order_ref: str = "") -> dict:
