@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from agent import book_state as bs
+from agent import broker as broker_mod
 from agent import guardrails as gr
 from agent import loop
 from agent import pdt as pdt_mod
@@ -681,6 +682,67 @@ def test_a_missing_shortlist_is_not_an_error(sandbox):
     rows, message = loop.read_shortlist(sandbox / "output" / "nothing_here.json")
     assert rows == []
     assert "nothing to pick from" in message
+
+
+# ---------------------------------------------------------------------------
+# What the broker says about borrowing, which today is nothing
+# ---------------------------------------------------------------------------
+
+
+def test_the_live_servers_snapshot_says_nothing_about_borrowing():
+    """The exact shape the MCP server returned on 2026-09-06, borrow fields and all."""
+    row = {"conId": 756733, "symbol": "SPY", "secType": "STK", "bid": -1.0,
+           "ask": -1.0, "last": 769.45, "close": 773.17, "marketPrice": 769.45,
+           "delta": None, "gamma": None}
+    terms = broker_mod.borrow_terms(row)
+    assert terms.shortable is False
+    assert terms.level is None
+    assert terms.fee_pct_annual is None
+    assert terms.shares_available is None
+    assert "has not confirmed" in terms.note
+
+
+def test_borrow_terms_are_read_the_day_the_server_reports_them():
+    terms = broker_mod.borrow_terms({"symbol": "AAPL", "shortable": 3.0,
+                                     "shortableShares": 2500000, "feeRate": 0.25})
+    assert terms.shortable is True
+    assert terms.level == 3.0
+    assert terms.shares_available == 2500000
+    assert terms.fee_pct_annual == 0.25
+    assert "2,500,000" in terms.note
+
+
+def test_a_short_with_no_borrow_confirmed_is_refused(sandbox):
+    """The guardrails, not the loop, are what stop it. This checks the wiring."""
+    guard = guard_for("A")
+    assert guard.universe.require_shortable is True
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    account_state = bs.account_state_for(state, gr, at(9, 40), "DUT077572", False, {})
+
+    borrow = broker_mod.borrow_terms(None)
+    intent = loop._entry_intent("TSLA", short=True, quantity=10, price=250.0,
+                                book_id="A", borrow=borrow)
+
+    assert intent.side == "SELL"
+    assert intent.shortable is False
+    assert intent.shortable_level is None
+    assert intent.borrow_fee_pct_annual is None
+    assert intent.shares_available_to_borrow is None
+    decision = gr.check_order(guard, account_state, intent)
+    assert decision.allowed is False
+    assert "shortable_required" in decision.rule_ids
+
+
+def test_a_long_carries_no_borrow_fields_at_all():
+    borrow = broker_mod.borrow_terms({"symbol": "AAPL", "shortable": 3.0,
+                                      "shortableShares": 100, "feeRate": 0.25})
+    intent = loop._entry_intent("AAPL", short=False, quantity=10, price=100.0,
+                                book_id="A", borrow=borrow)
+    assert intent.side == "BUY"
+    assert intent.shortable is False
+    assert intent.shortable_level is None
+    assert intent.borrow_fee_pct_annual is None
+    assert intent.shares_available_to_borrow is None
 
 
 # ---------------------------------------------------------------------------

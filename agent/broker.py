@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -383,42 +384,104 @@ def session_vwap(bars: list[dict]) -> float | None:
     return mcp.session_vwap(bars)
 
 
-def shortable_from_snapshot(row: dict | None) -> tuple[bool, str]:
-    """Whether IBKR has said this name can be borrowed, and a sentence saying how we know.
+@dataclass(frozen=True)
+class BorrowTerms:
+    """What the broker says about borrowing one name, and a sentence saying how we know.
 
-    Checked against the live server on 2026-09-06: the snapshot the MCP server
-    returns holds conId, symbol, secType, exchange, currency, bid, ask, last,
-    close, marketPrice and the option greeks, and nothing about borrowing at all.
+    The four fields line up one for one with the borrow fields on
+    agent/guardrails.py's OrderIntent, so the loop can hand them straight over.
+
+        shortable         can it be borrowed at all
+        level             IBKR's own shortable indicator, 0 to 3, where anything
+                          above 2.5 is what it calls easy to borrow
+        fee_pct_annual    what the borrow costs, as a percentage a year
+        shares_available  how many shares can be borrowed right now
+    """
+
+    shortable: bool = False
+    level: float | None = None
+    fee_pct_annual: float | None = None
+    shares_available: int | None = None
+    note: str = ""
+
+
+def borrow_terms(row: dict | None) -> BorrowTerms:
+    """Read the borrow terms out of one snapshot row.
+
+    Checked against the live MCP server on 2026-09-06: the snapshot it returns
+    holds conId, symbol, secType, exchange, currency, bid, ask, last, close,
+    marketPrice and the option greeks, and nothing about borrowing at all.
     ibkr_get_contract_details has nothing either. So the honest answer today is
-    always "we do not know", which comes back as False.
+    "we do not know", which comes back as shortable False and three Nones.
 
     That is the safe direction and it is the designed behaviour, not a gap being
-    papered over: the momentum books set require_shortable: true, so the
-    shortable_required rule in agent/guardrails.py refuses every short until the
-    broker can actually answer the question. The three field names below are the
-    ones IBKR uses elsewhere, so the day the server starts passing them through,
-    this starts working with no other change.
+    papered over: the momentum books set require_shortable, so the borrow rules
+    in agent/guardrails.py refuse every short until the broker can actually
+    answer. The field names below are the ones IBKR uses elsewhere for these
+    three ticks, so the day the server starts passing them through, this starts
+    working with no other change.
     """
     if not isinstance(row, dict):
-        return False, ("no quote came back for this name, so nothing is known about "
-                       "borrowing it")
-    for key in ("shortable", "shortableShares", "shortable_shares"):
+        return BorrowTerms(note="no quote came back for this name, so nothing is "
+                                "known about borrowing it")
+
+    level = _first_number(row, ("shortable", "shortableLevel", "shortable_level"))
+    shares = _first_number(row, ("shortableShares", "shortable_shares",
+                                 "sharesAvailable", "shares_available_to_borrow"))
+    fee = _first_number(row, ("feeRate", "fee_rate", "borrowFee",
+                              "borrow_fee_pct_annual"))
+
+    # A bare true or false is the older shape, and it is still worth reading.
+    flag = row.get("shortable")
+    plain = flag if isinstance(flag, bool) else None
+
+    known = [name for name, value in
+             (("a shortable level of " + _fmt(level), level),
+              (_fmt(shares) + " shares available to borrow", shares),
+              ("a borrow fee of " + _fmt(fee) + " percent a year", fee)) if value is not None]
+    if plain is not None:
+        known.append(f"a shortable flag of {plain}")
+
+    if not known:
+        return BorrowTerms(note="the MCP snapshot carries no shortable level, borrow "
+                                "fee or share availability, so the broker has not "
+                                "confirmed this name can be borrowed")
+
+    shortable = bool(plain) if plain is not None else False
+    if level is not None:
+        shortable = level > 2.5
+    elif shares is not None:
+        shortable = shares > 0
+
+    return BorrowTerms(
+        shortable=shortable, level=level, fee_pct_annual=fee,
+        shares_available=int(shares) if shares is not None else None,
+        note="the broker reported " + ", ".join(known))
+
+
+def _first_number(row: dict, keys: tuple[str, ...]) -> float | None:
+    """The first of these keys that holds a real number, or None."""
+    for key in keys:
         value = row.get(key)
-        if value is None:
+        if value is None or isinstance(value, bool):
             continue
-        if isinstance(value, bool):
-            return value, f"the broker reported {key}={value}"
         try:
-            shares = float(value)
+            number = float(value)
         except (TypeError, ValueError):
             continue
-        return shares > 0, f"the broker reported {key}={value:g} shares available"
-    fee = row.get("feeRate") or row.get("borrowFee")
-    if fee is not None:
-        return True, f"the broker reported a borrow fee of {fee}, so the name is borrowable"
-    return False, ("the MCP snapshot carries no shortable flag, borrow fee or share "
-                   "availability, so the broker has not confirmed this name can be "
-                   "borrowed")
+        if number != number or number < 0:      # a NaN, or IBKR's -1 for unknown
+            continue
+        return number
+    return None
+
+
+def _fmt(value: float | None) -> str:
+    """A number a person can read. No scientific notation, ever, in a log line."""
+    if value is None:
+        return "?"
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:,.4f}".rstrip("0").rstrip(".")
 
 
 def _self_test() -> int:

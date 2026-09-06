@@ -1042,9 +1042,12 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
                     candidate["opening_range_low"] = bars[0].get("low")
                     notes.append(f"{symbol}: the opening range was taken from the "
                                  "first bar, because the scanner did not supply it")
-            shortable, why = broker_mod.shortable_from_snapshot(quote)
-            candidate["shortable"] = shortable
-            candidate["borrow_note"] = why
+            borrow = broker_mod.borrow_terms(quote)
+            candidate["shortable"] = borrow.shortable
+            candidate["shortable_level"] = borrow.level
+            candidate["borrow_fee_pct_annual"] = borrow.fee_pct_annual
+            candidate["shares_available_to_borrow"] = borrow.shares_available
+            candidate["borrow_note"] = borrow.note
         else:
             # The sweeps read filings and have no market data at all, so this is
             # where the price floor is applied.
@@ -1187,14 +1190,11 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
                     f"at {entry:.2f} this book's limits allow zero shares")
         return
 
-    shortable, borrow_note = _borrow_answer(state, symbol)
-    intent = gr.OrderIntent(
-        symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
-        limit_price=round(entry, 2), purpose="entry", book_id=tick.book.book_id,
-        shortable=bool(shortable) if short else False)
+    borrow = _borrow_answer(state, symbol)
+    intent = _entry_intent(symbol, short, quantity, entry, tick.book.book_id, borrow)
     extra = f"stop {stop:.2f}, target {target:.2f}"
     if short:
-        extra += f", borrow: {borrow_note}"
+        extra += f", borrow: {borrow.note}"
     decision = consider(tick, state, guard, account_state, intent, broker, guards,
                         extra=extra, model=result.model, cost=None,
                         prompt_hash=result.prompt_hash)
@@ -1207,21 +1207,43 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
         state.halt("a guardrail asked for a halt for the rest of the day")
 
 
-def _borrow_answer(state: bs.BookState, symbol: str) -> tuple[bool, str]:
-    """What the broker said about borrowing this name, from the shortlist row.
+def _borrow_answer(state: bs.BookState, symbol: str) -> broker_mod.BorrowTerms:
+    """What the broker said about borrowing this name, off the shortlist row.
 
     Checked against the live MCP server on 2026-09-06: its snapshot carries no
-    shortable flag, no borrow fee and no share availability, and neither does
+    shortable level, no borrow fee and no share availability, and neither does
     ibkr_get_contract_details, so the answer today is always "the broker has not
-    confirmed it". The momentum books set require_shortable: true, so the
-    shortable_required rule in agent/guardrails.py refuses every short until the
-    server can answer.
+    confirmed it". The momentum books set require_shortable, so the borrow rules
+    in agent/guardrails.py refuse every short until the server can answer. That
+    is the designed behaviour and not a gap.
     """
     for row in state.shortlist:
         if isinstance(row, dict) and str(row.get("symbol") or "").upper() == symbol:
-            if "shortable" in row:
-                return bool(row.get("shortable")), str(row.get("borrow_note") or "")
-    return broker_mod.shortable_from_snapshot(None)
+            if "borrow_note" in row:
+                return broker_mod.BorrowTerms(
+                    shortable=bool(row.get("shortable")),
+                    level=row.get("shortable_level"),
+                    fee_pct_annual=row.get("borrow_fee_pct_annual"),
+                    shares_available=row.get("shares_available_to_borrow"),
+                    note=str(row.get("borrow_note") or ""))
+    return broker_mod.borrow_terms(None)
+
+
+def _entry_intent(symbol: str, short: bool, quantity: int, price: float,
+                  book_id: str, borrow: broker_mod.BorrowTerms) -> gr.OrderIntent:
+    """One entry order, with the borrow terms on it when it is a short.
+
+    A long carries none of them, because nothing is being borrowed. A short
+    carries all four exactly as the broker reported them, unknowns included, and
+    an unknown is what the guardrails refuse on.
+    """
+    return gr.OrderIntent(
+        symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
+        limit_price=round(price, 2), purpose="entry", book_id=book_id,
+        shortable=bool(borrow.shortable) if short else False,
+        shortable_level=borrow.level if short else None,
+        borrow_fee_pct_annual=borrow.fee_pct_annual if short else None,
+        shares_available_to_borrow=borrow.shares_available if short else None)
 
 
 def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
@@ -1503,15 +1525,13 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
             tick.record(state, symbol, "no entry",
                         f"at {last_close:.2f} this book's limits allow zero shares")
             continue
-        shortable, borrow_note = _borrow_answer(state, symbol)
-        intent = gr.OrderIntent(
-            symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
-            limit_price=round(last_close, 2), purpose="entry",
-            book_id=tick.book.book_id, shortable=bool(shortable) if short else False)
+        borrow = _borrow_answer(state, symbol)
+        intent = _entry_intent(symbol, short, quantity, last_close,
+                               tick.book.book_id, borrow)
         tick.say(f"  {symbol} broke its {entry:.2f} trigger, now {last_close:.2f}")
         decision = consider(tick, state, guard, account_state, intent, broker, guards,
                             extra=f"stop {_number(pick.get('stop')):.2f}"
-                                  + (f", borrow: {borrow_note}" if short else ""))
+                                  + (f", borrow: {borrow.note}" if short else ""))
         state.triggered[symbol] = {
             "at": tick.now.isoformat(), "price": last_close,
             "allowed": decision.allowed, "sent": False, "mode": tick.book.mode}
