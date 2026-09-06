@@ -523,6 +523,140 @@ def test_an_entry_goes_out_as_a_bracket_with_every_leg_tagged(sandbox):
     assert all(leg["order_ref"] == guard.order_ref for leg in sent["legs"])
 
 
+# ---------------------------------------------------------------------------
+# Nothing this book has resting survives the flatten
+# ---------------------------------------------------------------------------
+
+
+def _live(book_id: str = "A", now=None, monkeypatch=None):
+    """A tick with all four live locks open, and the account state to match."""
+    book = book_for(book_id, "full")
+    return loop.BookTick(book, now or at(15, 46), "testhash", write_ledger=False,
+                         quiet=True)
+
+
+def test_the_flatten_pulls_every_order_this_book_has_resting(sandbox, monkeypatch):
+    """Found by the replay gate: cancel_order was called in exactly one place.
+
+    An entry that never filled and the stop and target children that went out
+    with it were all left resting through the close. A momentum book meant to be
+    flat by 15:55 could be filled into a fresh position on the way out, and its
+    children could then sell stock it does not own.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    state = fresh_state(sandbox)
+    state.working_orders = {
+        "501": {"symbol": "REST", "purpose": "entry", "remaining": 100,
+                "limit_price": 99.5},
+        "502": {"symbol": "AAPL", "purpose": "stop", "price": 98.5, "is_child": True},
+        "503": {"symbol": "AAPL", "purpose": "target", "price": 103.0,
+                "is_child": True},
+    }
+    guard = guard_for("A")
+    tick = _live("A")
+    broker = RecordingBroker()
+    account_state = bs.account_state_for(state, gr, at(15, 46), "DUT077572", False)
+
+    cancelled = loop.cancel_working_orders(
+        tick, state, broker, loop.read_guards(sandbox), account_state,
+        "this book is flattening at 15:45")
+
+    assert cancelled == 3
+    assert sorted(broker.cancelled) == ["501", "502", "503"]
+    assert state.working_orders == {}
+
+
+def test_a_dry_run_cancels_nothing_and_says_what_it_would_have(sandbox):
+    state = fresh_state(sandbox)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry"}}
+    tick = loop.BookTick(book_for("A", "dry_run"), at(15, 46), "testhash",
+                         write_ledger=False, quiet=True)
+    broker = RecordingBroker()
+    account_state = bs.account_state_for(state, gr, at(15, 46), "DUT077572", False)
+
+    assert loop.cancel_working_orders(
+        tick, state, broker, loop.read_guards(sandbox), account_state,
+        "this book is flattening") == 0
+    assert broker.cancelled == []
+    assert state.working_orders, "nothing was sent, so nothing was pulled"
+
+
+def test_an_order_that_will_not_cancel_stays_in_the_book_file(sandbox, monkeypatch):
+    """So the next tick tries again rather than forgetting the order exists."""
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+
+    class Stubborn(RecordingBroker):
+        def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+            return {"order_id": order_id, "cancelled": False,
+                    "error": "it filled a moment ago"}
+
+    state = fresh_state(sandbox)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry"}}
+    tick = _live("A")
+    broker = Stubborn()
+    account_state = bs.account_state_for(state, gr, at(15, 46), "DUT077572", False)
+
+    assert loop.cancel_working_orders(
+        tick, state, broker, loop.read_guards(sandbox), account_state,
+        "this book is flattening") == 0
+    assert "501" in state.working_orders
+    assert any("would not cancel" in note for note in tick.notes)
+
+
+def test_a_broker_that_raises_on_cancel_does_not_stop_the_flatten(sandbox,
+                                                                  monkeypatch):
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+
+    class Broken(RecordingBroker):
+        def cancel_order(self, order_id):
+            raise RuntimeError("the gateway went away mid cancel")
+
+    state = fresh_state(sandbox)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry"}}
+    tick = _live("A")
+    account_state = bs.account_state_for(state, gr, at(15, 46), "DUT077572", False)
+
+    assert loop.cancel_working_orders(
+        tick, state, Broken(), loop.read_guards(sandbox), account_state,
+        "this book is flattening") == 0
+    assert "501" in state.working_orders
+
+
+def test_a_book_with_nothing_resting_cancels_nothing(sandbox, monkeypatch):
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    state = fresh_state(sandbox)
+    broker = RecordingBroker()
+    account_state = bs.account_state_for(state, gr, at(15, 46), "DUT077572", False)
+
+    assert loop.cancel_working_orders(
+        tick := _live("A"), state, broker, loop.read_guards(sandbox), account_state,
+        "this book is flattening") == 0
+    assert broker.cancelled == []
+    assert tick.notes == []
+
+
+def test_a_flatten_with_nothing_held_still_pulls_the_resting_entry(sandbox,
+                                                                   monkeypatch):
+    """The exact shape the gate found: an entry resting, no position, the close."""
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    state = fresh_state(sandbox)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry",
+                                    "remaining": 100, "limit_price": 99.5}}
+    guard = guard_for("A")
+    plan = loop.plan_for(book_for("A", "full"), guard)
+    tick = _live("A")
+    broker = RecordingBroker()
+    account_state = bs.account_state_for(state, gr, at(15, 46), "DUT077572", False)
+
+    loop.do_flatten(tick, state, plan, guard, broker, account_state,
+                    loop.read_guards(sandbox))
+
+    assert broker.cancelled == ["501"]
+    assert state.working_orders == {}
+    assert broker.placed == [], "there was nothing to close, only something to pull"
+
+
 def test_the_child_order_ids_are_written_into_the_book_file(sandbox):
     state = fresh_state(sandbox)
     guard = guard_for("A")

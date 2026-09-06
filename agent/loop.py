@@ -3228,10 +3228,83 @@ def flatten_price(quote: dict | None, short: bool) -> float | None:
     return snapshot_price(quote)
 
 
+def cancel_working_orders(tick: BookTick, state: bs.BookState,
+                          broker: broker_mod.Broker, guards: Guards,
+                          account_state, why: str) -> int:
+    """Pull every order this book still has resting at the broker. Returns how many.
+
+    Found by the replay gate rather than by reading the code: agent/loop.py used
+    to call cancel_order in exactly one place, move_resting_stop(), when the
+    trailing rule tightened a stop. Nothing cancelled an entry that never
+    filled, and nothing cancelled the stop and target children that went out
+    with it. So a momentum book that is meant to be flat by 15:55 could be
+    filled into a fresh position between the flatten and the close, and its two
+    children could then fill on their own and sell stock the book does not own.
+    They are DAY orders, so IBKR would expire them at the close: that covers the
+    overnight case and not the five minutes that actually matter.
+
+    Cancel first, then send the closing order, exactly as move_resting_stop
+    does. A moment with no stop is bad; a moment with a stop AND a flatten both
+    live is worse, because both can fill and the book ends up short a position
+    it never opened. Between 15:45 and the close the book is looking every
+    thirty seconds and is actively getting out, which is what makes that trade
+    the right way round.
+
+    An order that will not cancel is written down and left in the book file, so
+    the next tick tries again rather than forgetting it exists.
+    """
+    resting = [(order_id, order) for order_id, order
+               in list((state.working_orders or {}).items())
+               if isinstance(order, dict)]
+    if not resting:
+        return 0
+
+    open_locks, shut = live_locks(tick.book, account_state.account_id, guards)
+    if tick.dry or not open_locks:
+        for order_id, order in resting:
+            tick.say(f"DRY RUN {tick.tag} would cancel order {order_id}, "
+                     f"{order.get('purpose') or 'entry'} in "
+                     f"{order.get('symbol') or 'an unknown name'}, because {why}")
+        return 0
+
+    cancelled = 0
+    for order_id, order in resting:
+        symbol = str(order.get("symbol") or "").upper()
+        purpose = str(order.get("purpose") or "entry")
+        try:
+            answer = broker.cancel_order(order_id) or {}
+        except Exception as exc:                 # noqa: BLE001
+            tick.note(f"{symbol}: order {order_id} would not cancel ({exc}), so it "
+                      "is still resting at the broker and the next tick tries again")
+            continue
+        if not answer.get("cancelled"):
+            tick.note(f"{symbol}: order {order_id} would not cancel "
+                      f"({answer.get('error') or 'no reason given'}), so it is still "
+                      "resting at the broker and the next tick tries again")
+            continue
+        state.working_orders.pop(str(order_id), None)
+        cancelled += 1
+        tick.rule("working_order_cancelled",
+                  f"{symbol}: order {order_id} ({purpose}) was pulled because {why}",
+                  "cancelled at the broker and removed from this book's file")
+        tick.record(state, symbol, f"cancelled order {order_id}",
+                    f"the {purpose} order was still resting and {why}")
+    if cancelled:
+        tick.say(f"  cancelled {cancelled} resting order(s), because {why}")
+    return cancelled
+
+
 def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
                guard: gr.Guardrails, broker: broker_mod.Broker, account_state,
                guards: Guards) -> None:
     """Close everything, in the two stages Momentum v2 asks for (item A11).
+
+    Everything this book has resting at the broker is cancelled first, holding
+    something or not: an entry that never filled, the stop and target children
+    of a position about to be closed, and the previous tick's limit flatten that
+    did not get done. A book that is going flat must not be filled into a fresh
+    position on the way out, and it must not leave a child able to sell stock it
+    no longer owns. See cancel_working_orders above for how that was found.
 
     From flatten_at, 15:45, every position goes out as a LIMIT order at the bid
     for a long and the ask for a short. Spreads widen and depth collapses in the
@@ -3242,6 +3315,11 @@ def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
     few cents. A book with no flatten_market_at in its settings behaves exactly
     as it always did and sends market orders throughout.
     """
+    # Everything this book has resting at the broker comes off first, and that
+    # is true whether or not it is holding anything. See the docstring.
+    cancel_working_orders(tick, state, broker, guards, account_state,
+                          f"this book is flattening at {plan.flatten_at:%H:%M}")
+
     positions = state.all_positions()
     if not positions:
         tick.say(f"Nothing is open at {plan.flatten_at:%H:%M}, so there is nothing "
