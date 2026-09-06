@@ -4,7 +4,9 @@ Improvements ranked by how much risk they remove, highest first. Operational ite
 
 | Rank | Item | Risk it removes | Type | Status |
 |---|---|---|---|---|
-| 1 | Replay harness as the promotion gate (full five-book loop against recorded data with a fake broker) | Shipping a loop that breaks on its first live day | operational | building |
+| 0 | Loop follow-on from the replay gate: fill ingestion from broker executions into book state, sector and halt and cross-book fields filled on every intent, no re-send while an order is working, alerts from the loop, Gateway outage handled without a false halt, halts clearable, orphan positions alert, 10197 and delayed data visible, halt reason bounded | Gate found nine bugs; no book can trade until fixed | operational | queued behind Momentum v2 |
+| 0a | DECISION for Mo: books sharing a strategy (A, B, E) collide under one-ticker-one-book. Either attribute fills per order reference and allow shared symbols, or give shared-strategy books an allocation rule | Eval comparison between A, B and E is meaningless if only A ever gets the top names | decision | open |
+| 1 | Replay harness as the promotion gate (full five-book loop against recorded data with a fake broker) | Shipping a loop that breaks on its first live day | operational | shipped b5571ca; first run 6 pass 6 fail, see item 0 |
 | 2 | Reconciliation on every tick with per-book halt | Trading a book against the wrong picture of what it holds | operational | shipped (reconcile.py, loop) |
 | 3 | Watchdog with Gateway restart and Mo alert | Silent multi-day outage, seen 2026-09-03 to 09-06 | operational | shipped, launchd job not yet loaded |
 | 4 | Pre-flight at 9:00 with no-trade-today file | Trading on delayed data or an unreconciled book | operational | shipped, launchd job not yet loaded |
