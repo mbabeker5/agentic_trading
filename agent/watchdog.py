@@ -117,12 +117,16 @@ DISK_FLOOR_BYTES = 1024 ** 3
 REALERT_AFTER = timedelta(minutes=30)
 
 #: IBKR message codes worth naming.
-CODE_NO_SUBSCRIPTION = 354      # not subscribed, delayed prices only
-CODE_NO_API_SUBSCRIPTION = 10089  # the same news worded differently, seen 2026-09-06
-CODE_COMPETING_SESSION = 10197  # a live login is holding the market data feed
+CODE_NO_SUBSCRIPTION = 354        # not subscribed, delayed prices only
+CODE_NO_API_SUBSCRIPTION = 10089  # needs an extra subscription for the API
+CODE_NOT_SUBSCRIBED = 10168       # not subscribed and delayed is not enabled either
+CODE_COMPETING_SESSION = 10197    # a live login is holding the market data feed
 
-#: Both of the codes that mean "you are on delayed prices".
-NOT_SUBSCRIBED_CODES = (CODE_NO_SUBSCRIPTION, CODE_NO_API_SUBSCRIPTION)
+#: The three codes that all mean the same thing: no real time quotes for us.
+#: IBKR picks between them depending on what it was last asked for, so all three
+#: are treated the same. All three were seen from this Gateway on 2026-09-06.
+NOT_SUBSCRIBED_CODES = (CODE_NO_SUBSCRIPTION, CODE_NO_API_SUBSCRIPTION,
+                        CODE_NOT_SUBSCRIBED)
 
 #: IBC restarts IB Gateway by itself every night around 2 AM Eastern. A watchdog
 #: that starts a second Gateway in the middle of that gives two logins fighting
@@ -482,7 +486,8 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not math.isnan(float(value))
 
 
-def check_ib_and_market_data(port_ok: bool, market_hours: bool = True) -> tuple[Check, Check]:
+def check_ib_and_market_data(port_ok: bool, market_hours: bool = True,
+                            client_id: int = CLIENT_ID) -> tuple[Check, Check]:
     """One read only connection, two answers: the login and the quote feed.
 
     readonly=True on purpose. A read only API session cannot place, change or
@@ -511,7 +516,7 @@ def check_ib_and_market_data(port_ok: bool, market_hours: bool = True) -> tuple[
     ib.errorEvent += lambda reqId, code, msg, *rest: codes.append(code)
     try:
         try:
-            ib.connect(GATEWAY_HOST, GATEWAY_PORT, clientId=CLIENT_ID,
+            ib.connect(GATEWAY_HOST, GATEWAY_PORT, clientId=client_id,
                        timeout=15, readonly=True)
         except Exception as exc:                                  # noqa: BLE001
             return (Check(CHECK_IB_CONNECT, ok=False,
