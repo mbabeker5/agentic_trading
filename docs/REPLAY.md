@@ -26,16 +26,21 @@ in five specific ways. The loop cannot tell the difference, because the fake
 broker offers exactly the same read methods as
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/mcp_client.py`.
 
-## The three pieces
+## The six pieces
 
 | File | What it does |
 |---|---|
 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/fetch_history.py` | Pulls past bars out of IB Gateway, read only |
 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/record_day.py` | Records one live trading day as it happens, read only |
 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/fake_broker.py` | Replays what those two recorded, and fills orders against it |
+| `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/stub_decider.py` | Stands in for `agent/decide.py`, so no model is called and the gate is free |
+| `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/harness.py` | Steps the real loop through a whole day against the fake broker, and reports |
+| `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/scenarios.py` | The twelve things the gate proves, one `Scenario` each |
 
 Shared plumbing lives in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/common.py`.
+The gate has its own tests at
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_replay_gate.py`.
 
 The first two connect to IB Gateway with `readonly=True` and call nothing but
 quotes and historical bars. There is no order code in either file. That is not a
@@ -282,11 +287,32 @@ needs a scenario where it blocks an order, and the block has to show up in the
 ledger with that rule id on it. A guardrail that never fires during the whole
 harness has not been tested, it has just not been reached.
 
-`paper_only`, `wrong_account`, `wrong_book`, `kill_switch`, `sec_type`,
-`currency`, `blacklist`, `whitelist`, `no_shorts`, `short_price_floor`,
-`shortable_required`, `entry_window`, `outside_market_hours`, `flatten_time`,
-`daily_loss_cap`, `max_order_notional`, `max_position_pct`,
-`max_open_positions`, `gross_exposure_cap`, `entries_per_day`.
+`paper_only`, `wrong_account`, `wrong_book`, `kill_switch`, `symbol_exclusive`,
+`halted`, `sec_type`, `currency`, `blacklist`, `whitelist`, `no_shorts`,
+`short_price_floor`, `shortable_required`, `entry_window`,
+`outside_market_hours`, `flatten_time`, `daily_loss_cap`, `max_order_notional`,
+`max_position_pct`, `max_open_positions`, `gross_exposure_cap`,
+`entries_per_day`.
+
+Twenty two of them, not the twenty this list started with: `symbol_exclusive`
+and `halted` arrived with commit `e653508`. That list is not maintained by hand
+any more. `test_the_gate_covers_every_rule_id_the_guardrails_can_emit` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_replay_gate.py`
+reads the `decision.add(...)` calls straight out of
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py`
+and fails if the gate's list and the module have drifted apart, because a rule
+the gate does not know about is a rule the gate would silently report as
+covered.
+
+**A rule the loop can only reach with help is worth less than one it reaches on
+its own.** The gate says which is which. Seven rule ids are reached by the
+loop's own order flow. The rest are backstops behind a door the loop keeps shut:
+it will not build an entry outside the entry window, it will not build one while
+the stop file is there, it sizes every entry through `max_shares_for` so it
+cannot ask for more than the caps allow, and it always builds a dollar
+denominated share order tagged for the right book. Those are proven by pushing a
+crafted order through `agent/loop.py`'s own `consider()`, with the real
+guardrails and the real ledger writing, and the report labels them as probes.
 
 ### The named scenarios
 
@@ -326,6 +352,129 @@ harness has not been tested, it has just not been reached.
     Quietly trading on delayed quotes is the failure.
 12. **An order comes back rejected.** Inject `reject_next_order`. The loop must
     not treat a rejection as a fill, and must not retry it in a loop.
+
+### Which scenario is which
+
+Each numbered requirement above is one scenario in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/scenarios.py`,
+named by a key you can hand to `--scenario`.
+
+| Key | Bars | What it covers |
+|---|---|---|
+| `clean_day` | recorded | Requirements 1 to 3: the day runs, everything reaches the ledger, the books and the broker agree |
+| `clean_day_no_fill_bridge` | recorded | The same day with the harness fill bridge off, which measures what the loop can do on its own |
+| `every_guardrail` | recorded | Every rule id blocks an order and is written down |
+| `daily_loss_cap` | crafted | Requirement 4 |
+| `flatten_at_close` | crafted | Requirement 5, both halves: a position open at 15:50, and a book with nothing to sell |
+| `phantom_position` | crafted | Requirement 6, in both its shapes: a mismatch with a book's name on it, and an orphan with nobody's |
+| `kill_switch` | crafted | Requirement 7, running the real `agent/kill_switch.py` against the fake broker |
+| `day_trade_counter` | crafted | Requirement 8 |
+| `gateway_down` | crafted | Requirement 9 |
+| `competing_session_delayed_data` | crafted | Requirements 10 and 11 |
+| `rejected_order` | recorded | Requirement 12 |
+| `two_books_one_symbol` | crafted | One ticker, one book: the rule that arrived with commit `e653508` |
+
+Where the table says crafted, the bars were written by hand because a recorded
+session will not fall through a stop, hold a position to 15:50 or put two books
+in one name on request. Those scenarios prove the loop's arithmetic and its
+decisions. They prove nothing about the market. The scenarios marked recorded
+run on the real five minute bars of a real session.
+
+## Running the gate
+
+```bash
+cd /Users/mtalib/workspace_repos/personal_repo/agentic_trading
+
+# The whole thing. Twelve scenarios, about twenty seconds, no network at all.
+./venv312/bin/python -m agent.replay.harness --all
+
+# What it would run, and what each one proves.
+./venv312/bin/python -m agent.replay.harness --list
+
+# One scenario, repeatable, when you are chasing a single failure.
+./venv312/bin/python -m agent.replay.harness --scenario kill_switch
+
+# Skip the three slow ones, which is what the tests do.
+./venv312/bin/python -m agent.replay.harness --all --fast
+
+# A different recorded session.
+./venv312/bin/python -m agent.replay.harness --all --day 2026-09-03
+
+# The gate's own tests: the safety locks plus the nine fast scenarios, 15 seconds.
+./venv312/bin/python -m pytest -q tests/test_replay_gate.py
+```
+
+It writes two things. A plain language summary to the terminal, one block per
+scenario with its evidence and its failures written as sentences. And a JSON
+report at
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/replay_gate_YYYY-MM-DD.json`
+holding the same thing plus the per book end of day state, the rule ids that
+fired, the alerts that were captured, the day trade counts and the number of
+ledger rows. **The exit code is 0 only when every scenario passed.** Anything
+else is a 1, and a 1 means no book is promoted.
+
+Each scenario builds its own project root under
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/replay_sandbox/<scenario>/`
+and everything the loop writes goes in there: the book state files, the decision
+packets, the day trade counters, the guard files, the tick log. Nothing a gate
+run does touches the real `output/` folder except the report at the end. The
+sandboxes are left behind on purpose, because the first thing you want after a
+failure is the state file and the packet the loop was looking at.
+
+### Why the gate can open the live order path and still be safe
+
+The gate does two things that would be alarming anywhere else. It writes `full`
+into the mode of every book in its sandbox copy of the register, with
+`promoted_on` and `rules_commit` stamped so the register will load. And it sets
+`AGENTIC_TRADING_LIVE_ORDERS=yes` in its own process for the length of the run.
+
+Both are on purpose. Those are two of `agent/loop.py`'s four locks on the live
+order path, and a gate that left them shut would be exercising the dry run
+branch and proving nothing about the branch that will actually send orders in
+October.
+
+What makes it safe is not a lock at all but an object: the broker on the other
+end is a `FakeBroker`, and a `FakeBroker` cannot reach IB Gateway. That is
+checked rather than assumed, twice, before a single tick runs and again inside
+the adapter, and a run handed anything else stops dead with a message saying so. `agent/broker.py`'s `McpBroker` is replaced for the length of the run
+with a class whose constructor raises, so nothing the loop imports can quietly
+build a real one. The environment variable is put back in a `finally` block. The
+MCP order tools are never imported. And the sandbox holds no `agent/` folder and
+no `venv312`, so `run_helper()` cannot shell out to the scanner or a sweep,
+which are the only two things in a tick that would otherwise reach IBKR or the
+SEC.
+
+`tests/test_replay_gate.py` tests each of those rather than trusting them.
+
+## What a pass means, and what it does not
+
+A passing scenario means one thing: on this recorded day, with these bars, the
+loop did what the strategy documents say it must, and the evidence is written
+out underneath it in words you can check.
+
+What it does not mean is that the strategy works, or that the numbers in it are
+right, or that tomorrow will go the same way. Read the next section before
+treating a green run as permission for anything.
+
+**Evidence is not decoration.** Every scenario prints the specific fact it
+checked, not "ok". If a line reads `daily_loss_cap was logged against book A`
+you can go and find that row. A scenario with no evidence line for the thing it
+claims to prove has not proved it.
+
+**A failure is a finding, not a broken test.** Five of the twelve scenarios fail
+against the loop as it stands on 2026-09-06, and every one of them fails on
+something real: the loop has no `cancel_order` call anywhere, it has no
+`alert()` call anywhere, it cannot tell a Gateway that is down from an account
+that is empty, it does not read the market data type off a quote, and books A, B
+and E pick the same names and halt each other. Those are in the failure lines,
+in full sentences, with the reason.
+
+**The gate marks its own weak spots.** Where a scenario runs on bars written by
+hand rather than recorded, it says so. Where a rule was only reached by pushing a
+crafted order at it, the report separates that from the rules the loop reached
+on its own. Where the harness stood in for something the loop cannot do, the
+report says which and the clean day is run a second time with that stand in
+switched off so the gap is on the record.
 
 ## What replay cannot catch
 
@@ -376,6 +525,96 @@ harness does not either.
 process that wrote the loop. If the fake broker's arithmetic is wrong, every
 scenario it passes is worthless. That is why every fill rule has a test with the
 price worked out by hand rather than by running the code and pasting the answer.
+
+**What the harness stands in for.** `agent/loop.py` records a fill in one place
+only, from what `place_order()` hands straight back. There is no code in it that
+reads `executions()` or turns a resting order into a position later. Against a
+live market a marketable order comes back already filled, so that mostly works.
+Against a limit order that fills at 10:20 it does not, and the position exists
+at the broker while the book file has never heard of it. The harness carries a
+fill bridge that reads the broker's own executions after every tick and applies
+them with the loop's own `record_fill()`, and it tells the day trade counter
+about them too, because the loop only does that for an order that came back
+filled. **Every scenario downstream of a fill is running on that bridge.** The
+`clean_day_no_fill_bridge` scenario runs the same day with it switched off, so
+the size of the gap is measured rather than argued about. If that scenario ever
+reports the gap has closed, delete the bridge.
+
+**A bracket's children are not one cancels the other here.** IBKR hangs the stop
+and the target off the parent's id, activates them when the parent fills, and
+pulls one when the other fills. `agent/replay/fake_broker.py` says plainly that
+it does none of that: both children are live from the moment they are placed and
+neither cancels the other. That is harder than the real thing rather than
+easier, which is the right direction, but it means an entry limit resting well
+below the market has a target child that will sell stock the book does not own.
+Read any short position that appears in a gate run against that before believing
+it.
+
+**A resting stop is outside every rule the loop enforces.** Since the bracket
+work landed, a position's stop sits at the broker, which is the point of it. It
+also means the stop fires without asking anything. The day trade scenario shows
+book C's fourth round trip refused by `pdt_limit` and then happening anyway,
+because the stop was already resting. Any rule that works by refusing the loop's
+own closing order is weaker than it reads.
+
+**Nothing here proves the scanner works.** The gate builds its shortlist out of
+the recorded bars, ranked by the size of the move and what traded, because the
+real scanner talks to IBKR's scanner service and a replay cannot. That is the
+scanner's idea in miniature, not a copy of it. A green gate says the loop does
+something sensible with a shortlist. It says nothing at all about whether the
+shortlist would have held those names.
+
+## The promotion checklist
+
+Nothing here is automatic. Promotion is Mo editing
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml`
+by hand, one book at a time. This is the list to work down before making that
+edit, and every line of it is a thing to check rather than a thing to assume.
+
+**Before the gate**
+
+1. `./venv312/bin/python -m pytest -q` passes on the whole repository.
+2. The recording being replayed is real and usable: open its `manifest.json` and
+   check the sessions are complete, the gaps list is empty, and the quotes have
+   real bids and asks in them rather than the nulls a shut market returns.
+3. `git status` is clean, so the hash the gate reports is the hash that ran.
+
+**The gate**
+
+4. `./venv312/bin/python -m agent.replay.harness --all` exits 0. Not "mostly
+   passed". Zero.
+5. Read the summary rather than the exit code. Every scenario's evidence lines
+   say what was actually checked, and a scenario that passed with nothing
+   underneath it has proved nothing.
+6. Check that every rule id turns up in the report's `rule_ids_fired` list. A
+   guardrail that did not fire has not been tested, it has only not been
+   reached.
+7. Check how many rule ids were reached by the loop's own order flow rather than
+   by a probe, and be honest about the difference.
+8. Run it again on a second recorded session, `--day`, and read the differences.
+   One day is one day.
+9. Run one full scenario with `partial_fill_probability` turned on, because
+   partial fills are the normal case in a real account and they are off by
+   default here.
+
+**Beyond the gate, which the gate cannot tell you**
+
+10. The strategy numbers in the book's `strategy.yaml` are approved, not
+    provisional. Every one of them still says `status: provisional` today.
+11. The hub has approved this specific book, and the date and the rules hash go
+    into `promoted_on` and `rules_commit` at the same moment the mode changes.
+    A book set to `tiny` or `full` without both refuses to load, which is the
+    last mechanical check between a typo and a live order.
+12. The book goes to `tiny` first, never straight to `full`. `tiny` risks
+    `money.tiny_capital_usd`, which is 2,000 dollars.
+13. One book at a time. Watch it for a week before the next one.
+14. The kill switch has been pulled by hand, for real, against the paper
+    account, and the account was empty afterwards. Rehearsing it in a replay is
+    not the same as knowing the button works on the day.
+15. Alerts reach a human. As of 2026-09-06 `agent/loop.py` contains no `alert()`
+    call at all, so a halt is written to a log file nobody is watching. Fix that
+    before a book sends a real order, or accept that a halted book will go
+    unnoticed until somebody opens the ledger.
 
 ## The interface the loop codes against
 
@@ -499,4 +738,8 @@ cd /Users/mtalib/workspace_repos/personal_repo/agentic_trading
 
 # The fake broker's own tests
 ./venv312/bin/python -m pytest -q tests/test_replay_fake_broker.py
+
+# The gate itself. See "Running the gate" above for the rest.
+./venv312/bin/python -m agent.replay.harness --all
+./venv312/bin/python -m pytest -q tests/test_replay_gate.py
 ```
