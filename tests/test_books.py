@@ -351,12 +351,32 @@ def test_a_book_may_only_run_in_one_of_the_three_named_modes(tmp_path: Path):
 
 
 def test_every_book_is_still_on_dry_run_today():
-    """Nothing sends an order until Mo promotes a book by hand."""
+    """Nothing sends an order until Mo promotes a book by hand.
+
+    A stamped rules_commit is NOT a promotion. Books A, B and E carry the hash
+    of the commit that holds Momentum v2, which says which rules they run, and
+    it was stamped on 2026-09-06 the moment those numbers were approved. What
+    makes a book able to send an order is its mode plus promoted_on, and
+    promoted_on is still empty on all five.
+    """
     for book in load_books(BOOKS_YAML).books:
         assert book.mode == "dry_run", f"book {book.book_id} is not on dry_run"
         assert book.sends_orders is False
         assert book.promoted_on is None, "nothing has been promoted yet"
-        assert book.rules_commit is None, "nothing has been promoted yet"
+
+
+def test_the_momentum_books_are_stamped_with_the_rules_they_run():
+    """So a decision in the ledger can be read against the exact numbers."""
+    stamped = {book.book_id: book.rules_commit for book in load_books(BOOKS_YAML).books}
+    for book_id in MOMENTUM_BOOKS:
+        assert stamped[book_id], f"book {book_id} carries no rules_commit"
+        assert len(stamped[book_id]) >= 7, "that does not look like a git hash"
+    assert len({stamped[book_id] for book_id in MOMENTUM_BOOKS}) == 1, (
+        "the three momentum books have to run the same version of the rules")
+    for book_id in ("C", "D"):
+        assert stamped[book_id] is None, (
+            "the insider and Congress numbers were not part of what Mo approved "
+            "on 2026-09-06, so they carry no stamp")
 
 
 def test_an_older_file_written_with_a_hyphen_still_reads_as_dry_run(tmp_path: Path):

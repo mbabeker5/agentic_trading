@@ -46,7 +46,12 @@
 #                  is no argument later about which version of the numbers and
 #                  the guardrails was signed off
 #
-# Both are empty on every book right now, because nothing has been promoted.
+# rules_commit is stamped on books A, B and E as of 2026-09-06: 273e928, which is
+# the commit that carries Momentum v2, the numbers Mo approved that day. It says
+# WHICH RULES THE BOOK RUNS. It is not a promotion: promoted_on is still empty on
+# all five books, every one of them is still on dry_run, and a book cannot be set
+# to tiny or full without both fields filled in. Books C and D keep an empty
+# stamp because their numbers were not part of that approval.
 # A book set to tiny or full without both of them filled in refuses to load, so
 # a mode change on its own cannot quietly start sending orders.
 #
@@ -87,7 +92,9 @@ books:
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit:                # and the git hash of the rules it approved
+    rules_commit: 273e928          # the git hash of the rules this book runs
+    rules_commit_note: >-
+      Momentum v2 per Mo's decisions 2026-09-06
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -107,7 +114,9 @@ books:
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit:                # and the git hash of the rules it approved
+    rules_commit: 273e928          # the git hash of the rules this book runs
+    rules_commit_note: >-
+      Momentum v2 per Mo's decisions 2026-09-06
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -163,7 +172,9 @@ books:
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit:                # and the git hash of the rules it approved
+    rules_commit: 273e928          # the git hash of the rules this book runs
+    rules_commit_note: >-
+      Momentum v2 per Mo's decisions 2026-09-06
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-

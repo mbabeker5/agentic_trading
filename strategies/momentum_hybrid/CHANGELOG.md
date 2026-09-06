@@ -6,7 +6,7 @@ This file records every change to this strategy's numbers: what changed, on what
 
 Approved by Mo from the consolidated critique at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06.md`
 
-Commit: RULES_COMMIT_PLACEHOLDER
+Commit: 273e928
 
 Stamped into `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml` as `rules_commit` for books A, B and E.
 
