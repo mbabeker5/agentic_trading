@@ -72,12 +72,17 @@ exists, the script reads four values out of it:
 | Key in the YAML | Meaning | Falls back to |
 |---|---|---|
 | `universe.price_floor` | ignore anything cheaper than this | 5 dollars |
-| `universe.min_avg_volume` | ignore anything that normally trades fewer shares a day | 1,000,000 |
-| `scanner.rel_volume_min` | how many times its normal pace a name has to be trading | 2.0 |
+| `universe.min_avg_dollar_volume` | ignore anything that normally trades less than this many dollars a day | 20,000,000 |
+| `universe.dollar_volume_sessions` | how many completed sessions that average covers | 30 |
+| `scanner.rel_volume_min` | how many times its normal pace a name has to be trading, measured at 09:35 | 2.0 |
 | `scanner.max_candidates` | how long the shortlist can be | 20 |
 
 Anything missing falls back to the number above. The script never writes to that
 file. Another part of the project owns it.
+
+`universe.min_avg_volume`, the old floor of a million shares a day, is still
+read and still written into the output so an old run can be read back, but
+nothing filters on it any more. See the next section for why it changed.
 
 ## What it actually does, in order
 
@@ -93,14 +98,14 @@ file. Another part of the project owns it.
    spending any data requests on them.
 4. Keeps the first forty and looks up daily price history for each: what it
    is trading at now, what it closed at yesterday, how many shares have changed
-   hands today, and its average daily volume over the last twenty completed
-   sessions.
-5. Applies the number filters: price above the floor, average daily volume
-   above the minimum, relative volume above the threshold, and still up on the
-   day. A name with fewer than ten completed sessions of history gets no
-   average volume at all, so it fails this step. A stock listed last week has
-   no normal to be unusual against, and averaging its first three days would
-   dress up a wild number as a settled one.
+   hands today, its average daily dollar volume over the last thirty completed
+   sessions, and its average daily share volume over the last twenty.
+5. Applies the number filters: price above the floor, average daily dollar
+   volume at or above the liquidity floor, relative volume above the threshold,
+   and still up on the day. A name with fewer than ten completed sessions of
+   history gets no average at all, so it fails this step. A stock listed last
+   week has no normal to be unusual against, and averaging its first three days
+   would dress up a wild number as a settled one.
 6. Looks up what each survivor actually is and drops it if it is priced in
    anything but US dollars, if its home exchange is not one of NYSE, NASDAQ,
    ARCA, AMEX, BATS or IEX, or if it is a leveraged or inverse fund.
@@ -108,6 +113,40 @@ file. Another part of the project owns it.
    the opening five-minute range for the names that made it. Fetching last saves
    data requests, which are rationed.
 8. Writes the JSON file.
+
+### The liquidity floor, in dollars rather than shares
+
+Mo changed this on 2026-09-06. The floor used to be a million shares a day. It
+is now 20 million dollars a day, averaged over the last thirty completed
+sessions, worked out as each session's closing price times that session's
+volume.
+
+The reason is that a share count does not mean anything on its own. A million
+shares of a 6 dollar stock is 6 million dollars of trading, and a million shares
+of a 600 dollar stock is 600 million. The second one can absorb our order
+without moving the price and the first one cannot, but the old rule treated them
+as the same and, worse, threw out plenty of perfectly liquid expensive names
+that trade far fewer than a million shares.
+
+The new floor is also the wider one. A census run on 2026-09-04, which lives in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/liquidity_census/`,
+found about 2,700 US names above 20 million dollars a day against about 1,950
+above a million shares a day. So the change is not a tightening: it opens the
+universe up and points it at the right measure.
+
+Two consequences worth knowing about:
+
+- **Nothing is filtered by volume at Gateway any more.** Gateway's own scanner
+  can filter on a share count and has no dollar volume filter at all, and a
+  share count cannot stand in for one. 20 million dollars is 4 million shares at
+  5 dollars and 40 thousand shares at 500, so any share floor loose enough to
+  keep the expensive names would let everything else through as well. The price
+  floor is still sent to Gateway, because that one means the same thing either
+  way. The liquidity floor is applied here instead, against real daily bars.
+- **The daily history request grew from 40 days to 60.** Thirty trading sessions
+  is about forty four calendar days, so the old request would have come up
+  short. Sixty calendar days is roughly forty two sessions, which leaves room
+  for holidays and for today's own part-formed bar.
 
 ### Relative volume, and why it is not just today's volume
 
@@ -121,6 +160,21 @@ The "how much of the session has gone by" figure comes from how far SPY's bars
 actually reach, not from the clock on the wall. Delayed market data runs about
 fifteen minutes behind, so trusting the clock would make every stock look
 quieter than it really is.
+
+**The floor is anchored at 09:35.** Mo's rule of 2026-09-06 is a statement about
+one moment: the volume traded by 9:35, five minutes after the open, has to be at
+least twice the stock's normal volume for that point in the day. Five minutes is
+five three hundred and ninetieths of a session, so a name that normally trades a
+million shares a day would normally have done about 12,800 by then, and it needs
+about 25,600 to clear the floor.
+
+The output says so out loud. Every run writes `rel_volume_anchor_eastern`,
+`rel_volume_anchor_minutes` and `rel_volume_anchor_reached` at the top of the
+JSON file, and each candidate carries `rel_volume_minutes_elapsed`, the number of
+minutes of data its own ratio was actually measured over. If the data has not
+reached 9:35 yet, which is what happens every time the scanner is run at 9:35 on
+a delayed feed, a warning says so in plain words rather than letting the
+shortlist imply a measurement that was never taken.
 
 ### Leveraged and inverse funds
 
@@ -163,6 +217,9 @@ The top of the file describes the run:
 | `data_as_of_eastern` | how recent the data actually is, which lags the timestamp on delayed data |
 | `session_minutes_elapsed` | how many of the day's 390 trading minutes the data covers |
 | `session_minutes_total` | always 390, the length of a normal session |
+| `rel_volume_anchor_eastern` | always `09:35`, the moment the relative volume floor is about |
+| `rel_volume_anchor_minutes` | always 5, the same thing in minutes past the open |
+| `rel_volume_anchor_reached` | whether the data actually reached 9:35. False means the ratios below were measured on less trading than the rule intends |
 | `scan_codes` | which IBKR scans were run |
 | `thresholds` | the numbers used, and whether they came from the YAML or the built-in defaults |
 | `counts` | how many names survived each stage, explained below |
@@ -182,7 +239,7 @@ because it shows exactly where the names went:
 | `capped_for_enrichment` | left after trimming to forty |
 | `daily_bars_ok` | how many returned usable price history |
 | `passed_price_floor` | still above the price floor |
-| `passed_avg_volume` | still above the average volume minimum |
+| `passed_dollar_volume` | still at or above the 20 million dollar average daily liquidity floor |
 | `passed_rel_volume` | still trading above the relative volume threshold |
 | `passed_moving_up` | still up on the day rather than down |
 | `passed_us_listing` | priced in dollars and listed on an allowed US exchange |
@@ -202,8 +259,11 @@ Each entry in `candidates` looks like this:
 | `opening_range_high` | the highest price in the first five minutes. The entry trigger is a break above this |
 | `opening_range_low` | the lowest price in the first five minutes. This is one of the two candidates for the stop |
 | `volume_today` | shares traded so far today |
-| `avg_volume_20d` | average shares traded per day over the last twenty completed sessions |
+| `avg_volume_20d` | average shares traded per day over the last twenty completed sessions. Only the bottom half of the relative volume ratio, which is shares against shares. Nothing is filtered on it |
+| `avg_dollar_volume` | average dollars traded per day over the last thirty completed sessions. This is the liquidity floor's number |
+| `avg_dollar_volume_sessions` | how many completed sessions that average actually used, which is fewer than thirty for a recent listing |
 | `rel_volume` | today's volume divided by what would be normal by this time of day |
+| `rel_volume_minutes_elapsed` | how many minutes of trading that ratio was measured over. 5 means it was measured at the 9:35 anchor the rule is about |
 | `flagged_by` | which scans flagged it. Two entries is a stronger signal than one |
 | `reasons` | short plain-language sentences explaining why it is on the list, meant to be read |
 | `score` | the ranking number described above |

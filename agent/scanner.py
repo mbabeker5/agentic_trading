@@ -6,6 +6,17 @@ heavily, checks each one against the strategy's rules, and writes a shortlist of
 at most twenty names to a JSON file. Claude reads that file at 9:35 AM and
 decides which names, if any, are worth trading.
 
+Two of the filters are Mo's decisions of 2026-09-06 and are worth knowing about
+before reading the code. The liquidity floor is 20 million dollars of average
+daily trading over 30 completed sessions, worked out as close times volume per
+session and averaged. It replaced a floor of a million shares a day, because a
+million shares of a 6 dollar stock and a million shares of a 600 dollar stock
+are not the same amount of money and only one of them can absorb our order. And
+the relative volume floor of 2 times normal is anchored at 09:35 Eastern, five
+minutes after the open, which is the moment the strategy makes its picks. When
+the data does not reach 09:35 the run says so in its warnings rather than
+quietly measuring the ratio somewhere else.
+
 This script is read-only by construction. It calls exactly four things on the
 Gateway API, all of them reads: the scanner, historical bars, contract details
 and the market data type. There is no order code in the file at all.
@@ -41,7 +52,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, ScannerSubscription, Stock, TagValue
+from ib_async import IB, ScannerSubscription, Stock
 
 try:
     import yaml
@@ -60,9 +71,19 @@ OPEN_HOUR, OPEN_MINUTE = 9, 30
 
 # Defaults. Anything present in config/guardrails.yaml wins over these.
 DEFAULT_PRICE_FLOOR = 5.0
-DEFAULT_MIN_AVG_VOLUME = 1_000_000
+DEFAULT_MIN_AVG_DOLLAR_VOLUME = 20_000_000.0
+DEFAULT_DOLLAR_VOLUME_SESSIONS = 30
 DEFAULT_REL_VOLUME_MIN = 2.0
 DEFAULT_MAX_CANDIDATES = 20
+
+# The relative volume test is anchored at 9:35 AM Eastern, five minutes after
+# the open. That is the moment the strategy makes its picks, and Mo's rule of
+# 2026-09-06 is about that moment: the volume traded by 9:35 has to be at least
+# twice the stock's normal pace for that point in the day. Written down as a
+# real time rather than left implicit in whenever the script happens to run.
+REL_VOLUME_ANCHOR_HOUR, REL_VOLUME_ANCHOR_MINUTE = 9, 35
+REL_VOLUME_ANCHOR_LABEL = "09:35"
+REL_VOLUME_ANCHOR_MINUTES = 5.0
 
 # How many names we are willing to pull extra data for. Kept low on purpose:
 # IB Gateway rations historical-data requests (roughly 60 in any ten minutes),
@@ -81,6 +102,17 @@ HISTORY_MIN_GAP_SECONDS = 0.25
 # A stock listed last week has no normal, and averaging its first three days
 # would make a wild number look settled.
 MIN_DAILY_BARS_FOR_AVERAGE = 10
+
+# How many sessions of daily bars to ask Gateway for. The dollar volume average
+# covers 30 completed sessions, which is about 44 calendar days, so a 40 day
+# request would come up short. 60 calendar days is roughly 42 sessions, which
+# leaves room for holidays and for today's own part-formed bar.
+DAILY_HISTORY_DURATION = "60 D"
+
+# How many completed sessions the share volume average behind relative volume
+# covers. That one stays at 20: it is a ratio of shares against shares, and a
+# shorter window tracks a change in a stock's normal pace more quickly.
+REL_VOLUME_AVERAGE_SESSIONS = 20
 
 SCAN_CODES = ("TOP_PERC_GAIN", "HOT_BY_VOLUME")
 SCAN_INSTRUMENT = "STK"
@@ -156,21 +188,40 @@ log = logging.getLogger("scanner")
 
 @dataclass
 class Thresholds:
-    """The numbers the scanner filters on."""
+    """The numbers the scanner filters on.
+
+    min_avg_dollar_volume is the liquidity floor Mo settled on 2026-09-06: a
+    name has to have traded at least this many dollars a day on average, over
+    dollar_volume_sessions completed sessions, before it is worth looking at.
+    It replaced a floor of a million shares a day. Dollars are the honest unit,
+    because a million shares of a 6 dollar stock and a million shares of a 600
+    dollar stock are not remotely the same amount of money, and how much we can
+    trade without moving the price depends on the money.
+
+    universe.min_avg_volume, the old share count, is still read out of the
+    settings file so an older file loads, but nothing in here filters on it any
+    more. It is carried into the output so a run can be read back later.
+    """
 
     price_floor: float = DEFAULT_PRICE_FLOOR
-    min_avg_volume: float = DEFAULT_MIN_AVG_VOLUME
+    min_avg_dollar_volume: float = DEFAULT_MIN_AVG_DOLLAR_VOLUME
+    dollar_volume_sessions: int = DEFAULT_DOLLAR_VOLUME_SESSIONS
     rel_volume_min: float = DEFAULT_REL_VOLUME_MIN
     max_candidates: int = DEFAULT_MAX_CANDIDATES
     source: str = "built-in defaults"
+    deprecated_min_avg_volume: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "price_floor": self.price_floor,
-            "min_avg_volume": self.min_avg_volume,
+            "min_avg_dollar_volume": self.min_avg_dollar_volume,
+            "dollar_volume_sessions": self.dollar_volume_sessions,
             "rel_volume_min": self.rel_volume_min,
+            "rel_volume_anchor_eastern": REL_VOLUME_ANCHOR_LABEL,
+            "rel_volume_anchor_minutes": REL_VOLUME_ANCHOR_MINUTES,
             "max_candidates": self.max_candidates,
             "source": self.source,
+            "deprecated_min_avg_volume": self.deprecated_min_avg_volume,
         }
 
 
@@ -216,8 +267,33 @@ def load_thresholds(path: Path) -> Thresholds:
             return current
 
     thresholds.price_floor = pick(universe, "price_floor", thresholds.price_floor, float)
-    thresholds.min_avg_volume = pick(
-        universe, "min_avg_volume", thresholds.min_avg_volume, float
+    thresholds.min_avg_dollar_volume = pick(
+        universe,
+        "min_avg_dollar_volume",
+        thresholds.min_avg_dollar_volume,
+        float,
+    )
+    thresholds.dollar_volume_sessions = int(
+        pick(
+            universe,
+            "dollar_volume_sessions",
+            thresholds.dollar_volume_sessions,
+            int,
+        )
+    )
+    if thresholds.dollar_volume_sessions < MIN_DAILY_BARS_FOR_AVERAGE:
+        log.warning(
+            "Averaging dollar volume over %d session(s) is too few to mean "
+            "anything, using %d instead",
+            thresholds.dollar_volume_sessions,
+            MIN_DAILY_BARS_FOR_AVERAGE,
+        )
+        thresholds.dollar_volume_sessions = MIN_DAILY_BARS_FOR_AVERAGE
+    # Read but never filtered on. Mo replaced this share count with the dollar
+    # figure above on 2026-09-06. It is kept so an older settings file still
+    # loads, and it is written into the output so a run can be read back later.
+    thresholds.deprecated_min_avg_volume = pick(
+        universe, "min_avg_volume", thresholds.deprecated_min_avg_volume, float
     )
     thresholds.rel_volume_min = pick(
         scanner, "rel_volume_min", thresholds.rel_volume_min, float
@@ -305,7 +381,10 @@ class Candidate:
     volume_today: float | None = None
     avg_volume_20d: float | None = None
     avg_volume_days: int | None = None
+    avg_dollar_volume: float | None = None
+    avg_dollar_volume_sessions: int | None = None
     rel_volume: float | None = None
+    rel_volume_minutes_elapsed: float | None = None
     opening_range_high: float | None = None
     opening_range_low: float | None = None
     score: float = 0.0
@@ -329,7 +408,10 @@ class Candidate:
             "opening_range_low": round2(self.opening_range_low),
             "volume_today": to_int(self.volume_today),
             "avg_volume_20d": to_int(self.avg_volume_20d),
+            "avg_dollar_volume": to_int(self.avg_dollar_volume),
+            "avg_dollar_volume_sessions": self.avg_dollar_volume_sessions,
             "rel_volume": round2(self.rel_volume),
+            "rel_volume_minutes_elapsed": round2(self.rel_volume_minutes_elapsed),
             "flagged_by": list(self.flagged_by),
             "reasons": list(self.reasons),
             "score": round2(self.score),
@@ -354,6 +436,19 @@ def human_millions(value: float | None) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.0f} thousand"
     return f"{value:.0f}"
+
+
+def human_dollars(value: float | None) -> str:
+    """A dollar figure a person can read, so 20000000.0 reads as 20.0 million dollars."""
+    if value is None:
+        return "unknown"
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f} billion dollars"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f} million dollars"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f} thousand dollars"
+    return f"{value:.0f} dollars"
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +488,100 @@ def minutes_into_session(moment: datetime) -> float:
     )
     elapsed = (moment - session_open).total_seconds() / 60.0
     return max(0.0, min(float(SESSION_MINUTES), elapsed))
+
+
+def bar_dollar_volume(bar: Any) -> float | None:
+    """What one session's trading was worth in dollars: close times volume.
+
+    Close times volume is the rough and standard way to do this. It is not the
+    true average price of the day's trades, but over 30 sessions the difference
+    washes out, and it is the only version that can be worked out from a daily
+    bar. None comes back when the bar has no usable close or volume.
+    """
+    close = getattr(bar, "close", None)
+    volume = getattr(bar, "volume", None)
+    if close is None or volume is None:
+        return None
+    try:
+        close = float(close)
+        volume = float(volume)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(close) or not math.isfinite(volume):
+        return None
+    if close <= 0 or volume < 0:
+        return None
+    return close * volume
+
+
+def average_dollar_volume(
+    bars: list[Any],
+    sessions: int = DEFAULT_DOLLAR_VOLUME_SESSIONS,
+    min_sessions: int = MIN_DAILY_BARS_FOR_AVERAGE,
+) -> tuple[float | None, int]:
+    """Average daily dollar volume over the most recent completed sessions.
+
+    Hand in completed daily bars, oldest first, with today's part-formed bar
+    already taken out. The answer is the average of close times volume over the
+    last `sessions` of them, and how many sessions that average actually used.
+
+    A name with fewer than min_sessions completed sessions gets None back, the
+    same way the share average always worked. A stock listed last week has no
+    normal to be measured against, and averaging its first three days would
+    dress a wild number up as a settled one. None fails the liquidity floor,
+    which is the safe answer.
+    """
+    if sessions < 1:
+        raise ValueError(
+            f"average_dollar_volume was asked for {sessions} sessions, and it needs "
+            "at least one."
+        )
+    usable = [value for value in (bar_dollar_volume(b) for b in bars) if value is not None]
+    recent = usable[-sessions:]
+    if len(recent) < min_sessions:
+        return None, len(recent)
+    return sum(recent) / len(recent), len(recent)
+
+
+def expected_volume_by(
+    avg_daily_volume: float | None,
+    minutes_elapsed: float,
+    session_minutes: int = SESSION_MINUTES,
+) -> float | None:
+    """How many shares a normal day would have traded by this point.
+
+    The normal daily volume, scaled by how much of the 390 minute session has
+    gone by. At 9:35, five minutes in, that is five 390ths of a normal day.
+    """
+    if not avg_daily_volume or avg_daily_volume <= 0:
+        return None
+    fraction = max(0.0, min(1.0, float(minutes_elapsed) / float(session_minutes)))
+    if fraction <= 0:
+        return None
+    return float(avg_daily_volume) * fraction
+
+
+def relative_volume(
+    volume_so_far: float | None,
+    avg_daily_volume: float | None,
+    minutes_elapsed: float,
+    session_minutes: int = SESSION_MINUTES,
+) -> float | None:
+    """How many times its normal pace a name is trading at right now.
+
+    2.0 means twice the volume a normal day would have shown by this point.
+    Mo's floor of 2026-09-06 is 2.0 measured at 9:35, five minutes after the
+    open, which is REL_VOLUME_ANCHOR_MINUTES above.
+
+    None comes back when there is nothing to divide by, and that fails the
+    floor, which is the safe answer.
+    """
+    if volume_so_far is None:
+        return None
+    expected = expected_volume_by(avg_daily_volume, minutes_elapsed, session_minutes)
+    if not expected:
+        return None
+    return float(volume_so_far) / expected
 
 
 # ---------------------------------------------------------------------------
@@ -456,24 +645,19 @@ class OpeningMomentumScanner:
             numberOfRows=SCAN_ROWS,
             abovePrice=self.thresholds.price_floor,
         )
-        # Filter on the twenty-day average, never on the volume traded so far.
-        # At 9:35 a stock that normally does a million shares a day has only
-        # done a small fraction of that, so a "volume so far" test would throw
-        # out precisely the names we are looking for.
-        filter_options = [
-            TagValue("avgVolumeAbove", str(int(self.thresholds.min_avg_volume)))
-        ]
+        # No volume filter is sent to Gateway any more. Gateway's scanner can
+        # filter on a share count and has no dollar volume filter at all, and a
+        # share count cannot stand in for one: 20 million dollars is 4 million
+        # shares at 5 dollars and 40 thousand shares at 500, so any share floor
+        # loose enough to keep the expensive names would let through everything
+        # else as well. The liquidity floor is applied further down instead,
+        # against 30 sessions of real daily bars. The price floor is still sent,
+        # in abovePrice above, because that one means the same thing either way.
         try:
-            rows = await self.ib.reqScannerDataAsync(
-                subscription, scannerSubscriptionFilterOptions=filter_options
-            )
+            rows = await self.ib.reqScannerDataAsync(subscription)
         except Exception as exc:
-            self.note(f"Scan {scan_code} failed with volume filters: {exc}")
-            try:
-                rows = await self.ib.reqScannerDataAsync(subscription)
-            except Exception as exc2:
-                self.note(f"Scan {scan_code} failed outright: {exc2}")
-                return []
+            self.note(f"Scan {scan_code} failed outright: {exc}")
+            return []
         log.info("Scan %s returned %d rows", scan_code, len(rows))
         return list(rows)
 
@@ -573,6 +757,28 @@ class OpeningMomentumScanner:
             f"({self.session_minutes_elapsed:.0f} minutes into the session)"
         )
 
+    def check_rel_volume_anchor(self) -> None:
+        """Say so plainly when the data has not reached 9:35 yet.
+
+        The relative volume floor is a statement about one moment: by 9:35, five
+        minutes after the open, a name has to have traded at least twice its
+        normal volume for that point in the day. If the data does not reach 9:35
+        the ratio is being measured somewhere else, and the shortlist should not
+        pretend otherwise. Delayed market data runs about fifteen minutes
+        behind, so a 9:35 run on a delayed feed lands here every time.
+        """
+        elapsed = self.session_minutes_elapsed
+        if elapsed is None:
+            return
+        if elapsed + 1e-9 < REL_VOLUME_ANCHOR_MINUTES:
+            self.note(
+                f"The data only reaches {elapsed:.0f} minute(s) into the session, and "
+                f"the relative volume floor is anchored at {REL_VOLUME_ANCHOR_LABEL}, "
+                f"which is {REL_VOLUME_ANCHOR_MINUTES:.0f} minutes in. Relative volume "
+                "below that point is measured on a sliver of trading and should not be "
+                "trusted."
+            )
+
     # -- step 3: per-name data --------------------------------------------
 
     async def fetch_bars(
@@ -605,10 +811,18 @@ class OpeningMomentumScanner:
         return list(bars)
 
     async def load_daily_stats(self, candidate: Candidate) -> None:
-        """Fill in price, gain, today's volume and the 20-day average volume."""
+        """Fill in price, gain, today's volume and the two averages.
+
+        Two averages, because they answer two different questions. The dollar
+        volume average over 30 sessions says whether the name is liquid enough
+        to trade at all, which is Mo's floor of 20 million dollars a day. The
+        share volume average over 20 sessions is the bottom half of the relative
+        volume ratio, which is shares against shares and so has to stay in
+        shares.
+        """
         bars = await self.fetch_bars(
             candidate.contract(),
-            duration="40 D",
+            duration=DAILY_HISTORY_DURATION,
             bar_size="1 day",
             label=f"{candidate.symbol} daily bars",
         )
@@ -634,19 +848,28 @@ class OpeningMomentumScanner:
 
         if completed:
             candidate.prev_close = float(completed[-1].close)
-            recent = completed[-20:]
+
+            # The liquidity floor: 30 sessions of close times volume, averaged.
+            candidate.avg_dollar_volume, candidate.avg_dollar_volume_sessions = (
+                average_dollar_volume(
+                    completed, self.thresholds.dollar_volume_sessions
+                )
+            )
+            if candidate.avg_dollar_volume is None:
+                # Too new to have a normal. Leaving this empty makes the name
+                # fail the liquidity floor, which is the safe answer.
+                log.debug(
+                    "%s has only %d completed session(s), too new to judge",
+                    candidate.symbol,
+                    candidate.avg_dollar_volume_sessions or 0,
+                )
+
+            # The bottom half of the relative volume ratio, still in shares.
+            recent = completed[-REL_VOLUME_AVERAGE_SESSIONS:]
             if len(recent) >= MIN_DAILY_BARS_FOR_AVERAGE:
                 volumes = [float(b.volume or 0.0) for b in recent]
                 candidate.avg_volume_20d = sum(volumes) / len(volumes)
                 candidate.avg_volume_days = len(recent)
-            else:
-                # Too new to have a normal. Leaving this empty makes the name
-                # fail the average volume filter, which is the safe answer.
-                log.debug(
-                    "%s has only %d completed session(s), too new to judge",
-                    candidate.symbol,
-                    len(recent),
-                )
 
         if candidate.last is not None and candidate.prev_close:
             candidate.gain_pct = (
@@ -654,10 +877,10 @@ class OpeningMomentumScanner:
             )
 
         elapsed = self.session_minutes_elapsed or float(SESSION_MINUTES)
-        if candidate.avg_volume_20d and candidate.volume_today is not None:
-            expected = candidate.avg_volume_20d * (elapsed / SESSION_MINUTES)
-            if expected > 0:
-                candidate.rel_volume = candidate.volume_today / expected
+        candidate.rel_volume_minutes_elapsed = elapsed
+        candidate.rel_volume = relative_volume(
+            candidate.volume_today, candidate.avg_volume_20d, elapsed
+        )
 
     async def load_contract_details(self, candidate: Candidate) -> None:
         try:
@@ -750,12 +973,23 @@ class OpeningMomentumScanner:
         if candidate.rel_volume is not None:
             reasons.append(
                 f"Trading {candidate.rel_volume:.1f} times its normal volume for this "
-                f"point in the day"
+                f"point in the day, measured against the {REL_VOLUME_ANCHOR_LABEL} "
+                f"anchor and {candidate.rel_volume_minutes_elapsed:.0f} minutes of data"
+                if candidate.rel_volume_minutes_elapsed is not None
+                else f"Trading {candidate.rel_volume:.1f} times its normal volume for "
+                f"this point in the day"
             )
         if candidate.volume_today is not None and candidate.avg_volume_20d:
             reasons.append(
                 f"{human_millions(candidate.volume_today)} shares traded so far "
                 f"against a {human_millions(candidate.avg_volume_20d)} share daily average"
+            )
+        if candidate.avg_dollar_volume is not None:
+            reasons.append(
+                f"Normally trades {human_dollars(candidate.avg_dollar_volume)} a day "
+                f"over the last {candidate.avg_dollar_volume_sessions} sessions, "
+                f"against a floor of "
+                f"{human_dollars(self.thresholds.min_avg_dollar_volume)}"
             )
         if candidate.opening_range_high is not None and candidate.opening_range_low is not None:
             reasons.append(
@@ -807,8 +1041,9 @@ class OpeningMomentumScanner:
         if not candidates:
             self.counts["daily_bars_ok"] = 0
             self.counts["passed_price_floor"] = 0
-            self.counts["passed_avg_volume"] = 0
+            self.counts["passed_dollar_volume"] = 0
             self.counts["passed_rel_volume"] = 0
+            self.counts["passed_moving_up"] = 0
             self.counts["passed_us_listing"] = 0
             self.counts["passed_leverage_name_filter"] = 0
             self.counts["opening_range_ok"] = 0
@@ -816,6 +1051,7 @@ class OpeningMomentumScanner:
             return self.build_output([])
 
         await self.measure_session_progress(reference_symbol)
+        self.check_rel_volume_anchor()
 
         await asyncio.gather(
             *(self.load_daily_stats(c) for c in candidates), return_exceptions=True
@@ -831,12 +1067,15 @@ class OpeningMomentumScanner:
         survivors = [c for c in with_data if (c.last or 0.0) > self.thresholds.price_floor]
         self.counts["passed_price_floor"] = len(survivors)
 
+        # The liquidity floor. Dollars a day, not shares a day (Mo, 2026-09-06).
+        # A name with no dollar average at all is too new to judge and fails
+        # here, which is the safe answer.
         survivors = [
             c
             for c in survivors
-            if (c.avg_volume_20d or 0.0) > self.thresholds.min_avg_volume
+            if (c.avg_dollar_volume or 0.0) >= self.thresholds.min_avg_dollar_volume
         ]
-        self.counts["passed_avg_volume"] = len(survivors)
+        self.counts["passed_dollar_volume"] = len(survivors)
 
         survivors = [
             c
@@ -948,6 +1187,13 @@ class OpeningMomentumScanner:
                 else None
             ),
             "session_minutes_total": SESSION_MINUTES,
+            "rel_volume_anchor_eastern": REL_VOLUME_ANCHOR_LABEL,
+            "rel_volume_anchor_minutes": REL_VOLUME_ANCHOR_MINUTES,
+            "rel_volume_anchor_reached": (
+                None
+                if self.session_minutes_elapsed is None
+                else self.session_minutes_elapsed + 1e-9 >= REL_VOLUME_ANCHOR_MINUTES
+            ),
             "scan_codes": list(SCAN_CODES),
             "thresholds": self.thresholds.as_dict(),
             "counts": dict(self.counts),
@@ -1027,11 +1273,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 async def main_async(args: argparse.Namespace) -> int:
     thresholds = load_thresholds(Path(args.config))
     log.info(
-        "Thresholds: price above %.2f, 20-day average volume above %s, "
-        "relative volume above %.2f, at most %d names (%s)",
+        "Thresholds: price above %.2f, average daily dollar volume of %s or more over "
+        "%d sessions, relative volume above %.2f measured at the %s anchor, at most "
+        "%d names (%s)",
         thresholds.price_floor,
-        f"{int(thresholds.min_avg_volume):,}",
+        human_dollars(thresholds.min_avg_dollar_volume),
+        thresholds.dollar_volume_sessions,
         thresholds.rel_volume_min,
+        REL_VOLUME_ANCHOR_LABEL,
         thresholds.max_candidates,
         thresholds.source,
     )
