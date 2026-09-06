@@ -25,14 +25,86 @@ It runs this, and nothing else:
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/run_tick.sh
 ```
 
+## Do not edit that file by hand
+
+Every plist in `config/launchd/` is written by a generator from a short template.
+Edit the template, run the generator, commit both. An edit made straight to a
+plist is lost the next time anybody generates.
+
+The templates are here, one per job:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/
+```
+
+The generator is here:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+```
+
+Why it exists: a job that fires every five minutes needs one entry per wake up,
+written out in full. The tick job has 420 of them and the watchdog has 533.
+Nobody keeps that correct by hand, and every one of those entries used to have
+this Mac's own home folder written into it, which is the thing that stopped the
+project moving to another machine. Now the schedule is written once, in English,
+in the template:
+
+```
+every 5 minutes from 09:25 to 16:05 on weekdays
+```
+
+and the generator turns that into the entries launchd wants, filling in the
+project folder, the venv Python, the home folder and the path to `claude` from
+wherever it is actually running.
+
+The four commands:
+
+```
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --check
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --uninstall
+```
+
+With no flags it rewrites every plist in `config/launchd/` and loads nothing.
+`--check` says whether the files on disk already match the templates, changes
+nothing, and exits non-zero if they do not. That is the one to run after editing
+a template, and a test runs it too, so a template edit that was never generated
+fails the suite.
+
+`--install` copies the plists to `~/Library/LaunchAgents` and asks launchd to
+load them. **That starts the jobs running.** It is the only thing in the file
+that does. `--uninstall` unloads them and removes the copies, leaving
+`config/launchd/` alone.
+
+The generator runs on any Python 3.9 or newer with nothing installed, on
+purpose: on a fresh Mac it has to work before the project's own virtual
+environment exists.
+
 ## The schedule
 
-Every five minutes from 09:25 to 16:00, Monday to Friday. That is 80 wake ups a
-day, and 400 entries in the file, one for each time on each weekday.
+Every five minutes from 09:25 to 16:05, Monday to Friday, plus three extra wake
+ups a day for the filing sweeps. That is 84 wake ups a day and 420 entries in
+the file, one for each time on each weekday.
 
 09:25 rather than 09:30 on purpose: the first wake up of the day happens five
 minutes before the market opens, so if IB Gateway is down or the MCP server
-needs restarting, that shows up in the log before it costs anything.
+needs restarting, that shows up in the log before it costs anything. It ends at
+16:05 rather than 16:00 because the tick at or after the close is the one that
+writes each book's end of day line, and a job set to fire exactly on the close
+can land a second early.
+
+The three extra times, and which book each belongs to:
+
+| Time | Book | What it does |
+|---|---|---|
+| 07:00 | C | sweeps SEC Form 4 insider filings, `agent/sweep_insider.py` |
+| 07:30 | D | sweeps Congress disclosures, `agent/sweep_congress.py` |
+| 16:30 | C | sweeps Form 4 again, for tomorrow morning |
+
+All of that lives in `config/launchd/templates/tick.template`, in English, and
+the generator does the counting.
 
 launchd works in whatever time zone the Mac is set to, and there is no way to
 pin a time zone inside the file. This Mac is in Eastern. That was checked with
@@ -192,10 +264,107 @@ after the close.
 
 ---
 
-# The other two jobs: the watchdog and the pre-flight
+# All six jobs
 
-Added 2026-09-06. Like the tick job above, **neither of these is loaded.** They
-are definitions sitting in the repo waiting for you to decide.
+There are six job definitions in the repo. **None of them is loaded.** They sit
+there waiting for you to decide, and `scripts/gen_launchd.py --install` is the
+one command that starts them.
+
+| Job | When | What runs | Wake ups a week |
+|---|---|---|---|
+| `tick` | every 5 min 09:25 to 16:05, plus 07:00, 07:30 and 16:30, weekdays | `agent/run_tick.sh` | 420 |
+| `watchdog` | every 5 min in market hours, hourly the rest of the time including weekends | `agent/watchdog.py --once` | 533 |
+| `preflight` | 09:00 weekdays | `agent/preflight.py` | 5 |
+| `recorder` | every 5 min 09:25 to 16:05 weekdays | `agent/replay/record_day.py --once` | 405 |
+| `learning` | 16:30 weekdays | headless `claude -p` on the daily prompt | 5 |
+| `weekly` | 16:45 Friday | headless `claude -p` on the weekly prompt | 1 |
+
+Their full labels are `com.mtalib.agentic-trading.` plus the name in the first
+column, which is what every `launchctl` command below wants.
+
+Only the tick job can trade, and only once a book in `config/books.yaml` is
+taken out of dry run by hand. The other five read, write files and send
+messages.
+
+## The recorder
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.recorder.plist
+```
+
+It wakes `agent/replay/record_day.py` every five minutes through the trading day
+and records what the market was doing, so the whole loop can later be replayed
+against a real day with a fake broker. That replay is the gate every book has to
+pass before it is allowed to place a paper order for real. What it records, and
+what the replay proves, is in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/REPLAY.md`.
+
+It is meant for one day at a time. launchd has no way to say "just this one
+Tuesday", so the template carries the weekday entries and you load it on the day
+and unload it afterwards.
+
+It connects to IB Gateway read only and asks for nothing but quotes and
+historical bars, so it cannot place an order.
+
+## The daily learning loop and the weekly review
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.learning.plist
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.weekly.plist
+```
+
+These two are different from the rest: they run Claude Code with no terminal
+attached, `claude -p`, and feed it a prompt file on standard input.
+
+**The learning loop, 16:30 on weekdays.** It reads the day's tick log, the five
+book state files, the watchdog and alert logs, the pre-flight result and the
+day's commits, and writes one journal entry at
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/journal/YYYY-MM-DD.md`
+plus the five line `journal/latest_summary.md` that the hub relays to you.
+Confirmed learnings graduate to `docs/LEARNINGS.md` and improvements go to
+`docs/BACKLOG.md`.
+
+**The weekly review, 16:45 on Friday.** Fifteen minutes after Friday's learning
+loop, so the week's last journal entry already exists when it starts reading. It
+reads the ledger's Books tab, the week's journal entries and last week's review,
+and writes `docs/weekly/YYYY-WW.md` comparing the five books on return, alpha
+against SPY, drawdown, trades, commissions, model cost, rule triggers and missed
+ticks.
+
+What they are allowed to do is a short list, written into the plist and repeated
+in the prompt: read files, write files, and a handful of git commands. The
+weekly one may also fetch the ledger sheet. Neither can run the trading loop,
+reach IB Gateway or the MCP server, or place an order.
+
+The prompts are the place to change what these two do, not the plists:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/prompts/daily_learning_loop.md
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/prompts/weekly_review.md
+```
+
+**What they need to work.** Claude Code installed and signed in as you on that
+Mac, and the Mac logged in to the desktop. A user launchd job runs inside your
+login session, and Claude reads its sign in from the login keychain. A locked
+screen is fine. A logged out Mac is not. The generator writes the full path to
+`claude` into the plist, because launchd starts a job with almost no PATH and
+would never find it by name.
+
+If nothing appears in `journal/` after 16:30, or in `docs/weekly/` after a
+Friday, read these first:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_learning.err.log
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_weekly.err.log
+```
+
+A sign in that has expired shows up there.
+
+---
+
+# The watchdog and the pre-flight
+
+Added 2026-09-06. Like every other job here, **neither of these is loaded.**
 
 ```
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.watchdog.plist
@@ -288,6 +457,17 @@ launchctl bootout gui/$(id -u)/com.mtalib.agentic-trading.preflight
 
 **Load the watchdog first, before the tick job.** It is the thing that tells you
 the loop has stopped, so it is not much use arriving second.
+
+To load all six at once instead, on a machine where you want the lot:
+
+```
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install
+launchctl list | grep com.mtalib.agentic-trading
+```
+
+That copies every plist to `~/Library/LaunchAgents` and bootstraps it. The undo
+is the same command with `--uninstall`. Loading one at a time with `bootstrap`
+above is the safer habit while you are still watching each job's first run.
 
 Their launchd logs, for anything that breaks before the script gets going:
 

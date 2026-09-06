@@ -227,6 +227,46 @@ To pause without stopping the launchd job at all, one line does it:
 touch /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/STOP
 ```
 
+## The six scheduled jobs
+
+The four guards above are what watches the money. These are the six things
+launchd wakes up, which is a different list: two of the guards are on it, and so
+are three jobs that write rather than watch.
+
+| Job | When | What it does |
+|---|---|---|
+| `tick` | every 5 min 09:25 to 16:05, plus 07:00, 07:30 and 16:30, weekdays | one tick of the loop for all five books |
+| `watchdog` | every 5 min in market hours, hourly otherwise including weekends | the health check above |
+| `preflight` | 09:00 weekdays | the morning check above |
+| `recorder` | every 5 min 09:25 to 16:05 weekdays | records the day for the replay harness |
+| `learning` | 16:30 weekdays | writes the day's journal entry |
+| `weekly` | 16:45 Friday | writes the week's review |
+
+The last two run Claude Code with no terminal attached and are told what to do
+by a prompt file, not by the job. Change what they do by editing the prompt:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/prompts/daily_learning_loop.md
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/prompts/weekly_review.md
+```
+
+Neither of them can place an order, connect to IB Gateway or the MCP server, or
+touch a launchd job. They read files, write files and run a short list of git
+commands, and that is the whole of it.
+
+**The job files themselves are generated, so do not edit one by hand.** Each job
+has a template in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/`
+holding its schedule in plain English, and this turns them into the plists:
+
+```
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+```
+
+That writes the files and loads nothing. `--check` says whether they are up to
+date, `--install` copies them into `~/Library/LaunchAgents` and starts them, and
+`--uninstall` is the undo. The full explanation is in `docs/LAUNCHD.md`.
+
 ## Where to look when something is odd
 
 ```
@@ -259,8 +299,10 @@ proper MCP request.
 
 As of 2026-09-06:
 
-* No launchd job is loaded. Not the tick, not the watchdog, not the
-  pre-flight. All three are definitions sitting in the repo. Loading them is in
+* No launchd job is loaded. There are six of them now and not one is running:
+  the tick, the watchdog, the pre-flight, the market recorder, the daily
+  learning loop and the weekly review. They are definitions sitting in the repo.
+  Loading them is in
   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md`,
   and the watchdog is the one to load first.
 * iMessage alerts are off until `IMESSAGE_TO` exists in
