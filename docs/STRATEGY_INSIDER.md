@@ -4,7 +4,7 @@ Status: draft for Mo's approval, written 2026-09-06. Nothing here trades until M
 
 ## The idea in one paragraph
 
-Executives and directors know more about their company than anyone outside it, and they have to tell the SEC within two business days whenever they buy or sell its stock. Sales tell you little, people sell for houses, taxes and divorces. Open-market buys are different: someone who already has salary, options and reputation tied to the company chose to put more of their own cash in. When several of them do it in the same week, or the CEO writes a cheque that is large next to what they already hold, history says the stock tends to do better than the market over the following months. This book buys those situations, holds for days to weeks, and gets out on a stop, a target or a clock.
+Executives and directors must tell the SEC within two business days whenever they trade their own company's stock. Sales tell you little, people sell for houses and taxes. Open-market buys are different: someone already paid in salary and options chose to put more of their own cash in. When several do it in the same week, or the CEO buys big relative to what they hold, the stock has historically beaten the market over the following months. This book buys those situations, holds for days to weeks, and exits on a stop or a clock.
 
 ## The signal
 
@@ -22,7 +22,7 @@ SEC EDGAR is free, needs no account, and publishes a filing to its feeds within 
 2. **The Form 4 XML document** inside each filing. It is structured, not a PDF, so transaction code, price, share count, the 10b5-1 checkbox, the insider's title and post-trade holdings all parse cleanly.
 3. **The submissions API** at data.sec.gov for each company, to fetch recent history and count the cluster.
 
-EDGAR's rule is at most ten requests a second with a descriptive User-Agent header. As a cross-check, the free OpenInsider screener publishes the same purchases in a table and is useful for spotting parsing mistakes, but it is a website rather than an API and the code does not depend on it.
+EDGAR allows ten requests a second with a descriptive User-Agent header. The free OpenInsider screener shows the same purchases and is a handy cross-check, but it is a website, not an API, so the code does not depend on it.
 
 ## The day
 
@@ -57,9 +57,9 @@ This book holds overnight and for weeks. **It is exempt from the 3:55 PM flat ru
 
 ## What the code enforces versus what Claude decides
 
-**Code:** the sweep, the filters, the scoring, every cap above, the stops, the time stop, the daily loss cap, the order reference tag, the ledger. Nothing Claude says can move a number in this table.
+**Code:** the sweep, filters, scoring, every cap above, the stops, the time stop, the daily loss cap, the order reference tag, the ledger. Nothing Claude says can move a number in the table.
 
-**Claude:** which of the qualifying names to buy today, in what order, and why. Whether a filing looks like conviction or like a director topping up to meet an ownership guideline. Whether a headline explains the buy in a way that removes the edge. Every pick and every skip gets a written reason.
+**Claude:** which qualifying names to buy today and why; whether a filing looks like conviction or a director topping up to meet an ownership guideline; whether a headline explains the buy away. Every pick and skip gets a written reason.
 
 ## How this book fits the virtual-book design
 
@@ -71,10 +71,9 @@ Its folder is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strat
 - **The signal is slow.** Two business days from trade to filing, and the market reads the same filing we do. Any edge is in judgment about which buys matter, not in speed.
 - **Small caps dominate.** Big-company insiders rarely buy in the open market. Expect thin names, wide spreads and paper fills that flatter reality.
 - **Backtests lie a little.** Published studies on insider buying suffer from survivorship, since companies that went bust drop out of the data. The proposed stops exist because of that.
-- **Clusters can be routine.** Some boards buy together after every annual meeting. The insider-history check is meant to catch this, and it will not always.
 
 ## How we judge month one
 
 Operations first, exactly as in the main spec: every sweep ran, no cap breached, every fill and decision in the ledger with a reason, positions reconciled daily against the broker.
 
-Returns second, and with a specific caveat: 30-day holds mean most of the month's positions will still be open at month end. Judge on mark-to-market equity against SPY and against the other books, plus the quality of the picks (how many stopped out fast, how many the insider was right about on a longer view). A decision to carry this book into month two should not need it to have beaten the day-trading book in four weeks.
+Returns second, with a caveat: 30-day holds mean most positions are still open at month end. Judge on mark-to-market equity against SPY and the other books, and on pick quality (how many stopped out fast). Carrying this book into month two should not require it to have beaten the day-trading book in four weeks.

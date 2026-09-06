@@ -4,7 +4,7 @@ Status: draft for Mo's approval, written 2026-09-06. Nothing here trades until M
 
 ## The idea in one paragraph
 
-Members of the US House and Senate must disclose their stock trades under the STOCK Act. Some of them sit on committees that write the rules for the industries they trade, and a few have records that beat the market by margins professional managers would envy. This book buys what members buy, weighting trades that are large, that come from members whose committee touches the company's sector, and that several members made at once. It holds for weeks. The honest framing: this is a bet that whatever a member knew when they bought is still worth something by the time the public finds out.
+Members of the US House and Senate must disclose their stock trades under the STOCK Act. Some sit on committees that write the rules for the industries they trade in, and a few have records professional managers would envy. This book buys what members buy, weighting large trades, committee links to the company's sector, and several members buying the same name. It holds for weeks. The honest framing: a bet that what a member knew when they bought is still worth something once the public finds out.
 
 ## The signal
 
@@ -28,7 +28,7 @@ Whatever the source, the code records both dates for every trade: the date the m
 
 ## The timing problem, in plain words
 
-Members have up to 45 days to disclose a trade, and most use a good part of it. So on the morning a purchase shows up, the member bought it three to six weeks ago. Whatever they knew has had weeks to reach the price. The strategy is therefore not "trade what they trade". It is "trade what they traded, if the reason they traded still holds". A member buying a defence stock ahead of a budget cycle that runs for months may still be worth following. A member buying ahead of a product announcement that already happened is not. Claude's job is largely to tell those apart, and the trailing stop exists because it will often be wrong.
+Members have up to 45 days to disclose, and most use a good part of it, so a purchase that shows up this morning was made three to six weeks ago and the price has had time to react. The strategy is not "trade what they trade" but "trade what they traded, if the reason still holds". A defence stock bought ahead of a months-long budget cycle may still be worth following. A stock bought ahead of an announcement that already happened is not. Telling those apart is Claude's job, and the trailing stop exists because it will often be wrong.
 
 ## The day
 
@@ -64,7 +64,7 @@ This book holds overnight and for weeks. **It is exempt from the 3:55 PM flat ru
 
 **Code:** the sweep, the scoring table, staleness, every cap above, the stops, the time stop, the daily loss cap, the order reference tag, the ledger.
 
-**Claude:** whether the reason behind a member's buy still stands weeks later, which of the qualifying names to take, and why. Whether a committee link is real or coincidental. Every pick and skip gets a written reason.
+**Claude:** whether the reason behind a buy still stands weeks later, which qualifying names to take and why, whether a committee link is real. Every pick and skip gets a written reason.
 
 ## How this book fits the virtual-book design
 
@@ -76,10 +76,9 @@ Its folder is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strat
 - **Few trades.** Many days the sweep will find nothing that qualifies. A month may produce ten positions. The sample is small and the results will be noisy.
 - **Data quality.** Free mirrors miss filings, misread PDFs and sometimes stop updating. The code flags staleness, but it cannot see what a mirror never parsed.
 - **Attention crowding.** Congress trades are popular content. By the time a filing is public, retail traders have often already piled in, which is part of why the 15% run-up skip rule exists.
-- **Reputational optics.** Following politicians' trades is legal and the data is public. Mo should be comfortable with the framing before this book runs with real money.
 
 ## How we judge month one
 
 Operations first, as in the main spec: every sweep ran, staleness flagged, no cap breached, every fill and decision logged with a reason, positions reconciled daily against the broker.
 
-Returns second, with the same caveat as the insider book: 60-day holds mean the month ends with nearly everything still open. Judge on mark-to-market equity against SPY and the other books, on how many entries the trailing stop later justified, and on whether the data path held up. If the mirrors failed more than twice, month two starts with a paid feed or the book is parked.
+Returns second, with the same caveat as the insider book: 60-day holds mean the month ends with nearly everything open. Judge on mark-to-market equity against SPY and the other books, and on whether the data path held up. If the mirrors failed more than twice, month two starts with a paid feed or the book is parked.
