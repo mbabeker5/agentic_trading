@@ -15,7 +15,7 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 
 ## The day, step by step
 
-**Before 9:35 AM Eastern.** IBKR's scanner ranks US stocks and ETFs by percentage gain and by unusual volume. The code keeps names priced above $5 with average daily volume above one million shares, whose opening volume is well above their normal pace, and throws out leveraged and inverse ETFs. Result: a shortlist of at most 20, long and short candidates together, each tagged with why it was flagged.
+**Before 9:35 AM Eastern.** IBKR's scanner ranks US stocks and ETFs by percentage gain and by unusual volume. The code keeps names priced above $5 that trade at least $20 million a day on average over the last 30 sessions, whose volume by 9:35 is at least twice their normal pace for that time of day, and throws out leveraged and inverse ETFs. Result: a shortlist of at most 20, long and short candidates together, each tagged with why it was flagged.
 
 **9:35 AM.** Claude reviews the shortlist and picks up to five. For each it records the opening range (the high and low of 9:30 to 9:35), an entry trigger (price breaks above the range high on rising volume), a stop (the range low or 1.5% below entry, whichever is closer), and a target or a trailing rule.
 
@@ -36,8 +36,9 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | New entries allowed | 9:35 to 11:00 AM only | |
 | Loop cadence | Every 5 minutes, market hours | |
 | Universe | US-listed stocks and ETFs at IBKR | No international, no fixed income in month one |
-| Price floor | $5 | |
-| Volume floor | 1,000,000 shares average daily | Under review: Mo has a proposal of $20 million average daily dollar volume plus relative volume of at least 2x at 9:35 |
+| Price floor | $5 | Kept as a junk filter |
+| Liquidity floor (Mo, 2026-09-06) | $20,000,000 average daily dollar volume over 30 sessions | Replaces the old 1,000,000 share floor. A census on 2026-09-04 found about 2,700 US names above $20M dollar volume against about 1,950 above 1M shares, so the new floor is wider and better matched to how much we can trade. Script and data in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/liquidity_census/` |
+| Relative volume floor (Mo, 2026-09-06) | 2x normal by 9:35 | Volume traded by 9:35 must be at least twice the stock's usual volume for that time of day. Below 2x the name is skipped |
 | Shortlist size | 20 at most | |
 | Shorting | Allowed (Mo, 2026-09-02) | Same caps as longs, stop 1.5% above entry or the range high if closer, price floor $10, and the easy-to-borrow rule below |
 | Easy-to-borrow rule (Mo, 2026-09-06) | All three must hold at the moment of entry | IBKR shortable indicator at the easy-to-borrow level; borrow fee under 1% a year; at least 10 times our intended share count available to borrow. Any miss and the short is skipped, logged with the reason |
@@ -53,7 +54,9 @@ Mo enabled real-time data sharing to the paper account on 2026-09-02 (IBKR appli
 
 US regulators call anyone who makes four or more round-trip day trades in five business days in a margin account a pattern day trader, and require that account to hold at least $25,000. Fall below it and the broker blocks day trading for 90 days. This strategy would trip the rule in its first week.
 
-The paper account is exempt because it holds simulated money, and IBKR does not apply the rule there. That is fine for testing the logic, but it means month one says nothing about whether the strategy survives the rule with real money. If the test succeeds and we go live, the live account needs to stay comfortably above $25,000, or the strategy has to be reshaped to under four day trades a week.
+The paper account is exempt because it holds simulated money, and IBKR does not apply the rule there. That is fine for testing the logic, but it means month one says nothing about whether the strategy survives the rule with real money.
+
+Mo's decision (2026-09-06): assume $25,000 of live account equity as the safe minimum. Every book keeps a rolling five-business-day day-trade counter in the ledger. Books C (insider) and D (Congress) are held to a hard limit of three day trades per five business days, because they are meant to hold for weeks and a day trade there is a mistake. The momentum books are not blocked, since day trading is the strategy, but the code logs every trade the rule would have blocked so the live-money cost of the rule is measured, not guessed.
 
 ## How we judge month one
 
