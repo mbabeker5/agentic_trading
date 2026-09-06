@@ -61,9 +61,15 @@ from typing import Any, Sequence
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-PROJECT = Path(__file__).resolve().parent.parent
-LEDGER_CONFIG = PROJECT / "config" / "ledger.json"
-TOKEN_PATH = PROJECT / ".secrets" / "token_personal_drive.json"
+_AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
+if str(_AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_DIR))
+
+from paths import config_dir, project_root, secrets_dir  # noqa: E402
+
+PROJECT = project_root()
+LEDGER_CONFIG = config_dir() / "ledger.json"
+TOKEN_PATH = secrets_dir() / "token_personal_drive.json"
 SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
 NEW_YORK = ZoneInfo("America/New_York")
 HTTP_TIMEOUT = 30

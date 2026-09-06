@@ -32,9 +32,17 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from paths import agent_dir  # noqa: E402
 
 DEFAULT_URL = "http://127.0.0.1:8765/mcp"
 DEFAULT_TIMEOUT = 45.0
@@ -179,8 +187,7 @@ class McpClient:
         except urllib.error.URLError as exc:
             raise McpError(
                 f"cannot reach the MCP server at {self.url} ({exc.reason}). "
-                "Is it running? Start it with "
-                "/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/start_mcp.sh"
+                f"Is it running? Start it with {agent_dir() / 'start_mcp.sh'}"
             ) from exc
         except socket.timeout as exc:
             raise McpError(

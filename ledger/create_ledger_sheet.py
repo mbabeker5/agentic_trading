@@ -20,14 +20,21 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.credentials import Credentials
 
-TOKEN_PATH = "/Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/token_personal_drive.json"
-PROJECT_DIR = "/Users/mtalib/workspace_repos/personal_repo/agentic_trading"
-LEDGER_JSON_PATH = os.path.join(PROJECT_DIR, "config", "ledger.json")
+_AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
+if str(_AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_DIR))
+
+from paths import config_dir, project_root, secrets_dir  # noqa: E402
+
+TOKEN_PATH = str(secrets_dir() / "token_personal_drive.json")
+PROJECT_DIR = str(project_root())
+LEDGER_JSON_PATH = str(config_dir() / "ledger.json")
 
 SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
 DRIVE_API = "https://www.googleapis.com/drive/v3/files"

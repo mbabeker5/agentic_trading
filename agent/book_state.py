@@ -42,33 +42,20 @@ arithmetic, which is why the tests for it run in a second.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date as date_type, datetime
 from pathlib import Path
 from typing import Any
 
-#: Where the project lives when nothing overrides it.
-DEFAULT_ROOT = Path("/Users/mtalib/workspace_repos/personal_repo/agentic_trading")
-ROOT_ENV_VAR = "AGENTIC_TRADING_ROOT"
-
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-
-def project_root() -> Path:
-    """The project folder, from AGENTIC_TRADING_ROOT or the default above."""
-    raw = (os.environ.get(ROOT_ENV_VAR) or "").strip()
-    return Path(raw).expanduser() if raw else DEFAULT_ROOT
-
-
-def output_dir(create: bool = True) -> Path:
-    path = project_root() / "output"
-    if create:
-        path.mkdir(parents=True, exist_ok=True)
-    return path
+# Where the project lives is agent/paths.py's job and nobody else's. These two
+# names are re-exported here because callers of this module have always asked it
+# where the state files go.
+from paths import ROOT_ENV_VAR, output_dir, project_root  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------- the shapes

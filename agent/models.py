@@ -25,14 +25,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PROJECT = Path("/Users/mtalib/workspace_repos/personal_repo/agentic_trading")
-SECRETS = PROJECT / ".secrets"
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from paths import project_root, secrets_dir  # noqa: E402
+
+PROJECT = project_root()
+SECRETS = secrets_dir()
 
 # Anthropic first party prices, dollars per million tokens (input, output), 2026-06.
 ANTHROPIC_PRICES = {

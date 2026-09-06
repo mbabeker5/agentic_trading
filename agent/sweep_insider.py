@@ -44,7 +44,13 @@ from zoneinfo import ZoneInfo
 import requests
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from paths import project_root  # noqa: E402
+
+PROJECT_ROOT = project_root()
 CACHE_DIR = PROJECT_ROOT / "output" / "edgar_cache"
 
 EASTERN = ZoneInfo("America/New_York")

@@ -82,7 +82,13 @@ except ImportError:  # pragma: no cover - pypdf is in requirements-312.txt
     PdfReader = None
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from paths import project_root  # noqa: E402
+
+PROJECT_ROOT = project_root()
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "output" / "congress_cache"
 
 # Be a polite visitor. These are public government sites paid for by taxpayers,
