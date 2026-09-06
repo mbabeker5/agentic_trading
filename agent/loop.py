@@ -3340,35 +3340,135 @@ def write_tick_log(lines: list[str]) -> Path:
     return path
 
 
-def read_broker_facts(broker: broker_mod.Broker, wanted_account: str | None,
-                      problems: list[str]) -> tuple[dict, dict, list]:
+#: The keys a broker row might carry the account number under. IBKR's own
+#: portfolio rows use "account"; the MCP server has been seen using the other
+#: two, so all three are read rather than one being guessed at.
+ACCOUNT_KEYS = ("account", "acctId", "accountId", "account_id")
+
+
+def position_account(row: dict, fallback: str = "") -> str:
+    """Which account one broker position row belongs to."""
+    for key in ACCOUNT_KEYS:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value.upper()
+    return str(fallback or "").strip().upper()
+
+
+def position_key(row: dict, fallback_account: str = "") -> tuple[str, str]:
+    """(symbol, account), which is what actually identifies a broker holding.
+
+    Keyed by symbol alone, a second row for the same name overwrites the first
+    and its shares vanish out of every sum the loop makes. That is not a
+    hypothetical: an account can report more than one row for one ticker, and
+    the replay gate's phantom position fault produces exactly that shape.
+    """
+    return (str(row.get("symbol") or "").strip().upper(),
+            position_account(row, fallback_account))
+
+
+def add_position_rows(first: dict, second: dict) -> dict:
+    """Two broker rows for the same name and account, added into one.
+
+    The share counts and the market values add. The average cost is weighted by
+    the share count, which is what an average cost means, and a row with no
+    shares cannot move it. Everything else on the row is taken from the first
+    one seen, because the two describe the same holding.
+    """
+    out = dict(first)
+    left = _number(first.get("position"))
+    right = _number(second.get("position"))
+    total = left + right
+    out["position"] = total
+
+    left_cost = _number(first.get("avgCost"))
+    right_cost = _number(second.get("avgCost"))
+    if total:
+        out["avgCost"] = round(
+            (left_cost * abs(left) + right_cost * abs(right))
+            / (abs(left) + abs(right) or 1.0), 4)
+    for key in ("marketValue", "unrealizedPnl", "realizedPnl"):
+        if first.get(key) is not None or second.get(key) is not None:
+            out[key] = round(_number(first.get(key)) + _number(second.get(key)), 2)
+    refs = list(first.get("order_refs") or []) + list(second.get("order_refs") or [])
+    if refs:
+        out["order_refs"] = sorted(set(refs))
+    return out
+
+
+def positions_by_key(holdings: dict,
+                     fallback_account: str = "") -> dict[tuple[str, str], dict]:
+    """The account's holdings keyed by (symbol, account), nothing dropped.
+
+    Two rows that land on the same key are added rather than one replacing the
+    other, so a name reported twice for one account keeps both halves of itself.
+    """
+    out: dict[tuple[str, str], dict] = {}
+    for row in (holdings.get("positions") or []):
+        if not isinstance(row, dict) or not row.get("symbol"):
+            continue
+        key = position_key(row, fallback_account)
+        out[key] = add_position_rows(out[key], row) if key in out else dict(row)
+    return {key: row for key, row in out.items() if _number(row.get("position"))}
+
+
+def net_by_symbol(rows: dict[tuple[str, str], dict]) -> dict[str, dict]:
+    """The same holdings netted per symbol, which is the one line IBKR shows.
+
+    Everything downstream of this, the reconciliation and each book's marks,
+    wants the netted answer, because a book holds a NAME and not a name in an
+    account. The per key view above is what stops a row being lost on the way.
+    """
+    out: dict[str, dict] = {}
+    for (symbol, _account), row in rows.items():
+        out[symbol] = add_position_rows(out[symbol], row) if symbol in out else dict(row)
+    return {symbol: row for symbol, row in out.items() if _number(row.get("position"))}
+
+
+@dataclass
+class BrokerFacts:
+    """One read of the shared account, in the shapes the rest of the tick wants.
+
+    positions is netted per symbol, which is what the reconciliation and each
+    book's marks read. rows is the same holdings keyed by (symbol, account),
+    which is what stops a second row for one name being lost, and it is what
+    goes into the position snapshot so the history keeps what the account
+    actually said.
+    """
+
+    values: dict = field(default_factory=dict)
+    positions: dict = field(default_factory=dict)
+    rows: dict = field(default_factory=dict)
+    orders: list = field(default_factory=list)
+    problems: list = field(default_factory=list)
+
+
+def read_broker_facts(broker: broker_mod.Broker,
+                      wanted_account: str | None) -> BrokerFacts:
     """One read of the shared account, used by all five books.
 
     Read once per tick rather than once per book, because five books asking IB
     Gateway the same three questions in the same second is how a data pacing
     violation happens.
     """
-    values: dict = {}
+    facts = BrokerFacts()
     holdings: dict = {}
-    orders: list = []
     try:
-        values = broker_mod.account_values(broker, wanted_account)
+        facts.values = broker_mod.account_values(broker, wanted_account)
     except Exception as exc:                 # noqa: BLE001
-        problems.append(f"could not read the account summary: {exc}")
+        facts.problems.append(f"could not read the account summary: {exc}")
     try:
         holdings = broker.portfolio(wanted_account) or {}
     except Exception as exc:                 # noqa: BLE001
-        problems.append(f"could not read the positions: {exc}")
+        facts.problems.append(f"could not read the positions: {exc}")
     try:
-        orders = (broker.open_orders(wanted_account) or {}).get("orders", []) or []
+        facts.orders = (broker.open_orders(wanted_account) or {}).get("orders", []) or []
     except Exception as exc:                 # noqa: BLE001
-        problems.append(f"could not read the open orders: {exc}")
+        facts.problems.append(f"could not read the open orders: {exc}")
 
-    positions = {}
-    for row in (holdings.get("positions") or []):
-        if isinstance(row, dict) and row.get("symbol") and _number(row.get("position")):
-            positions[str(row["symbol"]).upper()] = row
-    return values, positions, orders
+    facts.rows = positions_by_key(holdings, str(wanted_account or ""))
+    facts.positions = net_by_symbol(facts.rows)
+    return facts
 
 
 def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None) -> int:
@@ -3437,13 +3537,14 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     if broker is None:
         broker = broker_mod.McpBroker(account=account_wanted)
 
-    problems: list[str] = []
-    values, broker_positions, broker_orders = read_broker_facts(
-        broker, account_wanted, problems)
+    facts = read_broker_facts(broker, account_wanted)
+    values = facts.values
+    broker_positions = facts.positions
+    broker_orders = facts.orders
     account_id = str(account_wanted or "").strip()
     equity = _number(values.get("NetLiquidation"))
 
-    for problem in problems:
+    for problem in facts.problems:
         print(f"  note: {problem}")
     print(f"\nAccount {account_id}: worth {equity:,.2f}, {len(broker_positions)} "
           f"positions and {len(broker_orders)} working orders across all five books")

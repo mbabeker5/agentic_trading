@@ -525,6 +525,94 @@ def test_a_working_entry_order_placed_this_tick_claims_the_name_too(sandbox):
 
 
 # ---------------------------------------------------------------------------
+# Two rows for one name, and neither of them lost
+# ---------------------------------------------------------------------------
+
+
+def test_a_position_is_identified_by_its_symbol_and_its_account():
+    row = {"symbol": "aapl", "account": "du123", "position": 100}
+    assert loop.position_key(row) == ("AAPL", "DU123")
+    assert loop.position_key({"symbol": "AAPL", "position": 1}, "DUT077572") \
+        == ("AAPL", "DUT077572")
+    for key in ("acctId", "accountId", "account_id"):
+        assert loop.position_key({"symbol": "AAPL", key: "DU9"}) == ("AAPL", "DU9")
+
+
+def test_two_accounts_holding_one_name_are_two_rows_and_one_netted_line():
+    holdings = {"positions": [
+        {"symbol": "AAPL", "account": "DU1", "position": 100, "avgCost": 100.0,
+         "marketValue": 10000.0},
+        {"symbol": "AAPL", "account": "DU2", "position": 40, "avgCost": 150.0,
+         "marketValue": 6000.0},
+    ]}
+    rows = loop.positions_by_key(holdings)
+    assert set(rows) == {("AAPL", "DU1"), ("AAPL", "DU2")}, (
+        "keyed by symbol alone, the second row would have eaten the first")
+
+    netted = loop.net_by_symbol(rows)
+    assert netted["AAPL"]["position"] == 140
+    assert netted["AAPL"]["marketValue"] == 16000.0
+    # 100 shares at 100 and 40 at 150 average out at 114.2857.
+    assert netted["AAPL"]["avgCost"] == pytest.approx(114.2857, abs=0.0001)
+
+
+def test_one_account_reporting_a_name_twice_keeps_both_halves():
+    """The replay gate's phantom position fault makes exactly this shape."""
+    holdings = {"positions": [
+        {"symbol": "OWNED", "position": 100, "avgCost": 100.0, "marketValue": 10000.0},
+        {"symbol": "OWNED", "position": 50, "avgCost": 100.0, "marketValue": 5000.0},
+    ]}
+    rows = loop.positions_by_key(holdings, "DUT077572")
+    assert list(rows) == [("OWNED", "DUT077572")]
+    assert rows[("OWNED", "DUT077572")]["position"] == 150, (
+        "the two rows are added, not one thrown away")
+    assert loop.net_by_symbol(rows)["OWNED"]["position"] == 150
+
+
+def test_a_flat_row_is_dropped_and_a_short_one_is_not():
+    holdings = {"positions": [
+        {"symbol": "GONE", "position": 0},
+        {"symbol": "SHORT", "position": -30, "avgCost": 20.0},
+        {"symbol": "", "position": 10},
+        {"symbol": "NETSOUT", "account": "DU1", "position": 10},
+        {"symbol": "NETSOUT", "account": "DU2", "position": -10},
+    ]}
+    rows = loop.positions_by_key(holdings, "DUT077572")
+    assert ("GONE", "DUT077572") not in rows
+    assert rows[("SHORT", "DUT077572")]["position"] == -30
+    assert not [key for key in rows if not key[0]], "a row with no symbol is not a row"
+
+    netted = loop.net_by_symbol(rows)
+    assert "NETSOUT" not in netted, "long ten and short ten is flat"
+    assert netted["SHORT"]["position"] == -30
+
+
+def test_the_order_refs_on_two_rows_for_one_name_are_kept_together():
+    holdings = {"positions": [
+        {"symbol": "AAPL", "account": "DU1", "position": 10, "order_refs": ["BOOK_A"]},
+        {"symbol": "AAPL", "account": "DU2", "position": 10, "order_refs": ["BOOK_C"]},
+    ]}
+    netted = loop.net_by_symbol(loop.positions_by_key(holdings))
+    assert netted["AAPL"]["order_refs"] == ["BOOK_A", "BOOK_C"]
+
+
+def test_read_broker_facts_hands_back_both_views(sandbox):
+    class TwoAccounts(QuoteBroker):
+        def portfolio(self, account=None, include_pnl=True):
+            return {"positions": [
+                {"symbol": "AAPL", "account": "DU1", "position": 100,
+                 "avgCost": 100.0, "marketValue": 10000.0},
+                {"symbol": "AAPL", "account": "DU2", "position": 40,
+                 "avgCost": 100.0, "marketValue": 4000.0}]}
+
+    facts = loop.read_broker_facts(TwoAccounts(), "DUT077572")
+    assert facts.problems == []
+    assert len(facts.rows) == 2
+    assert facts.positions["AAPL"]["position"] == 140
+    assert facts.values["NetLiquidation"] == "1000000"
+
+
+# ---------------------------------------------------------------------------
 # One ticker, one book: a switch, and the loop stops re-asking when it is on
 # ---------------------------------------------------------------------------
 
