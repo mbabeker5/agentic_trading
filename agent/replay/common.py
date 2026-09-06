@@ -505,10 +505,20 @@ def previous_trading_days(count: int, ending: date_type | None = None) -> list[d
 def ib_end_datetime(moment: datetime) -> str:
     """A datetime in the exact wording reqHistoricalData wants for endDateTime.
 
-    IBKR takes "YYYYMMDD-HH:MM:SS" with an explicit time zone name after it.
-    Written out in full rather than left to the local clock, because a launchd
-    job runs with almost no environment and its idea of local time is not
-    something to bet the opening range on.
+    IBKR accepts two spellings of this field and they are not interchangeable:
+
+        "YYYYMMDD HH:MM:SS US/Eastern"   space between date and time, named zone
+        "YYYYMMDD-HH:MM:SS"              hyphen, UTC only, no zone allowed after
+
+    Mixing them, which is to say a hyphen with a time zone on the end, is thrown
+    out by Gateway with error 10314 and no useful explanation. This was found the
+    hard way on 2026-09-06, when the first history fetch lost every one of its
+    twenty opening range requests to it, so the wording here is deliberate and
+    the hyphen is not coming back.
+
+    We use the named zone form. Written out in full rather than left to the local
+    clock, because a launchd job runs with almost no environment and its idea of
+    local time is not something to bet the opening range on.
     """
     eastern = moment.astimezone(EASTERN)
-    return f"{eastern:%Y%m%d-%H:%M:%S} US/Eastern"
+    return f"{eastern:%Y%m%d %H:%M:%S} US/Eastern"
