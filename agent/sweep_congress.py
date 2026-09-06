@@ -39,9 +39,14 @@ out to be healthier than the mirrors that were meant to save us the work:
    a terms page first, then it answers with clean JSON listing the filings, and
    each electronically filed report is a tidy HTML table of transactions.
 
-3. Capitol Trades is kept as a last resort only. It is a website with no public
-   API, so reading it means parsing the page's HTML, which breaks the moment
-   they redesign. This script only touches it when both official sources fail.
+3. A volunteer rebuild of the old House Stock Watcher feed is kept as a last
+   resort, at raw.githubusercontent.com under TattooedHead. It is one JSON file,
+   refreshed daily from the same Clerk filings, covering the House only. Checked
+   against this script on 17 shared filings it agreed on 12, and lost or invented
+   rows on the other five, so it is a safety net and never a primary source.
+   Capitol Trades was the intended fallback but is unreachable, so it is not
+   implemented: its site answers every request with a bot challenge behind an
+   HTTP 429, and its own data service returns HTTP 503 on every path.
 
 Senators who still file on paper show up in the Senate list as "paper" filings.
 Those are scans with no text, so they are counted and reported but not read.
@@ -100,7 +105,14 @@ SENATE_SEARCH = SENATE_BASE + "/search/"
 SENATE_DATA = SENATE_BASE + "/search/report/data/"
 SENATE_PTR_REPORT_TYPE = "[11]"  # the site's own code for a Periodic Transaction Report
 
-CAPITOL_TRADES_URL = "https://www.capitoltrades.com/trades"
+# A volunteer rebuild of the old House Stock Watcher feed, refreshed daily from
+# the same Clerk filings this script reads directly. Only used when the official
+# sources are unreachable. See the notes on fetch_mirror for why it is not
+# trusted further than that.
+MIRROR_URL = (
+    "https://raw.githubusercontent.com/TattooedHead/house-stock-watcher-data/"
+    "main/data/all_transactions.json"
+)
 
 LEGISLATORS_BASE = (
     "https://raw.githubusercontent.com/unitedstates/congress-legislators/main/"
@@ -1309,84 +1321,110 @@ def parse_senate_ptr(html: str, filing: dict[str, Any]) -> tuple[list[Purchase],
 
 
 # ---------------------------------------------------------------------------
-# Source three, last resort: Capitol Trades
+# Source three, last resort: a community mirror of the House filings
 # ---------------------------------------------------------------------------
 
 
-def fetch_capitol_trades(
-    session: requests.Session, since: date, report: dict[str, Any]
+def fetch_mirror(
+    session: requests.Session, since: date, cache_dir: Path, report: dict[str, Any]
 ) -> list[Purchase]:
-    """Scrape the Capitol Trades website. Fragile, and only used in an emergency.
+    """Last resort: a volunteer rebuild of the old House Stock Watcher feed.
 
-    Capitol Trades has no public interface for programs, so this reads the HTML
-    the website sends to a browser. That means it will break without warning the
-    next time they change their page, which is exactly why the two official
-    sources come first.
+    This is one JSON file on GitHub, rebuilt daily from the same House Clerk
+    filings this script normally reads itself. It covers the House only, so the
+    Senate is simply missing when this path runs.
 
-    Worse, on 2026-09-06 it did not work at all. The website answers every
-    request, robots.txt included, with a JavaScript bot challenge behind an
-    HTTP 429, which only a full browser can clear. Their own data service at
-    bff.capitoltrades.com answers HTTP 503 on every path, because a piece of
-    their infrastructure is misconfigured on their side. So this function has
-    never been run against live data and should be treated as untested. It is
-    here so that the sweep has somewhere to turn rather than as a real second
-    source. If both official sources ever do fail, expect to fix this by hand.
+    It is a fallback and not a primary source, for a measured reason. Checked on
+    2026-09-06 against 17 filings both it and this script had parsed, they agreed
+    on 12. Every one of the five disagreements was theirs:
+
+    - It misses rows where a long company name wraps in the PDF, which cost it
+      real purchases of CMS Energy and UDR.
+    - It drops tickers containing a dot, so it lost a Berkshire Hathaway buy.
+    - Worst, on two filings it invented a ticker. Its own asset description
+      still had the raw null bytes the form's small capitals leave behind, and
+      out of that wreckage it pulled the ticker "K" twice. The securities were
+      really Alphabet and Microsoft. A phantom ticker is how a strategy ends up
+      buying a cereal company because a congressman bought Microsoft.
+
+    So records whose description carries those null bytes are dropped here, since
+    that is the visible tell that their parser failed on that row. Anything this
+    function returns is flagged in the output as coming from a degraded source.
     """
     log.warning(
-        "Both official sources failed, so falling back to reading the Capitol "
-        "Trades website. This path is fragile and unverified."
+        "Both official sources failed. Falling back to the community mirror, "
+        "which covers the House only and is known to miss and occasionally "
+        "invent rows. Treat the results with suspicion."
     )
-    purchases: list[Purchase] = []
-    pages_read = 0
-    for page in range(1, 6):
-        url = f"{CAPITOL_TRADES_URL}?txType=buy&page={page}&pageSize=96"
-        response = http_get(session, url, headers={"Accept": "text/html"})
+    path = cache_dir / "mirror_all_transactions.json"
+    if not cache_is_fresh(path, INDEX_CACHE_HOURS):
+        response = http_get(session, MIRROR_URL)
         if response is None:
-            break
-        pages_read += 1
-        rows = SENATE_ROW.findall(response.text)
-        found_on_page = 0
-        for row_html in rows:
-            cells = [strip_tags(cell) for cell in SENATE_CELL.findall(row_html)]
-            if len(cells) < 6:
-                continue
-            joined = " | ".join(cells)
-            ticker = re.search(r"\b([A-Z]{1,6})(?::US|\.US)\b", joined)
-            dates = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", joined)
-            amount = re.search(r"\$?[\d,]+K?\s*[-\u2013]\s*\$?[\d,]+K?", joined)
-            if not ticker or len(dates) < 2:
-                continue
-            published = parse_us_date(dates[0])
-            traded = parse_us_date(dates[1])
-            if published is None or traded is None or published < since:
-                continue
-            band, label, midpoint = parse_amount_band(
-                (amount.group(0) if amount else "").replace("K", ",000")
-            )
-            purchases.append(
-                Purchase(
-                    ticker=ticker.group(1),
-                    asset_description=cells[1] if len(cells) > 1 else "",
-                    member_name=cells[0] if cells else "unknown",
-                    chamber="unknown",
-                    amount_band=band,
-                    amount_band_label=label,
-                    band_midpoint_usd=midpoint,
-                    transaction_date=traded,
-                    disclosure_date=published,
-                    source_url=url,
-                    source_name="Capitol Trades",
-                )
-            )
-            found_on_page += 1
-        if not found_on_page:
-            break
+            report["errors"].append("The community mirror could not be downloaded")
+            return []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(response.content)
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        report["errors"].append(f"The community mirror could not be read: {exc}")
+        return []
 
-    report["capitol_trades_pages_read"] = pages_read
-    if pages_read and not purchases:
+    purchases: list[Purchase] = []
+    newest = None
+    corrupted = 0
+    for row in rows:
+        disclosed = parse_us_date(row.get("disclosure_date", ""))
+        if disclosed is None:
+            continue
+        if newest is None or disclosed > newest:
+            newest = disclosed
+        if disclosed < since:
+            continue
+        if row.get("type") != "Purchase" or row.get("asset_type") != "Stock":
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if not ticker or ticker in {"--", "N/A"}:
+            continue
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,6}", ticker):
+            continue
+        description = str(row.get("asset_description") or "")
+        if "\x00" in description:
+            # Their parser failed on this row and the ticker cannot be trusted.
+            corrupted += 1
+            continue
+        description = re.sub(r"\s+", " ", description).strip()
+        if looks_like_a_fund(description):
+            continue
+
+        district = str(row.get("district") or "")
+        band, label, midpoint = parse_amount_band(row.get("amount", ""))
+        purchases.append(
+            Purchase(
+                ticker=ticker,
+                asset_description=description,
+                member_name=str(row.get("representative") or "unknown"),
+                chamber="House",
+                state=district[:2],
+                district=district[2:],
+                owner=str(row.get("owner") or "self").strip().lower() or "self",
+                amount_band=band,
+                amount_band_label=label,
+                band_midpoint_usd=midpoint,
+                transaction_date=parse_us_date(row.get("transaction_date", "")),
+                disclosure_date=disclosed,
+                source_url=str(row.get("source_url") or ""),
+                source_name="community mirror",
+            )
+        )
+
+    report["mirror_rows_total"] = len(rows)
+    report["mirror_newest_disclosure"] = newest.isoformat() if newest else None
+    report["mirror_rows_dropped_as_corrupted"] = corrupted
+    if corrupted:
         report["errors"].append(
-            "Capitol Trades answered but nothing could be read out of the page, "
-            "which usually means their layout has changed"
+            f"{corrupted} mirror row(s) were dropped because the mirror's own "
+            f"parser had mangled them and their ticker could not be trusted"
         )
     return purchases
 
@@ -1598,17 +1636,22 @@ def run_sweep(since: date, cache_dir: Path, max_candidates: int) -> dict[str, An
     else:
         sources_failed.append("Senate EFD")
 
+    degraded = False
     if not sources_used:
         try:
-            fallback = fetch_capitol_trades(session, since, report)
+            fallback = fetch_mirror(session, since, cache_dir, report)
         except Exception as exc:
             fallback = []
-            report["errors"].append(f"The Capitol Trades fallback failed: {exc}")
+            report["errors"].append(f"The community mirror fallback failed: {exc}")
         if fallback:
-            sources_used.append("Capitol Trades website (fallback, fragile)")
+            degraded = True
+            sources_used.append(
+                "community mirror of House filings (fallback, House only, "
+                "known to miss and occasionally invent rows)"
+            )
             purchases.extend(fallback)
         else:
-            sources_failed.append("Capitol Trades")
+            sources_failed.append("community mirror")
 
     transactions_scanned = int(report.get("house_rows_scanned", 0)) + int(
         report.get("senate_rows_scanned", 0)
@@ -1724,6 +1767,7 @@ def run_sweep(since: date, cache_dir: Path, max_candidates: int) -> dict[str, An
     newest_dates = [
         parse_us_date(report.get("house_index_newest_filing") or ""),
         parse_us_date(report.get("senate_newest_filing") or ""),
+        parse_us_date(report.get("mirror_newest_disclosure") or ""),
     ]
     newest = max([d for d in newest_dates if d], default=None)
     stale_by_days = (date.today() - newest).days if newest else None
@@ -1736,6 +1780,7 @@ def run_sweep(since: date, cache_dir: Path, max_candidates: int) -> dict[str, An
         "timestamp_utc": started.isoformat(),
         "since": since.isoformat(),
         "source_used": ", ".join(sources_used) if sources_used else "none",
+        "source_is_degraded": degraded,
         "sources_tried_and_failed": sources_failed,
         "source_last_updated": newest.isoformat() if newest else None,
         "source_stale_by_days": stale_by_days,

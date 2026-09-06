@@ -51,7 +51,8 @@ is better: the government's own systems.
 | **congress-legislators** on GitHub | Yes | 2026-09-03 | YAML | Yes, raw files over HTTPS |
 | House Stock Watcher, the S3 bucket | **No** | n/a | n/a | Answers HTTP 403 Access Denied. Its GitHub repository has been deleted. |
 | Senate Stock Watcher, the S3 bucket | **No** | n/a | n/a | Answers HTTP 403 Access Denied. Its GitHub repository last saw a change in March 2021. |
-| Capitol Trades | **No** | n/a | n/a | The website answers every request, `robots.txt` included, with a bot challenge behind HTTP 429. Their own data service answers HTTP 503 on every path because something is misconfigured on their side. |
+| **Community mirror** of the House feed, `raw.githubusercontent.com/TattooedHead/house-stock-watcher-data` | Yes | 2026-09-01 | One JSON file, 23,969 records | Yes, raw file over HTTPS |
+| Capitol Trades | **No** | n/a | n/a | The website answers every request, `robots.txt` included, with a bot challenge behind HTTP 429. Their own data service answers HTTP 503 on every path because something is misconfigured on their side. Not implemented, because it cannot be reached to test. |
 | Unusual Whales, Quiver, Finnhub, Financial Modeling Prep | Paid | n/a | n/a | All refuse without an API key. None were signed up for. |
 
 So the two Stock Watcher datasets the strategy document names are both dead,
@@ -61,11 +62,41 @@ not merely stale. The script does not use them and does not try.
 alternatives to each other, they cover different chambers, so the script runs
 both and uses whatever answers.
 
-**Fallback: Capitol Trades.** Only touched when both official sources fail. It
-reads the website's HTML, so it will break the next time they redesign the page.
-Since their site could not be reached at all on 2026-09-06, that code path has
-never run against live data. Treat it as untested. If both official sources ever
-do fail, expect to fix it by hand rather than trusting what it returns.
+**Fallback: a community mirror of the House feed.** Capitol Trades was meant to
+be the fallback, but it cannot be reached at all, so writing code against it
+would mean shipping something untestable. Instead the fallback is a volunteer
+rebuild of the old House Stock Watcher feed: one JSON file on GitHub, refreshed
+daily from the same Clerk filings this script reads directly. It has been tested,
+it works, and the sweep runs off it when both official sources fail.
+
+It is a safety net and nothing more, for reasons that were measured rather than
+assumed. See the next section.
+
+### What happened when the mirror was checked against this script
+
+Both had parsed 17 of the same filings. They agreed on 12. All five
+disagreements were the mirror's:
+
+- It **misses wrapped rows**, the same PDF quirk described above, which cost it
+  real purchases of CMS Energy and UDR.
+- It **drops tickers containing a dot**, so it lost a Berkshire Hathaway buy.
+- On two filings it **invented a ticker**. Its own asset description still had
+  the null bytes the form's small capitals leave behind, and out of that it
+  produced the ticker "K" twice. The real securities were Alphabet and Microsoft.
+
+That last one is the dangerous kind of wrong. A phantom ticker is how a strategy
+ends up buying a cereal company because a congressman bought Microsoft. So the
+script drops any mirror record whose description carries those null bytes, since
+that is the visible sign their parser failed on that row. On the 2026-08-01
+window that guard threw out 23 records.
+
+Anything the fallback returns is marked `"source_is_degraded": true` in the
+output, and the mirror covers the House only, so the Senate is simply missing
+whenever this path runs.
+
+Worth saying plainly: this exercise was also the best check available on the
+script's own parsing. On every one of the five disagreements, the reading here
+was the correct one, confirmed against the original filings.
 
 ### What the House PDFs are like
 
@@ -287,6 +318,8 @@ Run on 2026-09-06 for everything disclosed since 2026-08-01, written to
   committee. The warnings name anyone this happened to. Fixing it properly means
   also loading the historical roster, which is a 9 MB file, and that did not seem
   worth adding to every run for a handful of filings.
-- **The fallback is not a real fallback.** Capitol Trades has never been reached,
-  so if both official sources go down at once, this sweep produces nothing and
-  exits 1.
+- **The fallback is a downgrade, not a substitute.** It covers the House only,
+  it misses rows the official parsing catches, and it occasionally invents a
+  ticker. The known failure mode is guarded and the output is flagged, but a run
+  on the fallback should be read as a warning that something is broken upstream
+  rather than as a normal day's shortlist.
