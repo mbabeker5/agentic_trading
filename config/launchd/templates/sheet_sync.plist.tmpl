@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A TEMPLATE, not a loadable job. Every {ROOT} below is a placeholder.
+
+  Render it with the project folder written in, and it becomes a plist launchd
+  will accept. From the project folder:
+
+    sed "s|{ROOT}|$PWD|g" config/launchd/templates/sheet_sync.plist.tmpl \
+      > ~/Library/LaunchAgents/com.mtalib.agentic-trading.sheet_sync.plist
+    launchctl bootstrap gui/$(id -u) \
+      ~/Library/LaunchAgents/com.mtalib.agentic-trading.sheet_sync.plist
+
+  WHY THIS ONE IS NOT GENERATED LIKE THE SIX LIVE JOBS. Those are written by
+  scripts/gen_launchd.py from config/launchd/templates/*.template, and
+  tests/test_paths.py checks that every generated plist matches its template and
+  that each job wakes up exactly the number of times it is meant to. This job
+  has never run against the real sheet, so it is deliberately kept out of that
+  set, exactly like deadman.plist.tmpl beside it. Adding it would put an
+  unwatched job into the same list as the ones that are ready.
+
+  When Mo decides to arm it, the move is small and worth doing properly:
+
+    1. write config/launchd/templates/sheet_sync.template in gen_launchd's own
+       format, with the program, environment and comment from this file, and the
+       schedule line reading exactly:
+         at 16:35 on weekdays
+    2. add "sheet_sync": 5 to EXPECTED_WAKE_UPS in tests/test_paths.py
+    3. run scripts/gen_launchd.py to write the plist, then run it again with the
+       install flag to load it
+
+  WHAT IT DOES. At 16:35 New York, Monday to Friday, thirty five minutes after
+  the market shuts, it rewrites the Google Sheet ledger from the database. The
+  database is the record; the sheet is a picture of it that Mo can open on a
+  phone. Nothing writes to the sheet during the day any more, so a broken wifi
+  connection at half past nine in the morning costs nothing.
+
+  IT CANNOT TRADE. It reads one file on disk and writes to one Google Sheet. It
+  never opens a connection to IB Gateway and has no way to place an order.
+
+  IT IS SAFE TO RUN TWICE. Every tab is cleared over the columns the agent owns
+  and rewritten from the top, so a second run in the same evening produces the
+  same sheet rather than a doubled one.
+
+  TAKE THE LAST ARGUMENT OUT of ProgramArguments below, the write flag, and it
+  becomes a rehearsal: it works out every row, reads the live sheet to check the
+  column headings still line up, prints what it would send, and writes nothing.
+  That is the way to watch it for a week before trusting it. (The flag cannot be
+  spelled out here, because XML forbids two hyphens in a row inside a comment.)
+
+  WHAT IT NEEDS. The Google token at .secrets/token_personal_drive.json and the
+  sheet id in config/ledger.json. If either is missing it says so and stops
+  without touching anything.
+
+  launchd works in this Mac's own local time. There is no setting in here that
+  pins a time zone, so the time below is this Mac's clock. The market keeps New
+  York hours whatever the Mac thinks. Keep the Mac on Eastern, or change the
+  time in here.
+
+  NOT LOADED by writing this file. Loading is the separate, deliberate step
+  written out above.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mtalib.agentic-trading.sheet_sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>{ROOT}/venv312/bin/python</string>
+      <string>{ROOT}/ledger/sync_sheet.py</string>
+      <string>--write</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{ROOT}</string>
+
+    <key>StandardOutPath</key>
+    <string>{ROOT}/output/launchd_sheet_sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{ROOT}/output/launchd_sheet_sync.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>AGENTIC_TRADING_ROOT</key><string>{ROOT}</string>
+      <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+      <key>TZ</key><string>America/New_York</string>
+    </dict>
+
+    <!-- A run that overruns must never have a second one land on top of it. A
+         whole month of rows is a handful of requests to Google, so a few
+         minutes is generous and it only runs once a day anyway. -->
+    <key>AbandonProcessGroup</key>
+    <false/>
+    <key>ExitTimeOut</key>
+    <integer>300</integer>
+
+    <!-- Do not fire the moment the job is loaded, only at 16:35. A job that
+         fired at load would rewrite the sheet in the middle of a trading
+         morning from a database that is only half way through the day. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- 5 wake ups a week: 16:35, Monday to Friday. -->
+    <key>StartCalendarInterval</key>
+    <array>
+      <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>4</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>5</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+    </array>
+
+</dict>
+</plist>

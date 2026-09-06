@@ -421,6 +421,53 @@ To pause without stopping the launchd job at all, one line does it:
 touch /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/STOP
 ```
 
+## Where the record actually lives
+
+Everything the agent does goes into one SQLite database:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/data/trading.sqlite
+```
+
+That file is the record now. The Google Sheet is a picture of it, redrawn once a
+night. So if the wifi is off, or Google is having a bad morning, nothing is
+lost: the tick still writes to the database and the sheet catches up later. And
+if the sheet is ever wrong, or somebody deletes it, that is not a loss either.
+Run the sync again and it is rebuilt from the database.
+
+Everything means everything: every quote the agent looked at, every scanner run,
+every decision including the decisions to do nothing, every order sent, every
+fill that came back, every alert, and every pre-flight and watchdog check. The
+table by table explanation is in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/DATA.md`.
+
+To look inside it without any chance of breaking it:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/db.py
+```
+
+That prints where the file is and how many rows are in each table, and writes
+nothing.
+
+The sheet is rewritten at 16:35 New York by
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/ledger/sync_sheet.py`,
+and it is safe to run by hand at any time. `--dry-run` says what it would put in
+the sheet and writes nothing. `--write` actually rewrites it.
+
+The backup is a copy of that one file, once a night, into
+`data/backups/trading_YYYY-MM-DD.sqlite`, written by
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/backup_db.sh`.
+Thirty days are kept and older copies are deleted. If this Mac ever has to be
+replaced, that is the one file to carry across.
+
+**Neither of the two new jobs is loaded**, exactly like every other job in this
+project. The nightly sheet sync and the nightly backup are definitions sitting
+in the repo, at `config/launchd/templates/sheet_sync.plist.tmpl` and
+`config/launchd/templates/backup_db.plist.tmpl`, until somebody loads them by
+hand.
+
 ## Day-trading regime
 
 Two rulebooks exist in 2026, and the code follows whichever one the account is
@@ -548,6 +595,8 @@ output/tick_YYYY-MM-DD.log       everything a single day's ticks printed
 output/ibc_logs/                 IB Gateway's own logs
 output/mcp_logs/mcp_ibkr.log     the MCP server
 output/launchd_*.out.log         anything that broke before a script started
+data/trading.sqlite              every tick, decision, order and fill
+data/backups/                    a copy a night, 30 days kept
 ```
 
 All of those are under

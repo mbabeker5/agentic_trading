@@ -21,7 +21,13 @@ Jts/
 !config/mcp_ibkr.env
 !config/gateway.env
 
-# SQLite system of record and its backups live outside git
-data/
+# SQLite system of record and its backups live outside git.
+# It has to be data/* and not data/, because git never looks inside a folder it
+# has already excluded, so the two exceptions below would never be reached.
+data/*
 !data/schema.sql
 !data/migrations/
+
+# downloaded papers, regenerable from the links in the reading list
+research/reading_list_2026-09/pdfs/
+research/**/pdfs/

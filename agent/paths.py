@@ -87,6 +87,23 @@ def output_dir(create: bool = True) -> Path:
     return path
 
 
+def data_dir(create: bool = True) -> Path:
+    """data/, holding trading.sqlite, the system of record, and its backups.
+
+    This is where the database lives, and it is the one folder in the project
+    that is state rather than source. The whole of it is gitignored apart from
+    data/schema.sql and data/migrations/, because a database belongs to the
+    machine it runs on, not to git.
+
+    Created if it is missing, like output/, because the first thing anything
+    does here is write into it. Pass create=False when you only want to look.
+    """
+    path = project_root() / "data"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def secrets_dir() -> Path:
     """.secrets/, the gitignored folder holding tokens and logins.
 

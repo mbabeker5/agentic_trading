@@ -30,6 +30,14 @@ what this page is about:
    value comes from.
 3. **The launchd jobs**, which are per machine by nature. A generator writes
    them, so this is one command rather than six files.
+4. **The database**, which is one file, `data/trading.sqlite` under the project
+   root. The whole `data/` folder is gitignored, the same way `.secrets/` is,
+   so the clone does not bring it. If the old machine has already traded, copy
+   that one file across, and the simplest way is to copy the newest file out of
+   `data/backups/`. If it has not traded yet, run
+   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/migrate_db.py`
+   with the project's Python and you get an empty one. It is one file and
+   nothing else.
 
 Plan for an hour, most of which is waiting for downloads and for IBKR.
 
