@@ -37,9 +37,10 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | Loop cadence | Every 5 minutes, market hours | |
 | Universe | US-listed stocks and ETFs at IBKR | No international, no fixed income in month one |
 | Price floor | $5 | |
-| Volume floor | 1,000,000 shares average daily | |
+| Volume floor | 1,000,000 shares average daily | Under review: Mo has a proposal of $20 million average daily dollar volume plus relative volume of at least 2x at 9:35 |
 | Shortlist size | 20 at most | |
-| Shorting | Allowed (Mo, 2026-09-02) | Same caps as longs, stop 1.5% above entry or the range high if closer, easy-to-borrow names only, price floor $10 |
+| Shorting | Allowed (Mo, 2026-09-02) | Same caps as longs, stop 1.5% above entry or the range high if closer, price floor $10, and the easy-to-borrow rule below |
+| Easy-to-borrow rule (Mo, 2026-09-06) | All three must hold at the moment of entry | IBKR shortable indicator at the easy-to-borrow level; borrow fee under 1% a year; at least 10 times our intended share count available to borrow. Any miss and the short is skipped, logged with the reason |
 | Gross exposure cap | 100% of book equity | Longs plus shorts added together may never exceed the book's value. No margin borrowing for longs. With 5 positions at 15% the natural ceiling is 75%, so this is a backstop |
 | Options | Not in month one | |
 | Order types | Limit entries, bracket stops, market exits at close | |
