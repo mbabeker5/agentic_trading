@@ -18,7 +18,7 @@ To turn it back on:
 The rest of this page explains what is watching, what it will tell you, and what
 to do about it.
 
-## The four guards
+## The five guards
 
 | Guard | When it runs | What it can do |
 |---|---|---|
@@ -26,8 +26,10 @@ to do about it.
 | `agent/watchdog.py` | every 5 minutes in market hours, hourly otherwise | check six things, message you, start IB Gateway once |
 | `agent/preflight.py` | 09:00 on weekdays | check five things, stop the day's trading, message you |
 | `agent/kill_switch.sh` | when you run it | stop the loop, cancel every order, close every position |
+| `agent/deadman.py` | every 5 minutes 09:30 to 16:00 on weekdays | notice the loop has died while a book is exposed, message you, and pull the kill switch itself |
 
-Only the last one can trade. The other three read.
+Only the last two can trade, and the last one is the only thing in the project
+that can decide to trade with nobody watching. The other three read.
 
 ### The alerter
 
@@ -89,6 +91,60 @@ to restart itself.
 
 It will not nag. Once when something breaks, once every thirty minutes while it
 stays broken, once when it comes back. That is the whole budget.
+
+#### A restart only counts once it is proved
+
+The watchdog is allowed to start IB Gateway, once per outage. Until 2026-09-06
+it treated the start script finishing cleanly as proof that this had worked,
+which proves nothing at all:
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/start_gateway.sh`
+becomes Gateway when it succeeds and so never finishes. A clean exit from it is
+closer to bad news than good.
+
+So now it looks at Gateway before it starts anything and writes down two things:
+which process id Gateway is running under, and the time of the newest
+`Login has completed` line in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/ibc_logs/`.
+Then it starts Gateway and keeps looking, every five seconds for up to two
+minutes. Three things all have to be true before it will call that a restart:
+
+1. **A different process id.** The old one coming back means nothing started,
+   it means we are looking at the Gateway that was already sitting there.
+2. **A login in the IBC log newer than the one it wrote down.** A Gateway can
+   start, fail its login and sit on the prompt for the rest of the day, so a
+   new process on its own is not a Gateway anyone can trade through.
+3. **Port 4002 accepting a connection.** Logged in but not listening is exactly
+   the hang the watchdog exists to catch. Nothing is sent down that socket, it
+   is opened and closed again, so this can never touch the account.
+
+If any of the three is missing you get a message that names which ones did and
+did not happen:
+
+```
+[ERROR] Watchdog: restart did not take
+
+IB Gateway was started but the restart cannot be confirmed. Here is what was
+and was not seen in the 120 seconds after it was started:
+
+  a different process id: yes (was 123, now 456)
+  a newer login in the IBC log: yes (was 2026-09-06 06:30:00, now 2026-09-06 10:16:00)
+  port 4002 accepting connections: no
+
+All three have to be true before this counts as a restart, so it is not being
+written down as one.
+```
+
+That last line matters. A restart that cannot be proved is not recorded as the
+outage's one attempt, so nothing is spent on a start that did nothing.
+
+What to do when you see it: run
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/start_gateway.sh`
+yourself and watch the Gateway window, because IBKR Mobile is often sitting
+there waiting for you to approve the login.
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/gateway_launch.log`
+holds what the start script said, and
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/ibc_logs/`
+holds what Gateway itself said.
 
 ### The pre-flight
 
@@ -157,7 +213,13 @@ a quiet phone from a broken alerter.
 | `loop_tick failed` | The loop has stopped waking up | Check `output/tick_YYYY-MM-DD.log` for the last thing it said, then `launchctl print gui/$(id -u)/com.mtalib.agentic-trading.tick` to see whether the job is still loaded. |
 | `disk_free failed` | Under a gigabyte left | `output/ibc_logs/` is usually the culprit. Gateway writes a lot. |
 | `Pre-flight failed: ...` | One of the 09:00 checks said no | Read `output/preflight_YYYY-MM-DD.json`, fix the named check, then `agent/reenable.sh` to clear NO_TRADE_TODAY. Until you do, the agent will not open anything today. |
-| `Kill switch fired` | Somebody or something pulled the panic button | Read the message. It lists what was cancelled, what was closed, and what is left over. |
+| `Kill switch fired on account ...` | Somebody or something pulled the panic button | Read the message. It lists what was cancelled, what was closed, and what is left over. |
+| `Kill switch fired on LIVE account ...` | The panic button was pulled on an account that is not the paper one | This needs the flag and the environment variable together, so somebody meant it. Check the account. |
+| `Kill switch refused: ... is not a paper account` | The panic button was pulled on a live account without both permissions | Nothing was traded, but the loop IS stopped. Decide whether you really want that account flattened, and read the panic button section below. |
+| `Kill switch could not read the account` | The panic button was pulled and IB Gateway did not answer | The loop is stopped anyway. Fix Gateway, then run it again. |
+| `Loop is dead, pulling the kill switch` | The dead man's handle fired. The loop stopped for more than 15 minutes while a book was holding something | Nothing to do right now, it is already closing out. A second message follows with the result. Then find out why the loop stopped. |
+| `Loop is dead and ... is a LIVE account` | The same, on an account that is not the paper one | It has NOT traded and will not. Close the positions yourself, or read the panic button section. |
+| `The trading loop has stopped` | The loop stopped for more than 15 minutes in market hours, and no book was holding anything | Nothing was traded and nothing needed to be. Find out why the loop stopped. |
 | `Recovered: ...` | Nothing. It is over | Nothing. |
 
 ## The panic button
@@ -169,16 +231,31 @@ a quiet phone from a broken alerter.
 In order, that:
 
 1. writes `output/STOP` and `output/LOOP_DISABLED`, which stops the loop dead;
-2. cancels every working order on the account;
-3. sells every long and buys back every short, at the market, transmitted;
-4. reads the account back and prints what is actually left;
-5. messages you with all of it.
+2. cancels every working order on the account in one go;
+3. reads the orders back and cancels one by one anything that survived step 2;
+4. sells every long and buys back every short, at the market, transmitted;
+5. reads the account back, up to five times over thirty seconds, until it is
+   flat and empty or until it can say exactly what is left;
+6. messages you with all of it, and writes
+   `output/kill_switch_YYYY-MM-DD_HHMMSS.json`.
 
 Step 1 happens **whether or not you remember `--really`**. That is deliberate.
 The worst possible outcome would be typing this in a hurry, leaving off the flag,
 and walking away believing the agent was stopped when it was not. So the fast,
 certain part is always real, and `--really` only controls the part that talks to
-the broker.
+the broker. Both halves of the panic button write those two files: the shell
+script before it starts Python, and Python again as its own first step. Either
+one on its own stops the loop.
+
+Step 3 is there because IBKR ignores a global cancel often enough to matter,
+usually for an order placed by a different client id. An order still sitting
+there after step 2 gets cancelled by its own id.
+
+None of it goes through the trading loop. The kill switch talks straight to the
+broker through `agent/broker.py`, never imports `agent/loop.py`, never reads a
+book's state file, and never asks the guardrails for permission. Getting out is
+always allowed, and a panic button that depends on the thing you are panicking
+about is not a panic button.
 
 The rehearsal is safe at any time:
 
@@ -190,11 +267,126 @@ That reads the account, prints exactly which orders it would cancel and which
 positions it would close, and sends nothing to the broker. It still writes the
 two stop files, so run `agent/reenable.sh` afterwards.
 
-Two things to know. Market orders do not fill outside trading hours, they queue
-for the next open, so a kill switch pulled at 8 in the evening leaves you with
-orders waiting rather than a flat account. The script says so rather than
-pretending. And it refuses outright on any account that does not start with DU,
-so it cannot be pointed at a live account.
+Market orders do not fill outside trading hours, they queue for the next open,
+so a kill switch pulled at 8 in the evening leaves you with orders waiting
+rather than a flat account. The script says so rather than pretending, and it
+exits 1 rather than 0 when the account did not go flat.
+
+### Pointing it at a live account
+
+It refuses on any account id that does not start with `DU`, which is every
+account except an IBKR paper one. To override that you need **both** of these,
+together:
+
+```
+AGENTIC_TRADING_KILL_LIVE=yes \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/kill_switch.sh \
+  --really --live-account-ok
+```
+
+Two permissions rather than one, because they are hard to do by accident
+together: a flag alone is one typo, and an environment variable alone is
+something a shell profile could be carrying without you knowing. With both, it
+flattens the account and the alert says in plain words that it was a live one.
+With either missing it refuses, tells you which half is missing, and still
+writes the two stop files, so the loop is stopped either way.
+
+## The dead man's handle
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/deadman.py
+```
+
+The panic button above needs somebody to press it. This is the thing that
+presses it when nobody is there.
+
+Every other guard assumes something is still running. The watchdog tells you the
+loop has stopped, which is useful at 10 in the morning and useless at 3 in the
+afternoon when you are on a plane. The loop protects its own positions: it moves
+the stops, it sells the momentum books at 15:55. All of that stops the moment the
+loop stops. The one state nothing else covers: the loop is dead, the market is
+open, and the books are still holding things.
+
+Every five minutes from 09:30 to 16:00 on a weekday it asks three questions and
+stops at the first no:
+
+1. Has the loop written nothing for more than fifteen minutes?
+2. Is the market actually open?
+3. Does the broker hold a position, or a working order, that carries a `BOOK_`
+   tag?
+
+All three yes: it messages you, then runs the kill switch for real. Two messages
+arrive, on purpose. The first says why, the second says what happened.
+
+The first two yes and the third no: it sends one message saying the loop is dead
+and trades nothing, because nothing at the broker was its business.
+
+Question 3 is what stops it firing over nothing. Your one share of SPY, and
+the market-on-open order sitting next to it, were not put there by a book. They
+are orphans: they get listed in the output and named in the alert, and they never
+cause an order. Only a book's exposure counts, because only a book's exposure was
+being looked after by the thing that died.
+
+A position is a book's when the broker tags it, or when a book's own state file
+under `output/state_BOOK_*.json` says that book holds that symbol. The second
+half matters: IBKR reports one netted account and nothing about which order put a
+position there, so the book files are the only record of who owns what. The
+newest file per book wins, today's if the loop got that far and the most recent
+earlier one if it did not, because books C and D hold for weeks and a loop that
+died before writing today's file has not stopped owning last Thursday's buy.
+
+The heartbeat is the newest change time among these, all under `output/`:
+
+```
+heartbeat              wins outright if it exists. Nothing writes it today.
+loop.log               one line per book per tick
+tick_YYYY-MM-DD.log    everything one day's ticks printed
+state_BOOK_*_*.json    one file per book per day
+```
+
+Change times, not the timestamps written inside the files. That is deliberately
+different from the watchdog, which quotes the loop's own words because it is
+reporting to a person. This one is deciding whether to trade, so it asks the
+filesystem, which cannot be fooled by a loop that is still writing a stale
+timestamp.
+
+`output/deadman_state.json` is what stops it firing seventy-eight times in an
+afternoon. It records which silence it acted on and what it did about it, so a
+loop that stays dead gets one kill switch and not one every five minutes. When
+the loop comes back and dies again the heartbeat has moved, so that is a new
+silence and it can act again. `agent/reenable.sh` clears the file.
+
+It is a dry run unless you pass `--really`, and a dry run sends nothing, trades
+nothing and writes nothing:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/deadman.py
+```
+
+On an account that does not start with `DU` it alerts and stops there, unless
+`AGENTIC_TRADING_KILL_LIVE=yes` is in its environment, which the job file
+deliberately does not set. Flattening a live account because a log file looked
+old is not a decision a scheduled job gets to make on its own.
+
+**It is not loaded, and it is not one of the six generated jobs.** Its job file
+is a template at
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/deadman.plist.tmpl`,
+which is a plist with the project folder left as a placeholder rather than one of
+the `.template` files `scripts/gen_launchd.py` reads. That is on purpose: it has
+never run against a real account, so it is kept out of the set of jobs that are
+ready. To load it by hand, from the project folder:
+
+```
+sed "s|{ROOT}|$PWD|g" config/launchd/templates/deadman.plist.tmpl \
+  > ~/Library/LaunchAgents/com.mtalib.agentic-trading.deadman.plist
+launchctl bootstrap gui/$(id -u) \
+  ~/Library/LaunchAgents/com.mtalib.agentic-trading.deadman.plist
+```
+
+Take `--really` out of that file's `ProgramArguments` first and watch it for a
+week. The file itself says how to promote it into a proper generated job when
+you want it armed.
 
 ## Turning it back on
 
@@ -203,8 +395,10 @@ so it cannot be pointed at a live account.
 ```
 
 It removes the three files that hold the agent back and tells you which ones
-were actually there. It does not restart Gateway, reload any launchd job, or
-buy back anything the kill switch sold.
+were actually there. It also clears `output/deadman_state.json`, the dead man's
+handle's note of which silence it has already acted on, because starting the
+agent again is starting over. It does not restart Gateway, reload any launchd
+job, or buy back anything the kill switch sold.
 
 ## The three brakes
 
@@ -214,8 +408,8 @@ removed by `agent/reenable.sh`.
 
 | File | Effect | Written by |
 |---|---|---|
-| `STOP` | The loop closes positions but opens none. Getting out is always allowed. | `kill_switch.sh`, or you, by hand |
-| `LOOP_DISABLED` | `run_tick.sh` does not run a tick at all | `kill_switch.sh` |
+| `STOP` | The loop closes positions but opens none. Getting out is always allowed. | `kill_switch.sh` and `kill_switch.py`, or you, by hand |
+| `LOOP_DISABLED` | `run_tick.sh` does not run a tick at all | `kill_switch.sh` and `kill_switch.py` |
 | `NO_TRADE_TODAY` | Same as STOP: close, do not open | `preflight.py`, when a 09:00 check fails |
 
 `NO_TRADE_TODAY` does not clear itself at midnight, on purpose. A morning that
@@ -229,9 +423,11 @@ touch /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/STOP
 
 ## The six scheduled jobs
 
-The four guards above are what watches the money. These are the six things
+The five guards above are what watches the money. These are the six things
 launchd wakes up, which is a different list: two of the guards are on it, and so
-are three jobs that write rather than watch.
+are three jobs that write rather than watch. The dead man's handle would be a
+seventh, and it is deliberately not generated with these six. Its own section
+above says why and how to load it by hand.
 
 | Job | When | What it does |
 |---|---|---|
@@ -274,6 +470,8 @@ output/alerts.log                every alert ever sent, one line each
 output/watchdog.log              one line per watchdog run
 output/watchdog_state.json       what the watchdog currently believes
 output/preflight_YYYY-MM-DD.json the 09:00 answers, check by check
+output/kill_switch_<when>.json   what one pull of the panic button did
+output/deadman_state.json        which silence the dead man's handle acted on
 output/loop.log                  one line per tick
 output/tick_YYYY-MM-DD.log       everything a single day's ticks printed
 output/ibc_logs/                 IB Gateway's own logs
