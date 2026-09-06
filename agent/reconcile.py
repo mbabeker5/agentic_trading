@@ -19,14 +19,19 @@ collects what each book believes, hands all of it to reconcile() and acts on the
 report that comes back. That is why this can be tested in under a second with no
 account open.
 
-The five rules
---------------
+The four rules, and one thing that is reported rather than refused
+-----------------------------------------------------------------
 
-1. Position quantities. For every symbol at least one book claims, the
-   quantities the books claim have to add up to exactly what the broker reports.
-   Whole shares, and the tolerance is zero. This also covers a symbol the books
-   claim that the broker does not hold at all, because the broker's quantity is
-   then simply zero.
+1. Position quantities, checked one TICKER at a time. For every symbol at least
+   one book claims, the quantities the books claim have to add up to exactly
+   what the broker reports for that ticker. Whole shares, and the tolerance is
+   zero. This also covers a symbol the books claim that the broker does not hold
+   at all, because the broker's quantity is then simply zero.
+
+   When a ticker does not add up, the books that stop are exactly the ones with
+   a non-zero position in that ticker. Not all five, and not one picked out of
+   the group. A book holding nothing in the disputed name carries on untouched,
+   because nothing about its own numbers is in doubt.
 
 2. Broker orders. Every order working at the broker has to carry an order
    reference that belongs to one of the books, and that book has to have the
@@ -40,16 +45,32 @@ The five rules
    so the trading loop passes expected_orphans={"SPY": 1} and that one share is
    not treated as a problem until it is sold.
 
-5. One symbol, one book. No two books may claim the same symbol, whatever the
-   quantities add up to. IBKR nets positions by symbol inside the one shared
-   account, so once two books are in the same name the broker reports a single
-   line and there is no way left to say whose shares are whose. Rule one can
-   even be satisfied while this is broken, because two wrong claims can still
-   total the right number, which is exactly why it is checked separately. Both
-   books stop trading. Added 2026-09-06 at the review team's request, as the
-   other half of the symbol_exclusive guardrail in agent/guardrails.py: that
-   rule stops the second book getting in, and this one catches it if it ever
-   did.
+Two books may hold the same ticker
+----------------------------------
+
+This was a fifth rule and is not any more. On 2026-09-06 the review team raised
+cross-book symbol exclusivity as a blocking finding and it went in the same day:
+no two books may claim the same symbol, whatever the quantities came to, and both
+of them stop. The hub overturned it the same day.
+
+The reasoning. IBKR does net positions by symbol inside the one shared account,
+so the broker reports a single line for a shared name. But telling the two books
+apart never depended on that line. Every order already carries an orderRef tag
+naming the book that sent it, and every book keeps its own position record, and
+those two together are what attribute a fill. And forbidding it would throw away
+the thing month one exists to measure: two independent strategies picking the
+same name on the same morning is agreement, and agreement is signal.
+
+So a shared ticker is now written down and checked, not punished. Rule one
+already asks the right question of it, because rule one adds up every book
+holding the ticker before comparing. What is new is that the report says out loud
+that a ticker is shared and whether the total added up, so the daily report can
+print "two books hold NVDA and the numbers add up" rather than saying nothing at
+all. Those records come back on report.shared with kind symbol_shared. They are
+never mismatches and they halt nobody.
+
+Mo can overturn this. Making a shared ticker a problem again means turning the
+Shared records below back into Mismatch records, which is where they came from.
 
 Three deliberate decisions
 --------------------------
@@ -89,14 +110,20 @@ __all__ = [
     "ORDER_REF_PREFIX",
     "Mismatch",
     "Orphan",
+    "Shared",
     "ReconcileReport",
     "reconcile",
 ]
 
 
-# What kind of problem a line is about. These strings are stable, in the same
-# way the guardrail rule ids are stable, so the ledger can count how often each
-# one turns up without reading the English.
+# What kind of thing a line is about. These strings are stable, in the same way
+# the guardrail rule ids are stable, so the ledger can count how often each one
+# turns up without reading the English.
+#
+# All but one of them mark a problem. KIND_SYMBOL_SHARED is the exception: since
+# 2026-09-06 it marks a ticker that more than one book holds, which is allowed,
+# and it says whether the total added up. It used to mean "two books are in the
+# same name, which is forbidden". See the top of this file for why that changed.
 KIND_POSITION_QTY = "position_qty"
 KIND_SYMBOL_SHARED = "symbol_shared"
 KIND_UNKNOWN_ORDER_REF = "unknown_order_ref"
@@ -159,16 +186,56 @@ class Orphan:
 
 
 @dataclass(frozen=True)
+class Shared:
+    """A ticker more than one book holds, and whether the total adds up.
+
+    This is not a problem. It is a fact worth writing down, because two books
+    picking the same name on the same morning is the agreement between strategies
+    that month one is measuring, and because a reader of the daily report should
+    not have to guess why one ticker has two books against it.
+
+    holders    every book with a non-zero position in this ticker and what each
+               one believes it holds, in alphabetical order of book id.
+    total      what those add up to.
+    broker_qty what the broker reports for the ticker, as one netted line.
+    matches    True when total equals broker_qty, which is the ordinary case. A
+               False here always comes with a KIND_POSITION_QTY mismatch against
+               every one of these books, and that is what actually halts them.
+    line       one plain English sentence a person can read.
+    """
+
+    symbol: str
+    holders: tuple[tuple[str, int], ...]
+    total: int
+    broker_qty: int
+    matches: bool
+    line: str
+
+    @property
+    def kind(self) -> str:
+        """The stable label for this kind of line, for the ledger to count."""
+        return KIND_SYMBOL_SHARED
+
+    @property
+    def book_ids(self) -> tuple[str, ...]:
+        """Just the books, for a caller that does not care about the quantities."""
+        return tuple(book_id for book_id, _ in self.holders)
+
+
+@dataclass(frozen=True)
 class ReconcileReport:
     """The answer: did everything add up, and if not, what and who.
 
-    ok            True only when there is nothing wrong at all.
+    ok            True only when there is nothing wrong at all. Shared tickers
+                  never make it False, because sharing a ticker is allowed.
     mismatches    every disagreement, sorted so the same input always gives the
                   same order.
     orphans       every position no book claims, expected ones included.
     books_to_halt every book with at least one mismatch against its name, in
                   alphabetical order and each named once.
     lines         every sentence, ready to be written straight into a log.
+    shared        every ticker more than one book holds, in alphabetical order.
+                  Reporting, not a problem. See the Shared class above.
     """
 
     ok: bool
@@ -176,6 +243,7 @@ class ReconcileReport:
     orphans: tuple[Orphan, ...]
     books_to_halt: tuple[str, ...]
     lines: tuple[str, ...]
+    shared: tuple[Shared, ...] = ()
 
     def mismatches_for(self, book_id: str) -> tuple[Mismatch, ...]:
         """Everything wrong with one book. A book id is read however it is typed."""
@@ -249,10 +317,11 @@ def reconcile(
 
     mismatches: list[Mismatch] = []
     mismatches.extend(_check_position_quantities(claims, broker_qty))
-    mismatches.extend(_check_shared_symbols(claims))
     mismatches.extend(_check_broker_orders(claims, working_orders, orders))
     mismatches.extend(_check_book_working_orders(working_orders, orders))
     mismatches.sort(key=_mismatch_sort_key)
+
+    shared = _find_shared_symbols(claims, broker_qty)
 
     orphans = sorted(
         _find_orphans(claims, broker_qty, broker_cost, expected),
@@ -263,8 +332,17 @@ def reconcile(
         sorted({m.book_id for m in mismatches if m.book_id is not None})
     )
     unexpected = [orphan for orphan in orphans if not orphan.expected]
+
+    # A shared ticker that adds up gets a sentence, because the daily report
+    # should say "two books hold NVDA and the numbers add up" rather than being
+    # silent about it. A shared ticker that does NOT add up gets none, because
+    # rule one has already written one sentence naming every book involved, what
+    # each believes, the total and who stops. Saying it twice is noise for the
+    # person reading. Either way the full record is on report.shared.
     lines = _dedupe(
-        [m.line for m in mismatches] + [orphan.line for orphan in orphans]
+        [m.line for m in mismatches]
+        + [orphan.line for orphan in orphans]
+        + [record.line for record in shared if record.matches]
     )
 
     return ReconcileReport(
@@ -273,6 +351,7 @@ def reconcile(
         orphans=tuple(orphans),
         books_to_halt=books_to_halt,
         lines=lines,
+        shared=shared,
     )
 
 
@@ -280,6 +359,15 @@ def _check_position_quantities(
     claims: dict[str, dict[str, int]], broker_qty: dict[str, int]
 ) -> list[Mismatch]:
     """Rule one: what the books claim between them has to be what the broker has.
+
+    One ticker at a time. The broker reports a single netted line per symbol, so
+    the only fair comparison is against the sum of every book holding that
+    symbol. Since 2026-09-06 that sum can genuinely have several books in it,
+    because two books are allowed to hold the same name.
+
+    The books that stop are exactly the holders: every book with a non-zero
+    position in the disputed ticker, and nobody else. A book holding none of it
+    has nothing in doubt and carries on trading.
 
     Only symbols at least one book claims are looked at here. A symbol nobody
     claims is an orphan instead, which is a different problem with nobody to
@@ -310,21 +398,25 @@ def _check_position_quantities(
     return found
 
 
-def _check_shared_symbols(claims: dict[str, dict[str, int]]) -> list[Mismatch]:
-    """Rule five: a symbol belongs to one book, and only ever to one book.
+def _find_shared_symbols(
+    claims: dict[str, dict[str, int]], broker_qty: dict[str, int]
+) -> tuple[Shared, ...]:
+    """Every ticker more than one book holds, and whether the total adds up.
 
-    Rule one asks whether the books add up to the broker. This asks the separate
-    question of whether they should be adding up at all. Two books in the same
-    name can total exactly what the broker reports and still be wrong, because
-    IBKR nets positions by symbol: the broker shows one line, and nothing in the
-    account says which book owns which part of it. From there neither book can
-    be reconciled, and a book that cannot be reconciled will size its next order
-    off a number that is not true.
+    This is not a rule and it refuses nothing. Until 2026-09-06 it was a rule:
+    two books in one name stopped both of them. The hub retired that the same
+    day, because the orderRef tag on every order plus each book's own position
+    record are what attribute a fill, not the broker's netted line, and because
+    two strategies picking the same name on the same morning is the agreement
+    month one is meant to measure. The top of this file has the full reasoning.
 
-    So both books stop. There is no sense in which one of them is the innocent
-    party once the position is already netted together.
+    What is left is worth reporting. Rule one already checks the ticker properly,
+    by adding up every book holding it before comparing against the broker, so
+    the arithmetic needs nothing extra here. What a person reading the daily
+    report needs is to be told the ticker is shared at all, and whether it came
+    out right.
     """
-    found: list[Mismatch] = []
+    found: list[Shared] = []
     for symbol in sorted(_claimed_symbols(claims)):
         holders = [
             (book_id, claims[book_id][symbol])
@@ -333,18 +425,19 @@ def _check_shared_symbols(claims: dict[str, dict[str, int]]) -> list[Mismatch]:
         ]
         if len(holders) < 2:
             continue
-        line = _shared_symbol_line(symbol, holders)
-        for book_id, _ in holders:
-            found.append(
-                Mismatch(
-                    book_id=book_id,
-                    kind=KIND_SYMBOL_SHARED,
-                    symbol=symbol,
-                    order_id=None,
-                    line=line,
-                )
+        total = sum(qty for _, qty in holders)
+        theirs = broker_qty.get(symbol, 0)
+        found.append(
+            Shared(
+                symbol=symbol,
+                holders=tuple(holders),
+                total=total,
+                broker_qty=theirs,
+                matches=total == theirs,
+                line=_shared_symbol_line(symbol, holders, total, theirs),
             )
-    return found
+        )
+    return tuple(found)
 
 
 def _check_broker_orders(
@@ -492,19 +585,35 @@ def _position_line(
     return f"{sentence} {_halt_words([book_id for book_id, _ in holders])}"
 
 
-def _shared_symbol_line(symbol: str, holders: list[tuple[str, int]]) -> str:
-    """The one sentence that explains two books being in the same name."""
+def _shared_symbol_line(
+    symbol: str, holders: list[tuple[str, int]], total: int, theirs: int
+) -> str:
+    """The one sentence that says a ticker is shared and whether it added up.
+
+    Two shapes. When the total matches the broker, this is the whole story and
+    nothing is wrong. When it does not, this says so plainly, but the sentence
+    that actually gets logged is rule one's, which names the same books and says
+    who stops.
+    """
     clauses = [
         _claim_clause(book_id, qty, symbol=symbol, first=index == 0)
         for index, (book_id, qty) in enumerate(holders)
     ]
     named = [book_id for book_id, _ in holders]
+    how_many = "Two books" if len(holders) == 2 else f"{len(holders)} books"
+    opening = (
+        f"{_join_with_and(clauses)}, which is {_total_words(total)} between them"
+    )
+    if total == theirs:
+        return (
+            f"{opening}, and the broker reports {_broker_words(theirs)}. "
+            f"{how_many} holding {symbol} at once is allowed, and the numbers add "
+            "up, so nothing is wrong and no book stops trading."
+        )
     return (
-        f"{_join_with_and(clauses)}, and two books may never be in the same name "
-        f"at once. IBKR nets positions by symbol inside the one shared account, so "
-        f"the broker reports a single line of {symbol} and there is no way left to "
-        f"say whose shares are whose. Neither book can be reconciled from here. "
-        f"{_halt_words(named)}"
+        f"{opening}, but the broker reports {_broker_words(theirs)}. "
+        f"{how_many} holding {symbol} at once is allowed, but the total still has "
+        f"to match the broker and this one does not. {_halt_words(named)}"
     )
 
 

@@ -62,6 +62,9 @@ not fetch prices and it cannot place an order. It only ever answers yes or no.
 Each rule has a short id that gets written into the ledger, so you can count how
 often each one fired over a month.
 
+All of them refuse orders except one. `symbol_exclusive` used to refuse and now
+only reports, which is marked in its own row below and explained under it.
+
 | Rule id | What it does |
 |---|---|
 | `paper_only` | While the settings say paper trading, refuses any order aimed at an account whose id does not start with DU. Every IBKR paper account starts with DU, so anything else might be real money. |
@@ -89,8 +92,56 @@ often each one fired over a month.
 | `max_position_pct` | No single stock may grow past 10 percent of the book (item A6, was 15 percent), or 5 percent in the insider and Congress books. What we already hold and what is sitting unfilled on order both count towards that. |
 | `max_open_positions` | At most 10 stocks held at once, in every book (item D1, the momentum books were 5). Buying more of something we already hold does not count as one more. |
 | `wrong_book` | Five books share one paper account, so every order says which book it came from. One tagged for another book is refused, and this is the only rule that refuses a closing order too, because selling another book's position is worse than a missed exit. |
-| `symbol_exclusive` | Two books may never hold, or have a working order in, the same ticker. IBKR nets positions by symbol inside the one shared account, so a second book in the same name would disappear into the first book's line and neither could be reconciled afterwards. Blocks any entry, and any other order that would open or increase a position, in a name another book already has. Getting out of this book's own position is never blocked. Ties go first come, first served. |
+| `symbol_exclusive` | **Reports, does not refuse.** Two books may hold the same ticker. When this book opens a position in a name another book is already in, the decision comes back allowed with a note on it naming that other book. This rule never blocks anything. It did block, from the morning of 2026-09-06 until that same afternoon. See the section under this table. |
 | `halted` | Nothing goes out into a name that cannot be traded. While IBKR's halted tick says the name is halted only an exit or a flatten goes through. While it is sitting in a limit-up limit-down band, the step just before a volatility halt, no new position is opened. And if nobody could say whether the name is halted, no new position is opened either, because deciding to buy something without knowing whether it is even trading is the failure this rule exists to prevent. |
+
+### Two books may hold the same ticker (`symbol_exclusive`, retired 2026-09-06)
+
+**It used to block. It no longer does.** On the morning of 2026-09-06 the review
+team raised cross-book symbol exclusivity as a blocking finding, and it went in
+the same day: no two books may hold, or have a working order in, the same
+ticker, and a second book trying to get in was refused. The hub overturned that
+the same afternoon. Two books may now be in the same name at the same time.
+
+The hub changed it because the finding rested on one true fact and one wrong
+conclusion. The true fact is that IBKR nets positions by symbol inside the one
+shared paper account, so a shared name shows up as a single line and the account
+itself cannot say whose shares are whose. The wrong conclusion was that this
+makes attribution impossible. It does not. Every order already carries an
+orderRef tag naming the book that sent it, and every book already keeps its own
+position record, and those two together are what actually trace a fill home. The
+netted line was never what did that job.
+
+The second reason is about what month one is for. Two independent strategies
+picking the same name on the same morning is agreement between them, and that
+agreement is exactly the signal this month is meant to measure. A rule that
+forbids it does not prevent a problem, it deletes the measurement. It would also
+bite constantly in practice, because the books that share a strategy also share a
+shortlist and rank it the same way.
+
+What replaced it is in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/reconcile.py`,
+which now checks one ticker at a time rather than one book at a time. For each
+symbol, the broker's net position has to equal the sum of what every book
+believes it holds in that symbol. When those disagree, the books that stop are
+exactly the ones holding that ticker, not all five and not one picked
+arbitrarily. There is a fuller description in the reconciliation section further
+down.
+
+The rule itself still runs, and it still knows when another book is in this name.
+Instead of refusing, it writes one sentence onto the decision as a note.
+`Decision.notes` is a list of strings, each one the rule id followed by the
+sentence. Notes never set `allowed` to false and never appear in `rule_ids` or
+`reasons`, so nothing that counts refusals can mistake a note for one. Today
+`agent/loop.py` does not read `notes` yet, so the sentence is recorded on the
+decision and nothing prints it. Wiring that into the ledger is a small separate
+job on the loop.
+
+**Mo can overturn this.** Turning the block back on is a one word edit in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py`:
+in `_check_symbol_exclusivity`, change `decision.note` back to `decision.add` and
+the refusal returns exactly as it was. The matching change in reconciliation
+would be turning its `Shared` records back into `Mismatch` records.
 
 A few things the code does besides refusing orders:
 
@@ -259,9 +310,10 @@ own log every shortlisted name that came back without one.
 
 **`account_symbol_cap`.** No more than 15 percent of what all five books are
 worth on any single ticker, counted across every book rather than inside one.
-The one ticker one book rule already stops two books buying the same name; this
-is the second layer under it, and it also catches one book piling into a single
-ticker. When the loop did not hand in the account wide figure, this book's own
+Since two books are now allowed into the same name, this is the rule that keeps
+that from becoming one enormous bet: it counts the whole account's money in a
+ticker whether it came from one book or three. When the loop did not hand in the
+account wide figure, this book's own
 equity stands in instead. That is the smaller number, so the cap comes out
 tighter rather than looser, which is the safe direction to be wrong in. Unlike
 the sector cap, this one is set in the shared `config/guardrails.yaml`, so all
@@ -518,32 +570,52 @@ enforce the limit.
 
 Five books share one paper account, so the tag on an order is the only thing
 tying a fill to the book that asked for it. This is the check that it still adds
-up, and it enforces five rules:
+up, and it enforces four rules:
 
-1. For every symbol at least one book claims, what the books claim has to add up
-   to exactly what the broker reports. Whole shares, tolerance of zero.
+1. **Per ticker, not per book.** For every symbol at least one book claims, what
+   the books claim has to add up to exactly what the broker reports for that
+   symbol. Whole shares, tolerance of zero. The broker reports one netted line
+   per symbol, so a sum is the only fair thing to compare it against, and since
+   2026-09-06 that sum can genuinely have two or three books in it. When a
+   ticker does not add up, the books that stop are exactly the ones holding it.
+   A book holding nothing in the disputed name has nothing in doubt and carries
+   on trading.
 2. Every order working at the broker has to carry a reference belonging to a
    book, and that book has to know about the order.
 3. Every working order a book believes in has to exist at the broker.
 4. A position no book claims at all is an orphan.
-5. No two books may claim the same symbol, whatever the quantities come to.
-   Both of them stop, with kind `symbol_shared`. This is the other half of the
-   `symbol_exclusive` guardrail above: that rule stops the second book getting
-   in, and this one catches it if it ever did. It is checked separately from
-   rule one because two wrong claims can still add up to the right number, so
-   rule one can be perfectly happy while this is broken.
+
+There used to be a fifth rule saying no two books may claim the same symbol,
+whatever the quantities came to, with both of them stopping. It was added on
+2026-09-06 as the other half of the `symbol_exclusive` guardrail and retired the
+same day when the hub retired that guardrail. The reasoning is written up in full
+under the rule table above: attribution runs on the orderRef tag and each book's
+own position record, not on the broker's netted line, and two strategies picking
+the same name is the agreement month one exists to measure.
+
+A shared ticker is now **reported rather than punished**. The kind name
+`symbol_shared` survives and its meaning changed: it used to mean "two books are
+in the same name, which is forbidden", and it now means "two or more books hold
+this ticker, which is allowed, and here is whether the total matches the broker".
+These come back on `report.shared` as `Shared` records, they are never
+mismatches, and they halt nobody. When the total does add up, the sentence goes
+into the log, so the daily report can say "two books hold NVDA and the numbers
+add up" instead of saying nothing. When it does not, rule one has already written
+a sentence naming every book, the total and who stops, so the shared record stays
+on `report.shared` and does not repeat itself in the log. Mo can overturn this by
+turning those `Shared` records back into `Mismatch` records.
 
 The paper account already holds 1 share of SPY from a manual test, so the loop
 passes it in as an expected orphan and it is not treated as a problem until it
 sells.
 
-What comes back is one plain sentence per problem, the list of books to halt,
-the orphans, and one `ok` flag. Any book named in a problem stops trading until
-someone has looked, because a book that has lost track of its own positions will
-size its next order off a number that is not true. An order reference belonging
-to no book is the exception: it makes `ok` false but halts nobody, because there
-is no book to blame and stopping the five that are behaving would be the wrong
-trade.
+What comes back is one plain sentence per problem, the list of books to halt, the
+orphans, the shared tickers, and one `ok` flag. Any book named in a problem stops
+trading until someone has looked, because a book that has lost track of its own
+positions will size its next order off a number that is not true. An order
+reference belonging to no book is the exception: it makes `ok` false but halts
+nobody, because there is no book to blame and stopping the five that are behaving
+would be the wrong trade. Sharing a ticker never makes `ok` false at all.
 
 Nothing in here talks to the network either. The loop gathers the broker's
 positions and open orders, hands them over, and acts on the report.

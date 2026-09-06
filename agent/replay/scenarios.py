@@ -65,11 +65,19 @@ from agent.replay.stub_decider import (                             # noqa: E402
 
 #: Every rule id agent/guardrails.py's check_order can put on a refusal, read off
 #: the decision.add() calls in that file on 2026-09-06. docs/REPLAY.md lists the
-#: first twenty; symbol_exclusive and halted arrived later, in commit e653508.
+#: first twenty; halted arrived later, in commit e653508.
 #: A rule missing from a gate run has not been tested, it has merely not been
 #: reached.
+#:
+#: symbol_exclusive USED TO BE IN THIS LIST and deliberately is not any more.
+#: The hub retired it on 2026-09-06: two books may now hold the same ticker, and
+#: the rule reports rather than refuses, so it calls decision.note() instead of
+#: decision.add(). This list is refusals only, which is why it is gone from it.
+#: The rule itself is alive and still says which other book is in a name. What
+#: replaced the block is per symbol reconciliation in agent/reconcile.py, and
+#: the reasoning plus how Mo can overturn it is in journal/2026-09-06.md.
 GUARDRAIL_RULE_IDS = (
-    "paper_only", "wrong_account", "wrong_book", "kill_switch", "symbol_exclusive",
+    "paper_only", "wrong_account", "wrong_book", "kill_switch",
     "halted", "sec_type", "currency", "blacklist", "whitelist", "no_shorts",
     "short_price_floor", "shortable_required", "entry_window",
     "outside_market_hours", "flatten_time", "daily_loss_cap", "weekly_loss_cap",
@@ -88,8 +96,15 @@ GUARDRAIL_RULE_IDS = (
 #: do not set, and every one of those fields defaults to a value meaning all
 #: clear. They are checked against the loop rather than written out by hand, in
 #: _not_wired_up() below, so this list cannot go stale on its own.
+#:
+#: This dictionary shrank on 2026-09-06. agent/loop.py now fills every one of
+#: these fields on the way to the guardrails: the halt facts off IBKR's tick 49,
+#: the week and month figures and the losing day count out of the book's own
+#: earlier state files, the industry off the shortlist row, and the account wide
+#: symbol figures from reading all five book files once a tick. What is left
+#: here is checked against the loop rather than trusted, so an entry that is no
+#: longer true fails rather than lying.
 NOT_WIRED_UP_FIELDS = {
-    "symbol_exclusive": "symbols_held_elsewhere",
     "halted": "halted and limit_state",
     "weekly_loss_cap": "week_pnl",
     "monthly_loss_cap": "month_pnl",
@@ -438,19 +453,22 @@ def clean_day(day: date_type, fill_bridge: bool = True) -> Scenario:
             if shared:
                 line = next((ln.strip() for ln in context.text(shared[0].at).splitlines()
                              if "same name" in ln), "")
-                failures.append(
-                    "THE HEADLINE: two books landed in the same ticker, and since "
-                    "commit e653508 a ticker belongs to one book only. It happened "
-                    f"at {shared[0].at}, reconciliation named them both and halted "
-                    "them both for the rest of the day, and it will happen on any "
-                    "ordinary day, because the books that share a strategy also "
-                    "share a shortlist and rank it the same way. The guardrail "
-                    "written to prevent exactly this, symbol_exclusive, cannot fire: "
-                    "nothing in agent/loop.py or agent/book_state.py fills "
-                    "AccountState.symbols_held_elsewhere, so every book believes it "
-                    "is the only one in the account. Until the loop feeds that field "
-                    "or gives each book its own shortlist, the five book "
-                    f"arrangement stops itself. The line was: {line[:180]}")
+                # Two books in one ticker stopped being a failure on 2026-09-06,
+                # when the hub retired symbol exclusivity. It is expected on any
+                # ordinary day, because the books that share a strategy share a
+                # shortlist and rank it the same way, and that agreement is what
+                # month one is measuring. What matters now is only whether the
+                # numbers add up, which reconciliation checks per symbol, so this
+                # is a failure ONLY when the total disagrees with the broker.
+                if any(not getattr(row, "matches", True) for row in shared):
+                    failures.append(
+                        "THE HEADLINE: two books are in the same ticker and their "
+                        "positions do not add up to what the broker holds. It "
+                        f"happened at {shared[0].at}. Sharing a name is allowed "
+                        "since 2026-09-06 and is expected between books that share "
+                        "a strategy; the totals disagreeing is not, and every book "
+                        "holding that ticker is halted for the rest of the day "
+                        f"until somebody works out why. The line was: {line[:180]}")
             long_reason = max((len(str(why)) for why in halted.values()), default=0)
             if long_reason > 400:
                 failures.append(
@@ -653,16 +671,16 @@ def every_guardrail(day: date_type) -> Scenario:
                            context.account_state("A", gross_exposure=100_000.0),
                            note="a book already 100 percent invested")
 
-        # symbol_exclusive: another book is already in this name. Nothing in
-        # agent/loop.py fills symbols_held_elsewhere, so this can only be
-        # reached by handing the state in by hand.
-        context.probe_rule(
-            "A", entry(symbol="NVDA"),
-            context.account_state("A", symbols_held_elsewhere={"NVDA": "B"}),
-            note="a name book B already holds")
+        # symbol_exclusive is deliberately NOT probed any more. It stopped
+        # refusing anything on 2026-09-06, when the hub decided two books may
+        # hold the same ticker, so there is no refusal left for a probe to
+        # provoke. It still runs and still says which other book is in a name,
+        # it just says it as a note rather than as a no. What replaced the block
+        # is per symbol reconciliation in agent/reconcile.py.
 
         # The three caps that look beyond one day, and the losing streak pause.
-        # All four read a field the loop does not fill, so all four are probes.
+        # The loop fills all four fields now, so a probe is a belt and braces
+        # check rather than the only way to reach them.
         context.probe_rule("A", entry(),
                            context.account_state("A", week_pnl=-20_000.0),
                            note="a book well into its weekly loss cap")
@@ -728,10 +746,10 @@ def every_guardrail(day: date_type) -> Scenario:
                 "NOT WIRED UP, and this is the important line in this scenario: "
                 + ", ".join(f"{r} reads {NOT_WIRED_UP_FIELDS[r]}" for r in stranded)
                 + ". Every one of those fields is left at the value that means all "
-                "clear, because agent/book_state.py's account_state_for() and "
-                "agent/loop.py's _entry_intent() never set them. The rules work "
-                "when a probe hands them the facts. In production they cannot fire "
-                "however the day goes, so what looks like "
+                "clear, because nothing on the way from agent/book_state.py's "
+                "account_state_for() through agent/loop.py sets them. The rules "
+                "work when a probe hands them the facts. In production they cannot "
+                "fire however the day goes, so what looks like "
                 f"{len(GUARDRAIL_RULE_IDS)} guardrails is "
                 f"{len(GUARDRAIL_RULE_IDS) - len(stranded)}.")
 
@@ -1782,14 +1800,22 @@ def two_books_one_symbol(day: date_type) -> Scenario:
     Both positions are seeded, because every book's settings say allow_shorts
     false and the loop itself cannot open the short half.
 
-    Since commit e653508 this is not a state the project allows. One ticker
-    belongs to one book, because a netted line cannot be split back apart, and
-    agent/reconcile.py's rule five is the detector: two books claiming one
-    symbol is a mismatch against both of them and both stop trading. So what
-    this scenario proves is the pair of things that make that rule possible and
-    make it bite: the per book view at the broker still tells the two apart by
-    order_ref, and the loop halts both books the moment it sees them share a
-    name.
+    From 2026-09-06 this is a state the project ALLOWS. The hub retired one
+    ticker one book that day: a netted line can be split back apart, because the
+    tag on the order says who sent it and each book keeps its own record, and
+    forbidding it would have deleted the one signal month one exists to measure,
+    which is two independent strategies agreeing on a name.
+
+    What replaced the block is arithmetic. agent/reconcile.py compares, for
+    every ticker, the broker's netted line against the SUM of what all the books
+    believe they hold in it. Here that is 500 long and 300 short, so the sum is
+    200 and the broker's line is 200, and the day carries on. Had they not
+    added up, every book holding the ticker would be halted and no other book
+    touched.
+
+    So this scenario proves three things: the per book view at the broker tells
+    the two apart by order_ref, the book files agree with it, and reconciliation
+    adds a shared name up correctly instead of panicking about it.
     """
     name = "PAIR"
 
@@ -1842,24 +1868,26 @@ def two_books_one_symbol(day: date_type) -> Scenario:
         else:
             failures.append("an order went out with no order_ref on it")
 
-        # The one ticker one book half.
-        first = context.ticks[0] if context.ticks else None
-        note = first.reconcile_note if first else ""
-        if "same name" in "\n".join(t.reconcile_note for t in context.ticks) or \
-                (note and note != "everything matched"):
-            evidence.append(f"the very first tick refused the day: {note}")
+        # The shared name half. Since 2026-09-06 the question is not whether
+        # two books are in one ticker, it is whether their positions add up to
+        # what the broker actually holds.
+        total = a_file + b_file
+        if total == netted:
+            evidence.append(f"the two books hold {a_file} and {b_file} of {name}, "
+                            f"which adds up to {total}, and the broker's netted "
+                            f"line is {netted}, so the shared name reconciles")
         else:
-            failures.append("two books were in the same name and reconciliation said "
-                            f"everything matched: {note}")
+            failures.append(f"the two books hold {a_file} and {b_file} of {name}, "
+                            f"which adds up to {total}, and the broker says "
+                            f"{netted}")
 
         halted = context.halted_books()
-        if {"A", "B"} <= set(halted):
-            evidence.append("both books halted, which is what one ticker one book "
-                            "asks for: neither can be reconciled from a single "
-                            "netted line")
+        if not ({"A", "B"} & set(halted)):
+            evidence.append("neither book was halted, which is right: sharing a "
+                            "ticker is allowed and the totals agree")
         else:
-            failures.append("two books shared a symbol and these halted: "
-                            + (", ".join(sorted(halted)) or "none"))
+            failures.append("the shared name adds up and yet these books were "
+                            "halted anyway: " + ", ".join(sorted(halted)))
 
         stacked = _stacked_orders(context)
         if stacked:
@@ -1879,22 +1907,23 @@ def two_books_one_symbol(day: date_type) -> Scenario:
 
         entries = _entries_placed(context)
         if entries:
-            failures.append(f"{len(entries)} entry orders went out while both books "
-                            "were halted for sharing a name")
+            failures.append(f"{len(entries)} entry orders went out, and the stub "
+                            "decider was told to pick nothing for either book")
         else:
             covers = [o for o in context.broker.orders if o.side == "BUY"]
             evidence.append(
-                "neither halted book opened anything for the rest of the day, and "
-                f"the {len(covers)} buy orders that did go out were book B covering "
-                "its short at the flatten, which a halt is meant to allow")
+                "neither book opened anything, and the "
+                f"{len(covers)} buy orders that did go out were book B covering "
+                "its short at the flatten")
 
         return not failures, evidence, failures
 
     return Scenario(
         key="two_books_one_symbol",
-        title="One book long and another short the same name, caught by order_ref",
+        title="One book long and another short the same name, told apart by order_ref",
         proves="that the per book view at the broker tells two books apart inside one "
-               "netted account, and that sharing a ticker halts both of them",
+               "netted account, and that a shared ticker whose positions add up to "
+               "the broker's line reconciles cleanly and halts nobody",
         day=day, symbols=("OTHER",), build_broker=build,
         book_patches=only("A", "B"),
         decider=lambda s: StubDecider(max_picks=1, pick_nothing_for=("A", "B")),

@@ -34,6 +34,11 @@ how many shares are available. And a book's mode became one of dry_run, tiny or
 full, so a book can be promoted from writing orders down to actually sending
 them, by hand, one book at a time.
 
+Later that same day the hub retired a rule. Two books may now hold the same
+ticker at the same time. symbol_exclusive used to refuse the second book in and
+now only writes a note on the decision, which is what Decision.notes is for. See
+_check_symbol_exclusivity for the reasoning and for how to put the refusal back.
+
 Two things live next door rather than here. The rolling day trade count is in
 agent/pdt.py, and the daily check that the books and the broker agree is in
 agent/reconcile.py. Both are the same shape as this file: pure logic, no
@@ -138,15 +143,20 @@ KILL_SWITCH_ALLOWED_PURPOSES = ("exit", "flatten")
 # team's request.
 HALT_ALLOWED_PURPOSES = ("exit", "flatten")
 
-# How a tie is settled when two books want the same symbol on the same tick.
-# First come, first served: whoever registered the symbol first keeps it, and a
-# same-tick tie goes to whichever book comes first in config/books.yaml.
+# The order in which books are read when they share a symbol. There is no longer
+# a tie to break: since the hub retired cross-book symbol exclusivity on
+# 2026-09-06, two books may both hold the same ticker and neither has to give way
+# to the other. What is left is presentation. Whoever registered the symbol first
+# is the book named first when a shared name is reported, and a same-tick tie is
+# settled by whichever book comes first in config/books.yaml, so the same day
+# always reads the same way.
 #
-# That resolution belongs to the trading loop, which is the only thing that sees
+# That ordering belongs to the trading loop, which is the only thing that sees
 # all five books at once. This module only ever sees one book's order plus the
 # map of what the other books already have, so the constant is here to name the
 # rule and to give the loop one stable string to point at. Nothing in this file
-# implements it.
+# implements it. The name is kept as it is because the loop and the ledger both
+# quote the string.
 SYMBOL_TIE_BREAK = "first_come_first_served"
 
 VALID_PURPOSES = ("entry", "exit", "stop", "flatten")
@@ -777,12 +787,14 @@ class AccountState:
                            way it points. Left as None it is worked out from
                            open_positions instead.
     entries_opened_today   how many brand new names the book has opened today
-    symbols_held_elsewhere which symbols the other books have already taken,
-                           written as {symbol: the book id that has it}. The
-                           loop fills it by reading every book's state, because
-                           only the loop sees all five books at once. Empty
-                           means nothing is taken and the symbol_exclusive rule
-                           has nothing to say.
+    symbols_held_elsewhere which symbols the other books are already in, written
+                           as {symbol: the book id that has it}. The loop fills
+                           it by reading every book's state, because only the
+                           loop sees all five books at once. Empty means no
+                           other book is in any of our names and the
+                           symbol_exclusive rule has nothing to report. Since
+                           2026-09-06 this only ever produces a note, never a
+                           refusal: two books may hold the same ticker.
 
     Momentum v2, approved by Mo on 2026-09-06, added six more. All six default
     to a value that means "nothing to see", so a caller written before them
@@ -1141,18 +1153,36 @@ class Decision:
     broken, not just the first one. daily_halt is a separate signal: it is true
     whenever the account has hit its loss limit for the day, whether or not this
     particular order was blocked.
+
+    notes are the other kind of thing a rule can say. A note is something worth
+    writing down that is not a reason to refuse: "book B is in this name too, and
+    that is allowed". Notes never touch allowed, never touch rule_ids and never
+    touch reasons, so nothing that counts refusals can mistake one for a refusal.
+    Each note is one sentence with its rule id on the front, so the ledger can
+    still count how often a rule had something to say. Added 2026-09-06 when the
+    hub retired the symbol_exclusive refusal and left the rule reporting instead.
     """
 
     allowed: bool
     reasons: list[str] = field(default_factory=list)
     rule_ids: list[str] = field(default_factory=list)
     daily_halt: bool = False
+    notes: list[str] = field(default_factory=list)
 
     def add(self, rule_id: str, reason: str) -> None:
         """Record one broken limit and mark the order as refused."""
         self.rule_ids.append(rule_id)
         self.reasons.append(reason)
         self.allowed = False
+
+    def note(self, rule_id: str, message: str) -> None:
+        """Write something down without refusing the order.
+
+        This is the deliberate opposite of add(): allowed is left exactly as it
+        was. Use it for a rule that has something to report rather than a limit
+        to enforce.
+        """
+        self.notes.append(f"{rule_id}: {message}")
 
     @property
     def summary(self) -> str:
@@ -2933,18 +2963,46 @@ def _opens_or_increases_position(state: AccountState, intent: OrderIntent) -> bo
 def _check_symbol_exclusivity(
     g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
 ) -> None:
-    """Two books may never be in the same name at the same time.
+    """Say so when another book is already in this name. Refuse nothing.
 
-    IBKR nets positions by symbol inside the one shared paper account. If book A
-    is long 100 AAPL and book B buys 100 more, the broker reports one line of
-    200 shares and there is no way left to say whose is whose. Reconciliation
-    would be guessing, and a book that has lost track of what it holds sizes its
-    next order off a number that is not true. So the second book does not get
-    in. Added 2026-09-06 at the review team's request, as a blocking finding.
+    RETIRED AS A BLOCKING RULE, 2026-09-06. Two books may now hold the same
+    ticker at the same time. This rule no longer refuses anything: it writes a
+    note on the decision and lets the order through.
 
-    Getting out is never blocked by this rule. An exit, a stop or a flatten that
-    reduces this book's own position goes through untouched, because refusing
-    the way out of a trade is worse than any duplication this rule prevents.
+    The history, so it can be argued with later. The review team raised
+    cross-book symbol exclusivity on 2026-09-06 as a blocking finding, and it was
+    put in the same day: IBKR nets positions by symbol inside the one shared
+    paper account, so if book A is long 100 AAPL and book B buys 100 more, the
+    broker reports one line of 200 shares and cannot say whose is whose. The hub
+    overturned it the same day, for two reasons.
+
+    First, attribution never actually needed exclusivity. Every order already
+    carries an orderRef tag naming the book that sent it, and every book keeps
+    its own position record, so a fill can always be traced home. What the
+    broker's single netted line cannot do on its own, those two together can.
+
+    Second, forbidding it would throw away the signal the month is meant to
+    measure. Two independent strategies picking the same name on the same
+    morning is agreement, and agreement is exactly the thing worth counting.
+
+    What replaced it is in agent/reconcile.py, which now checks per SYMBOL
+    rather than per book: for each ticker, the broker's net position has to equal
+    the sum of what every book believes it holds in that ticker. If those
+    disagree, every book holding that ticker halts, and a book holding nothing in
+    it carries on.
+
+    The rule id stays alive on purpose. It still names a real fact about the
+    account, and the ledger can still count how often two books landed in one
+    name, which is the number month one wants. Note that the replay gate's list
+    in agent/replay/scenarios.py still expects this id to appear on a REFUSAL, so
+    that list needs a line moved before its rule id check passes again.
+
+    Mo can overturn this. Turning the block back on is one edit: swap
+    decision.note for decision.add in the call below, and the refusal returns
+    exactly as it was.
+
+    Getting out was never blocked by this rule and still is not. An exit, a stop
+    or a flatten goes through untouched.
     """
     owner = state.symbol_owner(intent.symbol)
     if owner is None:
@@ -2964,15 +3022,15 @@ def _check_symbol_exclusivity(
     if intent.purpose != "entry" and not _opens_or_increases_position(state, intent):
         return
 
-    decision.add(
+    decision.note(
         "symbol_exclusive",
         f"Book {owner} already holds {intent.symbol} or has a working order in it, "
-        f"so {_pot_words(g.book_id)} may not open a position in it as well. IBKR "
-        "nets positions by symbol inside the one shared paper account, so the "
-        "second book's shares would disappear into the first book's line and "
-        f"neither book could be reconciled afterwards. Book {owner} got there "
-        "first, and first come, first served is how that is settled. Getting out "
-        "of something this book already holds is never blocked by this rule.",
+        f"and {_pot_words(g.book_id)} is opening a position in it as well. Two "
+        "books in one ticker has been allowed since 2026-09-06. Nothing is "
+        "refused here. The orderRef tag on every order and each book's own "
+        "position record are what keep the two apart inside the netted account, "
+        "and agent/reconcile.py checks the ticker as a whole by adding up what "
+        "every book holding it believes.",
     )
 
 

@@ -1568,14 +1568,22 @@ def test_a_book_config_is_a_plain_readable_record():
 
 
 # ---------------------------------------------------------------------------
-# Cross-book symbol exclusivity, and halted names
+# Two books in one ticker (reporting only), and halted names
 #
-# Both rules were added on 2026-09-06 at the review team's request, and both are
-# blocking findings rather than nice to have. The first says two books may never
-# be in the same name at once, because IBKR nets positions by symbol inside the
-# one shared paper account. The second says an order never goes out into a name
-# that is halted, is in a limit-up limit-down band, or whose halt status nobody
-# could tell us.
+# Both were added on 2026-09-06 at the review team's request as blocking
+# findings. Only one of them is still a block.
+#
+# symbol_exclusive said two books may never be in the same name at once, because
+# IBKR nets positions by symbol inside the one shared paper account. The hub
+# retired that the same day: the orderRef tag on every order plus each book's own
+# position record are what attribute a fill, not the broker's netted line, and
+# two strategies picking the same name on the same morning is the agreement month
+# one exists to measure. The rule still runs and still notices, but it now writes
+# a note on the decision instead of refusing. The tests below are the ones that
+# would go red if the refusal ever came back by accident.
+#
+# halted is untouched. An order never goes out into a name that is halted, is in
+# a limit-up limit-down band, or whose halt status nobody could tell us.
 # ---------------------------------------------------------------------------
 
 
@@ -1611,27 +1619,89 @@ def reason_for(decision, rule_id: str) -> str:
     raise AssertionError(f"{rule_id} did not fire: {decision.rule_ids}")
 
 
-# --- Rule one: one symbol, one book -----------------------------------------
+def note_for(decision, rule_id: str) -> str:
+    """The sentence a rule wrote down without refusing anything.
+
+    Notes are stored as one string each, the rule id then a colon then the
+    sentence, so this splits that back apart.
+    """
+    prefix = f"{rule_id}: "
+    for note in decision.notes:
+        if note.startswith(prefix):
+            return note[len(prefix):]
+    raise AssertionError(f"{rule_id} wrote no note: {decision.notes}")
 
 
-def test_a_name_another_book_already_has_is_closed_to_this_book():
-    """Book B has AAPL, so book A does not get in, however sensible the trade."""
+def noted_rule_ids(decision) -> list[str]:
+    """Just the rule ids off the notes, for a test that only cares which fired."""
+    return [note.split(":", 1)[0] for note in decision.notes]
+
+
+# --- Two books in one ticker: allowed, and written down ---------------------
+
+
+def test_an_entry_in_a_name_another_book_holds_is_allowed_and_noted():
+    """Book B has AAPL. Book A gets in anyway, and the decision says so.
+
+    This is the hub's decision of 2026-09-06 in one test. Before that afternoon
+    this order came back refused with symbol_exclusive in rule_ids.
+    """
     momentum = load_book_guardrails(BOOKS_YAML, "A")
     decision = check_order(
         momentum,
         state_with_others("A", {"AAPL": "B"}),
         buy("A", symbol="AAPL", qty=10, limit_price=50.0),
     )
+    assert decision.allowed is True, decision.summary
+    assert "symbol_exclusive" not in decision.rule_ids
+    assert decision.reasons == []
+
+    note = note_for(decision, "symbol_exclusive")
+    assert "Book B" in note, "the note has to name the other book"
+    assert "AAPL" in note
+    assert note.endswith(".") and len(note.split()) >= 6, note
+
+
+def test_the_note_never_touches_whether_the_order_was_allowed():
+    """A note is not a refusal, so nothing that counts refusals can see it."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        state_with_others("A", {"AAPL": "B"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert decision.allowed is True
+    assert decision.summary == "allowed"
+    assert decision.rule_ids == []
+    assert decision.reasons == []
+    assert noted_rule_ids(decision) == ["symbol_exclusive"]
+
+
+def test_a_note_rides_along_beside_a_real_refusal_without_becoming_one():
+    """Book B has AAPL and the order is also on the blacklist. One refusal, one note."""
+    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    blacklisted = dataclasses.replace(
+        momentum,
+        universe=dataclasses.replace(momentum.universe, blacklist=("AAPL",)),
+    )
+    decision = check_order(
+        blacklisted,
+        state_with_others("A", {"AAPL": "B"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
     assert decision.allowed is False
-    assert "symbol_exclusive" in decision.rule_ids
-
-    reason = reason_for(decision, "symbol_exclusive")
-    assert "Book B" in reason and "AAPL" in reason
-    assert "first come, first served" in reason
+    assert "blacklist" in decision.rule_ids
+    assert "symbol_exclusive" not in decision.rule_ids
+    assert noted_rule_ids(decision) == ["symbol_exclusive"]
 
 
-def test_getting_out_of_our_own_position_is_never_blocked_by_the_exclusivity_rule():
-    """Book A holds AAPL and book B has it too. A may still sell its own out."""
+def test_getting_out_of_our_own_position_is_never_affected_by_this_rule():
+    """Book A holds AAPL and book B has it too. A may still sell its own out.
+
+    This was true while the rule refused orders and it is still true now. An
+    exit, a stop and a flatten all go through, and none of them is even worth a
+    note, because leaving a name says nothing about who else is in it.
+    """
     momentum = load_book_guardrails(BOOKS_YAML, "A")
     state = state_with_others(
         "A", {"AAPL": "B"}, positions={"AAPL": position("AAPL", 100, 50.0)}
@@ -1640,6 +1710,7 @@ def test_getting_out_of_our_own_position_is_never_blocked_by_the_exclusivity_rul
         decision = check_order(momentum, state, closing("A", "AAPL", 100, purpose))
         assert decision.allowed is True, (purpose, decision.summary)
         assert "symbol_exclusive" not in decision.rule_ids
+        assert decision.notes == [], (purpose, decision.notes)
 
 
 def test_an_entry_in_a_name_no_other_book_has_goes_straight_through():
@@ -1650,9 +1721,10 @@ def test_an_entry_in_a_name_no_other_book_has_goes_straight_through():
         buy("A", symbol="AAPL", qty=10, limit_price=50.0),
     )
     assert decision.allowed is True, decision.summary
+    assert decision.notes == []
 
 
-def test_an_empty_map_of_other_books_shuts_nobody_out():
+def test_an_empty_map_of_other_books_has_nothing_to_report():
     """The rule is silent until the loop actually hands it something."""
     momentum = load_book_guardrails(BOOKS_YAML, "A")
     for others in ({}, None):
@@ -1662,9 +1734,10 @@ def test_an_empty_map_of_other_books_shuts_nobody_out():
             buy("A", symbol="AAPL", qty=10, limit_price=50.0),
         )
         assert decision.allowed is True, (others, decision.summary)
+        assert decision.notes == [], (others, decision.notes)
 
 
-def test_a_book_is_never_shut_out_of_a_name_by_its_own_row_in_the_map():
+def test_a_book_is_never_reported_against_its_own_row_in_the_map():
     """A loop that hands in every book's holdings, ours included, is harmless."""
     momentum = load_book_guardrails(BOOKS_YAML, "A")
     decision = check_order(
@@ -1673,6 +1746,7 @@ def test_a_book_is_never_shut_out_of_a_name_by_its_own_row_in_the_map():
         buy("A", symbol="AAPL", qty=10, limit_price=50.0),
     )
     assert decision.allowed is True, decision.summary
+    assert decision.notes == []
 
 
 def test_the_map_of_other_books_is_read_however_it_is_typed():
@@ -1683,8 +1757,8 @@ def test_the_map_of_other_books_is_read_however_it_is_typed():
         state_with_others("A", {" aapl ": " b "}),
         buy("A", symbol="AAPL", qty=10, limit_price=50.0),
     )
-    assert decision.allowed is False
-    assert "symbol_exclusive" in decision.rule_ids
+    assert decision.allowed is True, decision.summary
+    assert "Book B" in note_for(decision, "symbol_exclusive")
 
 
 def test_a_nonsense_entry_in_the_map_of_other_books_is_refused_at_the_door():
@@ -1692,8 +1766,14 @@ def test_a_nonsense_entry_in_the_map_of_other_books_is_refused_at_the_door():
         state_with_others("A", {"AAPL": "book B"})
 
 
-def test_the_tie_break_between_two_books_is_named_and_left_to_the_loop():
-    """The constant is the contract. Nothing in the guardrails implements it."""
+def test_the_book_order_is_named_and_left_to_the_loop():
+    """The constant is the contract. Nothing in the guardrails implements it.
+
+    There are no ties left to break, because neither book has to give way any
+    more. The string now names the order books are read in when a shared ticker
+    is reported, so the same day always reads the same way. The value is kept as
+    it was because the loop and the ledger both quote it.
+    """
     from agent.guardrails import SYMBOL_TIE_BREAK
 
     assert SYMBOL_TIE_BREAK == "first_come_first_served"
@@ -1798,23 +1878,35 @@ def test_a_halt_flag_that_is_neither_true_nor_false_is_refused_at_the_door():
             )
 
 
-def test_both_new_rule_ids_can_block_an_order():
-    """One scenario each, so neither of them can quietly stop working."""
+def test_the_two_rule_ids_added_that_day_still_have_something_to_say():
+    """One scenario each, so neither of them can quietly stop working.
+
+    They no longer do the same thing. halted refuses. symbol_exclusive was
+    retired as a refusal by the hub on 2026-09-06 and now only reports, so what
+    is checked here is that it still notices and still writes a readable
+    sentence, and that it lets the order through.
+    """
     momentum = load_book_guardrails(BOOKS_YAML, "A")
-    scenarios = {
-        "symbol_exclusive": (
-            state_with_others("A", {"AAPL": "B"}),
-            buy("A", symbol="AAPL", qty=10, limit_price=50.0),
-        ),
-        "halted": (
-            book_state("A"),
-            buy("A", symbol="AAPL", qty=10, limit_price=50.0, halted=True),
-        ),
-    }
-    for rule_id, (state, intent) in scenarios.items():
-        decision = check_order(momentum, state, intent)
-        assert decision.allowed is False, rule_id
-        assert rule_id in decision.rule_ids, (rule_id, decision.rule_ids)
-        # Plain language check: every reason is a real sentence, not a code.
-        for reason in decision.reasons:
-            assert reason.endswith(".") and len(reason.split()) >= 6, reason
+
+    reporting = check_order(
+        momentum,
+        state_with_others("A", {"AAPL": "B"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert reporting.allowed is True, reporting.summary
+    assert "symbol_exclusive" in noted_rule_ids(reporting)
+
+    blocking = check_order(
+        momentum,
+        book_state("A"),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0, halted=True),
+    )
+    assert blocking.allowed is False
+    assert "halted" in blocking.rule_ids, blocking.rule_ids
+
+    # Plain language check: every reason and every note is a real sentence,
+    # not a code.
+    for sentence in (
+        blocking.reasons + blocking.notes + reporting.reasons + reporting.notes
+    ):
+        assert sentence.endswith(".") and len(sentence.split()) >= 6, sentence

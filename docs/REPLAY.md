@@ -318,7 +318,7 @@ clear:
 
 | Rule | Reads | Set by |
 |---|---|---|
-| `symbol_exclusive` | `AccountState.symbols_held_elsewhere` | nothing |
+| `symbol_exclusive` | `AccountState.symbols_held_elsewhere`, which the loop now fills | reports only. It stopped refusing anything on 2026-09-06, when the hub decided two books may share a ticker. Per symbol reconciliation is what catches a real disagreement now |
 | `halted` | `OrderIntent.halted`, `OrderIntent.limit_state` | nothing |
 | `weekly_loss_cap` | `AccountState.week_pnl` | nothing |
 | `monthly_loss_cap` | `AccountState.month_pnl` | nothing |
@@ -353,7 +353,7 @@ named by a key you can hand to `--scenario`.
 | `gateway_down` | crafted | Requirement 9 |
 | `competing_session_delayed_data` | crafted | Requirements 10 and 11 |
 | `rejected_order` | recorded | Requirement 12 |
-| `two_books_one_symbol` | crafted | One ticker, one book: the rule that arrived with commit `e653508` |
+| `two_books_one_symbol` | crafted | Two books in one ticker, told apart by the order reference, and their positions adding up to the broker's netted line. Sharing a name has been allowed since 2026-09-06 |
 
 Where the table says crafted, the bars were written by hand because a recorded
 session will not fall through a stop, hold a position to 15:50 or put two books

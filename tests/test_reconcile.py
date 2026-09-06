@@ -28,6 +28,7 @@ from agent.reconcile import (
     Mismatch,
     Orphan,
     ReconcileReport,
+    Shared,
     reconcile,
 )
 
@@ -130,22 +131,20 @@ def test_a_quantity_mismatch_stops_every_book_that_claims_that_symbol():
     )
     assert report.ok is False
     assert report.books_to_halt == ("A", "C")
-    # Two problems now: the quantities do not add up, and the two books should
-    # not have been in the same name in the first place.
-    assert len(report.lines) == 2
+    # One problem, not two. Two books sharing AAPL is allowed since 2026-09-06,
+    # so the only thing wrong here is that their total is not what the broker
+    # has, and that is written up once naming both of them.
+    assert len(report.lines) == 1
 
     line = report.lines[0]
     assert "100" in line and "50" in line and "150" in line and "120" in line
     assert "AAPL" in line
     assert "Book A and book C stop trading until someone looks." in line
 
-    assert {m.kind for m in report.mismatches} == {
-        KIND_POSITION_QTY,
-        KIND_SYMBOL_SHARED,
-    }
+    assert {m.kind for m in report.mismatches} == {KIND_POSITION_QTY}
     assert {m.symbol for m in report.mismatches} == {"AAPL"}
-    assert len(report.mismatches_for("A")) == 2
-    assert len(report.mismatches_for("C")) == 2
+    assert len(report.mismatches_for("A")) == 1
+    assert len(report.mismatches_for("C")) == 1
     assert report.mismatches_for("B") == ()
 
 
@@ -412,11 +411,13 @@ def test_several_problems_at_once_name_each_affected_book_once_and_in_order():
     kinds = {m.kind for m in report.mismatches}
     assert kinds == {
         KIND_POSITION_QTY,
-        KIND_SYMBOL_SHARED,
         KIND_UNKNOWN_ORDER_REF,
         KIND_ORDER_NOT_IN_BOOK,
         KIND_MISSING_WORKING_ORDER,
     }
+    # A and C share AAPL, which is reported rather than counted as a problem.
+    assert [s.symbol for s in report.shared] == ["AAPL"]
+    assert KIND_SYMBOL_SHARED not in kinds
 
     expected_spy = [o for o in report.orphans if o.symbol == "SPY"]
     unclaimed_gme = [o for o in report.orphans if o.symbol == "GME"]
@@ -424,7 +425,7 @@ def test_several_problems_at_once_name_each_affected_book_once_and_in_order():
     assert unclaimed_gme[0].expected is False
     assert report.unexpected_orphans == (unclaimed_gme[0],)
 
-    assert report.summary == "6 problems across books A, C, D"
+    assert report.summary == "5 problems across books A, C, D"
 
 
 def test_the_report_is_sorted_by_symbol_then_book_then_order():
@@ -440,7 +441,7 @@ def test_the_report_is_sorted_by_symbol_then_book_then_order():
     assert symbols == sorted(symbols), "symbols come out in alphabetical order"
 
     aapl_books = [m.book_id for m in report.mismatches if m.symbol == "AAPL"]
-    assert aapl_books == ["A", "A", "C", "C"]
+    assert aapl_books == ["A", "C"], "one quantity mismatch each, in book order"
 
     zzz_orders = [m.order_id for m in report.mismatches if m.symbol == "ZZZ"]
     assert zzz_orders == ["7", "55"], "order 7 comes before order 55, as a person counts"
@@ -548,44 +549,130 @@ def test_a_quantity_that_is_not_a_number_is_refused_with_a_readable_sentence():
 
 
 # ---------------------------------------------------------------------------
-# Rule five: one symbol, one book
+# Two books in one ticker: allowed, reported, and checked as one ticker
 #
-# Added 2026-09-06 at the review team's request. IBKR nets positions by symbol
-# inside the one shared paper account, so two books in the same name leave the
-# broker reporting a single line with no way to say whose shares are whose.
-# This is the detector behind the symbol_exclusive guardrail in
-# agent/guardrails.py: that rule stops the second book getting in, and this one
-# catches it if it ever did.
+# This was rule five, added on 2026-09-06 at the review team's request and
+# retired by the hub the same day. It said no two books may claim the same
+# symbol, whatever the quantities came to, and both of them stopped.
+#
+# What changed. IBKR does net positions by symbol inside the one shared paper
+# account, so a shared name is a single line at the broker. But telling the two
+# books apart never rested on that line: every order carries an orderRef tag
+# naming the book that sent it, and every book keeps its own position record.
+# Forbidding it would also delete the measurement month one exists to take, since
+# two independent strategies picking the same name on the same morning is
+# agreement between them.
+#
+# So the check is now per TICKER. For each symbol, the broker's net position has
+# to equal the sum of what every book believes it holds in that symbol. When they
+# disagree, the books that halt are exactly the ones holding that symbol. A
+# shared ticker that adds up is written down with kind symbol_shared, on
+# report.shared, and halts nobody.
+#
+# Mo can overturn this. It would mean turning those Shared records back into
+# Mismatch records.
 # ---------------------------------------------------------------------------
 
 
-def test_two_books_in_the_same_name_is_a_problem_for_both_of_them():
-    """The quantities add up perfectly and it is still wrong.
+def test_two_books_in_one_name_whose_total_matches_reconciles_clean():
+    """100 and 50 is the 150 the broker reports, so nothing is wrong.
 
-    100 and 50 is exactly the 150 the broker reports, so rule one has nothing to
-    say. That is the whole point of checking this separately: two claims can
-    total the right number and still leave neither book reconcilable.
+    Before the afternoon of 2026-09-06 this halted both books. Now it is the
+    ordinary case, and the only thing that happens is that the report says out
+    loud that two books are in the name and the numbers add up.
     """
     report = reconcile(
-        broker_positions=[held("AAPL", 150)],
+        broker_positions=[held("NVDA", 150)],
         broker_open_orders=[],
-        books_state={"A": book({"AAPL": 100}), "B": book({"AAPL": 50})},
+        books_state={"A": book({"NVDA": 100}), "B": book({"NVDA": 50})},
+    )
+    assert report.ok is True, report.lines
+    assert report.books_to_halt == ()
+    assert report.mismatches == ()
+    assert report.summary == "everything matched"
+
+    assert len(report.shared) == 1
+    record = report.shared[0]
+    assert isinstance(record, Shared)
+    assert record.symbol == "NVDA"
+    assert record.holders == (("A", 100), ("B", 50))
+    assert record.book_ids == ("A", "B")
+    assert (record.total, record.broker_qty, record.matches) == (150, 150, True)
+    assert record.kind == KIND_SYMBOL_SHARED
+
+
+def test_the_line_for_a_shared_name_that_adds_up_says_so_in_plain_words():
+    """The daily report should not be silent about two books in one ticker."""
+    report = reconcile(
+        broker_positions=[held("NVDA", 150)],
+        broker_open_orders=[],
+        books_state={"A": book({"NVDA": 100}), "B": book({"NVDA": 50})},
+    )
+    assert len(report.lines) == 1
+    line = report.lines[0]
+    assert line == report.shared[0].line
+    assert "NVDA" in line
+    assert "100" in line and "50" in line and "150" in line
+    assert "is allowed" in line
+    assert "no book stops trading" in line
+    assert line.endswith(".") and len(line.split()) >= 6
+
+
+def test_two_books_in_one_name_whose_total_is_wrong_halts_exactly_those_two():
+    """100 and 50 is 150, and the broker has 120, so both holders stop."""
+    report = reconcile(
+        broker_positions=[held("NVDA", 120)],
+        broker_open_orders=[],
+        books_state={"A": book({"NVDA": 100}), "B": book({"NVDA": 50})},
     )
     assert report.ok is False
     assert report.books_to_halt == ("A", "B")
-    assert {m.kind for m in report.mismatches} == {KIND_SYMBOL_SHARED}
+    assert {m.kind for m in report.mismatches} == {KIND_POSITION_QTY}
     assert len(report.mismatches_for("A")) == 1
     assert len(report.mismatches_for("B")) == 1
 
+    # One sentence, not two. The quantity line already names both books, the
+    # total and who stops, so the shared record does not repeat it in the log.
     assert len(report.lines) == 1
     line = report.lines[0]
-    assert "AAPL" in line
-    assert "two books may never be in the same name at once" in line
+    assert "150" in line and "120" in line
     assert "Book A and book B stop trading until someone looks." in line
 
+    record = report.shared[0]
+    assert (record.total, record.broker_qty, record.matches) == (150, 120, False)
+    assert record.line not in report.lines
 
-def test_one_book_alone_in_a_name_is_exactly_what_should_happen():
+
+def test_a_third_book_in_a_different_name_is_untouched_by_that_mismatch():
+    """Books A and B disagree about NVDA. Book C holds KO and carries on.
+
+    This is the point of checking one ticker at a time. The old rule halted
+    whoever was named in the problem, which was right, but the problem itself
+    used to include "two books are in one name at all", which dragged in books
+    that had nothing wrong with their numbers.
+    """
     report = reconcile(
+        broker_positions=[held("NVDA", 120), held("KO", 40)],
+        broker_open_orders=[],
+        books_state={
+            "A": book({"NVDA": 100}),
+            "B": book({"NVDA": 50}),
+            "C": book({"KO": 40}),
+            "D": book(),
+        },
+    )
+    assert report.ok is False
+    assert report.books_to_halt == ("A", "B")
+    assert "C" not in report.books_to_halt, "book C agrees with the broker about KO"
+    assert "D" not in report.books_to_halt, "book D is holding nothing at all"
+    assert report.mismatches_for("C") == ()
+    assert report.mismatches_for("D") == ()
+    assert {m.symbol for m in report.mismatches} == {"NVDA"}
+
+
+def test_a_symbol_only_one_book_holds_behaves_exactly_as_it_always_did():
+    """Nothing about the single book case changed, in either direction."""
+    clean = reconcile(
         broker_positions=[held("AAPL", 150), held("MSFT", 40)],
         broker_open_orders=[],
         books_state={
@@ -594,13 +681,42 @@ def test_one_book_alone_in_a_name_is_exactly_what_should_happen():
             "C": book(),
         },
     )
-    assert report.ok is True
-    assert report.books_to_halt == ()
+    assert clean.ok is True
+    assert clean.books_to_halt == ()
+    assert clean.shared == (), "nothing here is shared, so nothing is reported"
+    assert clean.lines == ()
+
+    wrong = reconcile(
+        broker_positions=[held("AAPL", 120)],
+        broker_open_orders=[],
+        books_state={"A": book({"AAPL": 100}), "B": book()},
+    )
+    assert wrong.ok is False
+    assert wrong.books_to_halt == ("A",)
+    assert {m.kind for m in wrong.mismatches} == {KIND_POSITION_QTY}
+    assert wrong.shared == ()
+    assert wrong.lines[0].endswith("Book A stops trading until someone looks.")
 
 
-def test_three_books_in_one_name_stops_all_three_of_them():
+def test_three_books_in_one_name_are_all_reported_and_all_add_up():
     report = reconcile(
         broker_positions=[held("NVDA", 60)],
+        broker_open_orders=[],
+        books_state={
+            "A": book({"NVDA": 10}),
+            "C": book({"NVDA": 20}),
+            "E": book({"NVDA": 30}),
+        },
+    )
+    assert report.ok is True, report.lines
+    assert report.books_to_halt == ()
+    assert report.shared[0].book_ids == ("A", "C", "E")
+    assert "3 books holding NVDA at once is allowed" in report.lines[0]
+
+
+def test_three_books_in_one_name_whose_total_is_wrong_stop_all_three():
+    report = reconcile(
+        broker_positions=[held("NVDA", 55)],
         broker_open_orders=[],
         books_state={
             "A": book({"NVDA": 10}),
@@ -616,7 +732,7 @@ def test_three_books_in_one_name_stops_all_three_of_them():
     )
 
 
-def test_a_book_holding_none_of_a_shared_name_is_not_one_of_the_two():
+def test_a_book_holding_none_of_a_shared_name_is_not_one_of_the_holders():
     """A zero is not a claim, so book B is not dragged into book A's name."""
     report = reconcile(
         broker_positions=[held("AAPL", 100)],
@@ -625,46 +741,83 @@ def test_a_book_holding_none_of_a_shared_name_is_not_one_of_the_two():
     )
     assert report.ok is True
     assert report.books_to_halt == ()
+    assert report.shared == (), "one real holder is not a shared ticker"
 
 
-def test_a_shared_short_is_caught_the_same_way_as_a_shared_long():
+def test_a_shared_short_is_added_up_the_same_way_as_a_shared_long():
+    """Minus 50 and minus 30 is the 80 short the broker reports."""
     report = reconcile(
         broker_positions=[held("GME", -80)],
         broker_open_orders=[],
         books_state={"A": book({"GME": -50}), "B": book({"GME": -30})},
     )
-    assert report.ok is False
-    assert report.books_to_halt == ("A", "B")
-    assert {m.kind for m in report.mismatches} == {KIND_SYMBOL_SHARED}
+    assert report.ok is True, report.lines
+    assert report.books_to_halt == ()
+    assert report.shared[0].total == -80
     assert "is short" in report.lines[0]
+    assert "80 short" in report.lines[0]
 
 
-def test_a_shared_name_whose_quantities_also_disagree_reports_both_problems():
+def test_one_book_long_and_another_short_the_same_name_nets_out():
+    """A is long 200 and B is short 50, so the broker's netted line is 150.
+
+    This is the shape the whole decision turns on: the broker cannot say whose
+    shares are whose, and it does not have to, because the sum is what gets
+    checked and the orderRef tag on each order is what says who owns what.
+    """
     report = reconcile(
-        broker_positions=[held("AAPL", 120)],
+        broker_positions=[held("PAIR", 150)],
         broker_open_orders=[],
-        books_state={"A": book({"AAPL": 100}), "B": book({"AAPL": 50})},
+        books_state={"A": book({"PAIR": 200}), "B": book({"PAIR": -50})},
+    )
+    assert report.ok is True, report.lines
+    assert report.books_to_halt == ()
+    assert report.shared[0].holders == (("A", 200), ("B", -50))
+    assert report.shared[0].matches is True
+
+
+def test_a_shared_name_and_an_unshared_one_are_judged_separately():
+    """AAPL is shared and adds up. MSFT belongs to one book and does not."""
+    report = reconcile(
+        broker_positions=[held("AAPL", 150), held("MSFT", 40)],
+        broker_open_orders=[],
+        books_state={
+            "A": book({"AAPL": 100, "MSFT": 25}),
+            "B": book({"AAPL": 50}),
+        },
     )
     assert report.ok is False
-    assert report.books_to_halt == ("A", "B")
-    assert {m.kind for m in report.mismatches} == {
-        KIND_POSITION_QTY,
-        KIND_SYMBOL_SHARED,
-    }
-    assert len(report.lines) == 2
-    assert report.summary == "2 problems across books A, B"
+    assert report.books_to_halt == ("A",), "book B is only in AAPL, which is fine"
+    assert {m.symbol for m in report.mismatches} == {"MSFT"}
+    assert [s.symbol for s in report.shared] == ["AAPL"]
+    assert report.shared[0].matches is True
 
 
-def test_the_shared_symbol_line_is_a_real_sentence_a_person_can_read():
-    report = reconcile(
-        broker_positions=[held("AAPL", 150)],
+def test_the_shared_lines_are_real_sentences_and_the_report_repeats_itself():
+    inputs = dict(
+        broker_positions=[held("AAPL", 150), held("KO", 10)],
         broker_open_orders=[],
-        books_state={"A": book({"AAPL": 100}), "B": book({"AAPL": 50})},
+        books_state={
+            "A": book({"AAPL": 100}),
+            "B": book({"AAPL": 50}),
+            "C": book({"KO": 5}),
+        },
     )
+    report = reconcile(**inputs)
     for line in report.lines:
         assert line.endswith(".") and len(line.split()) >= 6, line
-    assert reconcile(
-        broker_positions=[held("AAPL", 150)],
+    for record in report.shared:
+        assert record.line.endswith(".") and len(record.line.split()) >= 6
+    assert reconcile(**inputs) == report, "the same input twice gives the same report"
+
+
+def test_shared_tickers_come_back_in_alphabetical_order():
+    report = reconcile(
+        broker_positions=[held("ZM", 30), held("AAPL", 30)],
         broker_open_orders=[],
-        books_state={"A": book({"AAPL": 100}), "B": book({"AAPL": 50})},
-    ) == report, "the same input twice gives the same report"
+        books_state={
+            "A": book({"ZM": 10, "AAPL": 10}),
+            "B": book({"ZM": 20, "AAPL": 20}),
+        },
+    )
+    assert [record.symbol for record in report.shared] == ["AAPL", "ZM"]
