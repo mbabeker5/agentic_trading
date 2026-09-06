@@ -36,6 +36,15 @@ and
 and are waiting on Mo's approval as of 2026-09-06. Every strategy file says
 `status: provisional` at the top so nothing can quietly graduate itself.
 
+Two more files sit next door and work the same way, pure logic with no network:
+
+- The rolling day trade count, one file per book:
+  `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/pdt.py`
+- The daily check that the books and the broker still agree:
+  `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/reconcile.py`
+
+Both have their own sections near the bottom of this file.
+
 This code never touches the network. It does not connect to IB Gateway, it does
 not fetch prices and it cannot place an order. It only ever answers yes or no.
 
@@ -55,7 +64,7 @@ often each one fired over a month.
 | `whitelist` | If the whitelist has anything in it, nothing outside it may be traded. An empty whitelist means no restriction. |
 | `no_shorts` | A sell order is only allowed if we hold at least that many shares, unless the book has shorting switched on. Selling what we do not own, or selling more than we hold, is a short sale. |
 | `short_price_floor` | A book that shorts only shorts shares priced at or above its own floor, 10 dollars in the momentum books against the 5 dollar floor everything else uses. Cheap shares are the expensive ones to be short of. |
-| `shortable_required` | A short only goes out on a name IBKR has confirmed can be borrowed. The loop reads that flag from the broker and puts it on the order; without it, nothing is sent. |
+| `shortable_required` | The easy to borrow rule. A short only goes out when all three of these hold: IBKR rates the name above 2.5 on its own 0 to 3 borrowing scale, which is what the broker calls easy to borrow; the borrow costs less than `universe.max_borrow_fee_pct` a year, 1 percent; and there are at least `universe.borrow_availability_multiple` times as many shares available to borrow as we mean to sell, 10 times. Whichever of the three failed gets its own sentence. A figure the broker did not report counts as a failure, because the expensive borrows are the ones nobody quotes. |
 | `gross_exposure_cap` | Longs and shorts added together, ignoring which way they point, may never be worth more than 100 percent of the book. That is the line that says the book never borrows to buy. |
 | `entries_per_day` | A book may only open so many brand new names in a day: 5 for the momentum books, 3 for insider, 2 for Congress. Adding to something already held does not count. |
 | `entry_window` | New positions may only be opened between the book's pick time and its cut-off on a weekday, 09:35 to 11:00 for the momentum books. The start counts, the end does not. |
@@ -155,10 +164,43 @@ Three differences between books are worth knowing about:
   `allow_shorts: true`, and shorting brings three extra checks with it: the
   mirrored stop above the entry price, the 10 dollar floor, and the borrow
   confirmation from IBKR.
-- **Every book is in `dry-run` mode and cannot leave it.** The register refuses
-  to load any other mode. A book works out the order it would have sent, writes
-  it down, and stops there. Changing that is a decision for Mo, not an edit to
-  the yaml.
+- **Every book is in `dry_run` mode today, and promotion is a hand edit.** See
+  the next section.
+
+## The three modes, and how a book gets promoted
+
+A book's `mode` in `config/books.yaml` is one of three words.
+
+| Mode | What the book does | What it is sized against |
+|---|---|---|
+| `dry_run` | Works out the order it would have sent, writes it down, sends nothing | its full `capital_usd`, 100,000 dollars |
+| `tiny` | Sends real orders to the paper account | `money.tiny_capital_usd`, 2,000 dollars |
+| `full` | Sends real orders to the paper account | its full `capital_usd` |
+
+`BookConfig.effective_capital()` is the one place that answers "how much money
+does this book actually have today", and `load_book_guardrails()` uses it to set
+`money.starting_equity`. So a book on `tiny` really is held to 2,000 dollars all
+the way down: its 15 percent per position cap becomes 300 dollars, not 15,000.
+`BookConfig.sends_orders` is the short way to ask whether anything reaches the
+broker, and it is false on `dry_run`.
+
+`dry_run` is sized against the full capital on purpose. A rehearsal that sizes
+its orders differently from the real thing is not a rehearsal.
+
+**All five books are on `dry_run` today, 2026-09-06, and nothing promotes
+itself.** No code anywhere moves a book up a mode. Nothing watches a book's
+results and decides it has earned it. A promotion is Mo editing `books.yaml` by
+hand, one book at a time, after the hub has approved that book.
+
+When the hub approves a book, two fields are stamped on it in the same edit:
+
+- `promoted_on`, the date the hub approved it
+- `rules_commit`, the git hash of the rules it was approved against, so there is
+  no argument later about which version of the numbers was signed off
+
+Both are empty on all five books right now. A book set to `tiny` or `full`
+without both of them filled in refuses to load, so changing the mode on its own
+can never quietly start sending orders.
 
 ## How to change a number
 
@@ -184,7 +226,7 @@ startup and tells you which setting in which file is the problem and what a
 valid value looks like.
 
 Some names look like limits but are not checked on individual orders:
-`universe.price_floor`, `universe.min_avg_volume` and everything under
+`universe.price_floor`, `universe.min_avg_dollar_volume` and everything under
 `scanner:` shape the morning shortlist instead, so they belong to the scanner
 rather than to this file.
 
@@ -203,7 +245,7 @@ Or in one line from anywhere:
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python -m pytest -q
 ```
 
-You want to see something ending in `253 passed`. It takes under a second, and
+You want to see something ending in `492 passed`. It takes under a second, and
 no account or internet connection is needed. Run it after changing any number in
 any of the yaml files: several tests read the real settings, the real register
 of books and all four strategy files, so they will tell you straight away if a
@@ -215,6 +257,102 @@ group, name it:
 ```
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python -m pytest -q -k daily_loss
 ```
+
+## The liquidity floor, in dollars rather than shares
+
+Mo changed this on 2026-09-06. The floor used to be `universe.min_avg_volume`, a
+million shares a day. It is now `universe.min_avg_dollar_volume`, 20 million
+dollars a day, averaged over `universe.dollar_volume_sessions` of 30 completed
+sessions.
+
+A share count does not mean anything on its own. A million shares of a 6 dollar
+stock is 6 million dollars of trading and a million shares of a 600 dollar stock
+is 600 million, and only one of those can absorb our order without moving the
+price. The dollar floor is also the wider of the two: a census run on 2026-09-04,
+in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/liquidity_census/`,
+found about 2,700 US names above 20 million dollars a day against about 1,950
+above a million shares.
+
+`universe.min_avg_volume` is still accepted by the loader, so an older settings
+file keeps working, and it is still set in the insider and Congress strategy
+files because their sweeps quote a share figure in the words they hand the
+model. **The scanner no longer looks at it.** The filtering itself lives in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/scanner.py`,
+and its own README explains what changed at Gateway.
+
+The relative volume floor of 2 times normal is unchanged at `scanner.
+rel_volume_min`, but it is now anchored at 09:35 explicitly, five minutes after
+the open, because that is the moment the strategy makes its picks. That anchor
+is in the scanner rather than here.
+
+## The rolling day trade count
+
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/pdt.py`
+
+US regulators call anyone who makes four or more round trip day trades in five
+business days, in a margin account, a pattern day trader, and require that
+account to hold at least 25,000 dollars. The paper account is exempt because the
+money is simulated, so the code counts day trades itself and month one measures
+what the rule would cost rather than guessing at it.
+
+A day trade is a buy and a sell of the same symbol, in the same book, on the
+same trading day. Each book keeps its own count in its own file,
+`output/pdt_BOOK_A.json` for book A, written the moment a fill arrives.
+
+Two behaviours, set by `pdt.hard_limit` in each strategy file:
+
+- **Books C and D are held to a hard limit of three.** They are meant to hold
+  for weeks, so a day trade there is a mistake. The fourth in five business days
+  is refused, with rule id `pdt_limit`.
+- **Books A, B and E are never blocked.** Day trading is their whole strategy.
+  The order goes out, and the answer comes back with `would_have_blocked` set to
+  true so the loop can write down what the rule would have cost in a live
+  account.
+
+The rest of the numbers are in the `pdt` block of
+`config/guardrails.yaml`: `max_day_trades_per_5_days` is 3, and
+`assumed_live_equity_min_usd` is the 25,000 dollars nothing enforces on paper but
+which month one's results should be read against.
+
+Business days skip weekends, and they also skip anything in the new
+`schedule.holidays` list. That list is empty today. It is the only place in this
+project that knows about holidays at all; the order checks above still know
+about weekends only, which is written up as a known gap further down.
+
+This is the one check in the project that can refuse a closing order. On books C
+and D the closing order is the day trade, so refusing it is the only way to
+enforce the limit.
+
+## The daily reconciliation
+
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/reconcile.py`
+
+Five books share one paper account, so the tag on an order is the only thing
+tying a fill to the book that asked for it. This is the check that it still adds
+up, and it enforces four rules:
+
+1. For every symbol at least one book claims, what the books claim has to add up
+   to exactly what the broker reports. Whole shares, tolerance of zero.
+2. Every order working at the broker has to carry a reference belonging to a
+   book, and that book has to know about the order.
+3. Every working order a book believes in has to exist at the broker.
+4. A position no book claims at all is an orphan.
+
+The paper account already holds 1 share of SPY from a manual test, so the loop
+passes it in as an expected orphan and it is not treated as a problem until it
+sells.
+
+What comes back is one plain sentence per problem, the list of books to halt,
+the orphans, and one `ok` flag. Any book named in a problem stops trading until
+someone has looked, because a book that has lost track of its own positions will
+size its next order off a number that is not true. An order reference belonging
+to no book is the exception: it makes `ok` false but halts nobody, because there
+is no book to blame and stopping the five that are behaving would be the wrong
+trade.
+
+Nothing in here talks to the network either. The loop gathers the broker's
+positions and open orders, hands them over, and acts on the report.
 
 ## Judgement calls made where the strategy spec was quiet
 
@@ -267,6 +405,34 @@ Five more, added on 2026-09-06 with the books:
   Write a pair of numbers into the strategy file and the trailing stop switches
   itself on.
 
+Five more, added on 2026-09-06 with Mo's decisions on liquidity, borrowing,
+modes and day trades:
+
+- **An unreported borrow figure is a refusal, not a shrug.** If IBKR does not say
+  what a borrow costs, or how many shares are available, the short does not go.
+  The alternative was to skip the test when the number is missing, and that gets
+  it exactly backwards: the borrows that cost 300 percent a year are the ones
+  nobody quotes.
+- **`shortable_level` wins over the old `shortable` flag, and the flag still
+  works.** A caller that sets only the yes or no flag keeps the behaviour it had.
+  A caller that sets the level gets the level. That way the loop can be updated
+  without a flag day.
+- **`dry_run` sizes against the full capital.** It would have been defensible to
+  size a dry run against nothing, since nothing is sent. But the point of a dry
+  run is to see the orders the book would really have placed, and a rehearsal at
+  a different size is not one.
+- **A promotion needs its paper trail before it will load.** Setting a book to
+  `tiny` or `full` without `promoted_on` and `rules_commit` is refused. The
+  strategy spec did not ask for that. It is here because a mode is one word in a
+  yaml file, and one word should not be all that stands between a book and the
+  broker.
+- **The day trade counter cannot see the overnight position.** It only knows
+  about fills, so the first fill of the day in a symbol always reads as opening
+  one. A book that sells something it held overnight and buys it back the same
+  afternoon has that buy back counted as a day trade, where a broker might not
+  count it. That errs towards counting one too many, which is the safe direction
+  for a limit.
+
 ## Shorting, and where it stands now
 
 The strategy spec was changed on 2026-09-02 to propose shorting with mirrored
@@ -280,7 +446,10 @@ on 2026-09-06:
 - The gross exposure cap measures longs and shorts added together against the
   book, and refuses an entry that would push the total past 100 percent.
 - The 10 dollar floor for shorts and the borrow confirmation from IBKR are both
-  enforced, as `short_price_floor` and `shortable_required`.
+  enforced, as `short_price_floor` and `shortable_required`. The borrow
+  confirmation grew on 2026-09-06 from one yes or no flag into the three part
+  easy to borrow rule in the table above: the broker's own borrowing level, what
+  the borrow costs, and how many shares are actually there to borrow.
 
 So `allow_shorts: true` now lives in the two momentum strategy files,
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_hybrid/strategy.yaml`

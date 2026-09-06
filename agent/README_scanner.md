@@ -131,8 +131,8 @@ that trade far fewer than a million shares.
 The new floor is also the wider one. A census run on 2026-09-04, which lives in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/liquidity_census/`,
 found about 2,700 US names above 20 million dollars a day against about 1,950
-above a million shares a day. So the change is not a tightening: it opens the
-universe up and points it at the right measure.
+above a million shares a day. So the new floor lets more names through than the
+old one did, and measures the right thing while it does it.
 
 Two consequences worth knowing about:
 
