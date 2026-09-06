@@ -1,0 +1,54 @@
+# The daily learning loop: a headless Claude Code run that writes the journal.
+# Read by scripts/gen_launchd.py.
+
+[job]
+name = learning
+exit_timeout = 1800
+run_at_load = false
+stdin = {ROOT}/config/prompts/daily_learning_loop.md
+
+[program]
+{CLAUDE}
+-p
+--permission-mode
+acceptEdits
+--allowedTools
+Read Glob Grep Write Edit Bash(git add:*) Bash(git commit:*) Bash(git status:*) Bash(git diff:*) Bash(git log:*)
+
+[environment]
+TZ = America/New_York
+PATH = {HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+HOME = {HOME}
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# 4:30 PM Eastern, after the close, every weekday.
+at 16:30 on weekdays
+
+[comment]
+The daily learning loop, run by launchd.
+
+At 16:30 Eastern on weekdays it starts Claude Code with no terminal attached and
+feeds it the prompt at {ROOT}/config/prompts/daily_learning_loop.md on standard
+input. Claude reads the day's tick log, the five book state files, the watchdog
+and alert logs, the pre-flight result and the day's commits, and writes one
+journal entry at {ROOT}/journal/YYYY-MM-DD.md plus the five line
+{ROOT}/journal/latest_summary.md that the hub relays to Mo.
+
+Confirmed learnings graduate to {ROOT}/docs/LEARNINGS.md and improvements go to
+{ROOT}/docs/BACKLOG.md. The rules for all of that are in the prompt file, not
+here, so changing what the loop does is an edit to the prompt.
+
+WHAT IT IS ALLOWED TO DO. Reading, writing files, and a short list of git
+commands. The allowed tools list above is the whole of it. It cannot run the
+trading loop, cannot reach IB Gateway or the MCP server, and cannot place an
+order. The prompt says the same thing in words.
+
+WHAT IT NEEDS. Claude Code installed and signed in as Mo on this Mac, and the
+Mac logged in to the desktop, because a user launchd job runs in the login
+session and Claude reads its sign in from the login keychain. A locked screen is
+fine. A logged out Mac is not.
+
+If nothing appears in {ROOT}/journal/ after 16:30, read
+{ROOT}/output/launchd_learning.err.log first. A sign in that has expired shows up
+there.

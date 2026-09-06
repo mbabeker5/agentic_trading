@@ -1,0 +1,51 @@
+# The Friday weekly review: a headless Claude Code run.
+# Read by scripts/gen_launchd.py.
+
+[job]
+name = weekly
+exit_timeout = 1800
+run_at_load = false
+stdin = {ROOT}/config/prompts/weekly_review.md
+
+[program]
+{CLAUDE}
+-p
+--permission-mode
+acceptEdits
+--allowedTools
+Read Glob Grep Write Edit WebFetch Bash(git add:*) Bash(git commit:*) Bash(git status:*) Bash(git diff:*) Bash(git log:*)
+
+[environment]
+TZ = America/New_York
+PATH = {HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+HOME = {HOME}
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# 4:45 PM Eastern on Friday, fifteen minutes after the last learning loop of the
+# week, so the week's final journal entry already exists when this reads it.
+at 16:45 on friday
+
+[comment]
+The weekly review, run by launchd.
+
+At 16:45 Eastern on Fridays it starts Claude Code with no terminal attached and
+feeds it the prompt at {ROOT}/config/prompts/weekly_review.md on standard input.
+Claude reads the ledger's Books tab, the week's journal entries and last week's
+review, and writes {ROOT}/docs/weekly/YYYY-WW.md comparing the five books on
+return, alpha versus SPY, drawdown, trades, commissions, model cost, rule
+triggers and missed ticks, then says what to carry into next week.
+
+It runs fifteen minutes after Friday's daily learning loop on purpose, so the
+week's last journal entry is already written when this one starts reading.
+
+WHAT IT IS ALLOWED TO DO. Reading, writing files, fetching the ledger sheet, and
+a short list of git commands. It cannot run the trading loop, cannot reach IB
+Gateway or the MCP server, and cannot place an order.
+
+WHAT IT NEEDS. The same as the learning loop: Claude Code installed and signed in
+as Mo, and the Mac logged in to the desktop. It also needs the Google token at
+{ROOT}/.secrets/token_personal_drive.json to read the ledger.
+
+If nothing appears in {ROOT}/docs/weekly/ after a Friday, read
+{ROOT}/output/launchd_weekly.err.log first.

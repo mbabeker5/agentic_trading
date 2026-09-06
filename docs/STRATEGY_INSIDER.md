@@ -62,7 +62,7 @@ Prices and volumes for the shortlist come from IBKR, the broker we trade through
 | Liquidity floor | 500,000 shares average daily volume | Insider buys skew to smaller companies, so this is a modest floor |
 | Minimum buy size to count | $25,000 per filing, or $10,000 each inside a cluster | Filters token purchases |
 | Shorting | No, long only | Insider selling is not a usable signal |
-| Day trades | Hard limit of three per five business days | A day trade is buying and selling the same stock the same day. This book is meant to hold for weeks, so a day trade here is a mistake. US rules require $25,000 of account equity for anyone making four or more in five business days, so the limit also keeps a live account clear of that rule |
+| Day trades | Hard limit of three per five business days while the old pattern day trader regime applies | A day trade is buying and selling the same stock the same day. This book is meant to hold for weeks, so a day trade here is a mistake. Under the old regime (four or more in five business days needs $25,000 of equity) the limit keeps a live account clear of the rule. FINRA retired that rule on 2026-06-04 with a phase-in to 2027-10-20; a migrated account instead must never create an intraday margin deficit, which this book's no-borrowing sizing makes impossible. Which regime applies is read from the account on the first trading day and logged |
 | Order types | Limit entries, stop orders held in code, market exits on time stop | |
 
 ## What the code enforces versus what Claude decides

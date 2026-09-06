@@ -1,29 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  GENERATED FILE. Do not edit it by hand, your edit will be overwritten.
+  Written by /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+  from /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/preflight.template
+
+  launchd works in this Mac's own local time. There is no setting in here
+  that pins a time zone, so the times below are this Mac's clock. The
+  market keeps New York hours whatever the Mac thinks. Keep the Mac on
+  Eastern, or change every time in the template and generate again.
+
+  NOT LOADED by writing this file. Loading is a separate, deliberate step,
+  one command, written out in full in:
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md
+-->
+<!--
   The morning pre-flight check, run by launchd.
 
   It runs agent/preflight.py at 09:00, half an hour before the market opens, and
-  checks that everything the trading day needs is actually working before the
-  day starts. If any check fails it writes the file
-  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/NO_TRADE_TODAY,
-  and the loop reads that file and refuses to open new positions for the rest of
-  the day. So a bad morning stops the day rather than trading through it.
-
-  It runs once a day, at 09:00, Monday to Friday. Five entries below, one per
-  weekday. Nothing at the weekend, because there is no trading day to check.
-
-  launchd works in this Mac's own time zone, not in a time zone you can set
-  here. This Mac is in Eastern, so 09:00 below is already 09:00 New York and
-  needs no shifting. If the Mac ever moves to another time zone, these numbers
-  are wrong and have to be regenerated.
-
-  NOT LOADED. This file is a definition sitting in the repo, nothing more.
-  Loading it, unloading it and checking that it ran are all in
-  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md.
+  checks that everything the trading day needs is actually working before the day
+  starts. If any check fails it writes /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/NO_TRADE_TODAY, and the loop
+  reads that file and refuses to open new positions for the rest of the day. So a
+  bad morning stops the day rather than trading through it.
 
   It places no orders. All it does is read things and run the scanner, which is
-  why it gets a long timeout: the scanner on its own can take four minutes.
+  why it gets a ten minute timeout: the scanner on its own can take four minutes.
+
+  Worth knowing: if the Mac is asleep at 09:00, launchd runs the job once when it
+  wakes up, and there is no setting here that turns that off. A pre-flight that
+  lands at 11:00 is late but not wrong, and it still writes NO_TRADE_TODAY if
+  something is broken.
 -->
 <plist version="1.0">
 <dict>
@@ -39,8 +45,6 @@
     <key>WorkingDirectory</key>
     <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading</string>
 
-    <!-- preflight.py writes its own log. These two catch anything that goes
-         wrong before the script gets that far. -->
     <key>StandardOutPath</key>
     <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_preflight.out.log</string>
     <key>StandardErrorPath</key>
@@ -48,14 +52,12 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-      <key>TZ</key><string>America/New_York</string>
-      <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
       <key>AGENTIC_TRADING_ROOT</key><string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading</string>
+      <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+      <key>TZ</key><string>America/New_York</string>
     </dict>
 
-    <!-- Ten minutes, because this one runs the scanner and the scanner on
-         its own can take four minutes. Anything longer than ten and it has
-         hung, so let launchd stop it. -->
+    <!-- A run that overruns must never have a second one land on top of it. -->
     <key>AbandonProcessGroup</key>
     <false/>
     <key>ExitTimeOut</key>
@@ -65,11 +67,7 @@
     <key>RunAtLoad</key>
     <false/>
 
-    <!-- Worth knowing: if the Mac is asleep at 09:00, launchd runs the job
-         once when it wakes up, and there is no setting here that turns that
-         off. A pre-flight that lands at 11:00 is late but not wrong, and it
-         still writes NO_TRADE_TODAY if something is broken. -->
-
+    <!-- 5 wake ups a week. -->
     <key>StartCalendarInterval</key>
     <array>
       <dict>
@@ -98,5 +96,6 @@
         <key>Minute</key><integer>0</integer>
       </dict>
     </array>
+
 </dict>
 </plist>

@@ -89,3 +89,15 @@ It can prove the machine works: every day runs unattended, every cap holds, ever
 - The Congress-trades research returned only unverified figures because its sources are script-rendered or rate-limited; it needs a rerun before any of those numbers are used.
 - Commission and fee figures in the execution review are from memory and should be checked against IBKR's live schedule.
 - Whether IBKR's scanner filters and real-time quotes reach the paper account after today's subscription purchase is unknown until the Tuesday 9:37 AM probe.
+
+## Addendum, 2026-09-06 evening: the pattern day trader rule is being retired
+
+A late-arriving research pass, this one with retrieved sources, found that FINRA replaced the day-trading margin rules in their entirety effective June 4, 2026, with a phase-in ending October 20, 2027 (FINRA Regulatory Notice 26-10, https://www.finra.org/sites/default/files/2026-04/Regulatory-Notice-26-10.pdf). The 25,000 USD minimum and the four-trades-in-five-days count are gone for migrated accounts; the minimum to trade with leverage or short is 2,000 USD, and the replacement is an Intraday Margin Deficit (IMD) framework: a deficit must be cured within about three business days, and four unsatisfied deficits in twelve months can bring a 90-day restriction. IBKR states that new margin accounts "will generally not be subject to the pattern day trading rules" but may remain subject during the transition depending on account setup (https://www.interactivebrokers.com/faq?id=1460022486), and that un-migrated accounts still see the old rules (https://www.interactivebrokers.com/faq?id=23298902).
+
+Consequences for this document:
+- D5 (live funding) may no longer be driven by a 25,000 USD floor. It becomes a risk-capacity decision: fund what the ramp needs. The account's own status decides, and it can be read from the API: the "Day Trades Left" fields show three numbers under the old regime and are absent or unlimited under the new one.
+- The code needs a regime switch: under the old regime, the per-book day-trade counter and IBKR's pre-trade block of the fourth opening transaction apply (IBKR blocks rather than issuing a call, and the block cannot be overridden); under the new regime, the loop must instead avoid creating intraday margin deficits, which our 100 percent gross exposure cap already does by construction.
+- Portfolio Margin (110,000 USD to open, 100,000 to maintain) is carved out of the IMD framework entirely; irrelevant at our size but worth knowing.
+- Verified facts from the same pass: IBKR measures the old 25,000 USD test on the previous day's 4:15 PM net liquidation value of the securities segment; each linked account must qualify on its own; IBKR does not apply FINRA's six-percent exception; the one-time PDT reset is requested through Client Portal.
+
+Action: check Mo's account regime on Tuesday's pre-flight (read the day-trades-left fields), record it in the journal, and pick the D5 funding number after that.

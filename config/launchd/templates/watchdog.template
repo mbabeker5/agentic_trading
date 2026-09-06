@@ -1,0 +1,45 @@
+# The health check. Read by scripts/gen_launchd.py.
+
+[job]
+name = watchdog
+exit_timeout = 120
+run_at_load = false
+
+[program]
+{VENV_PYTHON}
+{ROOT}/agent/watchdog.py
+--once
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# The trading day, at the same rate as the loop it is watching.
+every 5 minutes from 09:25 to 16:05 on weekdays
+# The rest of the weekday, on the hour. Gateway falls over overnight as often as
+# it does at lunchtime, and finding out at 09:25 is finding out too late.
+hourly from 00:00 to 08:00 on weekdays
+hourly from 17:00 to 23:00 on weekdays
+# All day at the weekend.
+hourly from 00:00 to 23:00 on weekends
+
+[comment]
+The health check, run by launchd.
+
+It runs one pass of agent/watchdog.py, which looks at whether IB Gateway is up,
+whether the market data feed is still delivering prices, whether the trading
+loop has written a recent heartbeat, and how much free disk space is left. If
+any of them is wrong it tells Mo.
+
+Every five minutes from 09:25 to 16:05 on weekdays, which is the window the
+trading loop is awake in, and once an hour the rest of the time including all
+day Saturday and Sunday. That is 533 wake ups a week.
+
+What it is allowed to do: if Gateway is down it may restart Gateway, once, and
+then it leaves it alone. That is the only thing it changes. It never places an
+order, never changes one, never cancels one. It looks and it tells you.
+
+Load this one before the tick job. It is the thing that tells you the loop has
+stopped, so it is not much use arriving second.

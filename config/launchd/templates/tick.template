@@ -1,0 +1,55 @@
+# The five minute trading loop. One wake up is one tick for all five books.
+# Read by scripts/gen_launchd.py, which writes the plist. Do not hand edit the
+# plist, edit this and generate again.
+
+[job]
+name = tick
+exit_timeout = 240
+run_at_load = false
+
+[program]
+/bin/bash
+{ROOT}/agent/run_tick.sh
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# The two morning filing sweeps.
+at 07:00 on weekdays
+at 07:30 on weekdays
+# The trading day itself. 09:25 is five minutes before the open, so the first
+# tick has already checked Gateway and the MCP server before anything matters.
+# It ends at 16:05 rather than 16:00 because the tick at or after the close is
+# the one that writes each book's end of day line, and a job that fires exactly
+# on the close can land a second early.
+every 5 minutes from 09:25 to 16:05 on weekdays
+# Book C sweeps SEC Form 4 filings again, for tomorrow morning.
+at 16:30 on weekdays
+
+[comment]
+The five minute trading loop, run by launchd. One wake up is one tick for all
+five books in config/books.yaml.
+
+It runs {ROOT}/agent/run_tick.sh every five minutes from 09:25 to 16:05, Monday
+to Friday, plus three extra times a day for the filing sweeps. That is 84 wake
+ups a day and 420 entries below.
+
+The three extra times, and which book each is for:
+
+  07:00  book C sweeps SEC Form 4 filings, agent/sweep_insider.py
+  07:30  book D sweeps Congress disclosures, agent/sweep_congress.py
+  16:30  book C sweeps again for tomorrow morning
+
+What it runs is dry run only. Every book in config/books.yaml is in dry_run
+mode, so a loaded job works out what each of them would trade and sends
+nothing. run_tick.sh clears AGENTIC_TRADING_LIVE_ORDERS before every tick.
+
+Worth knowing: if the Mac is asleep at one of these times, launchd runs the job
+once when it wakes up, and there is no setting here that turns that off. It is
+harmless, because agent/loop.py reads the real clock and works out which part of
+the day it is actually in. A tick meant for 10:15 that lands at 14:00 does the
+14:00 thing. That is exactly why the phase comes from the clock rather than from
+which slot woke it.

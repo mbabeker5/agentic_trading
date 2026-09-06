@@ -1,0 +1,37 @@
+# The morning pre-flight check. Read by scripts/gen_launchd.py.
+
+[job]
+name = preflight
+exit_timeout = 600
+run_at_load = false
+
+[program]
+{VENV_PYTHON}
+{ROOT}/agent/preflight.py
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# Half an hour before the open, once a day, no weekends: there is no trading day
+# to check.
+at 09:00 on weekdays
+
+[comment]
+The morning pre-flight check, run by launchd.
+
+It runs agent/preflight.py at 09:00, half an hour before the market opens, and
+checks that everything the trading day needs is actually working before the day
+starts. If any check fails it writes {ROOT}/output/NO_TRADE_TODAY, and the loop
+reads that file and refuses to open new positions for the rest of the day. So a
+bad morning stops the day rather than trading through it.
+
+It places no orders. All it does is read things and run the scanner, which is
+why it gets a ten minute timeout: the scanner on its own can take four minutes.
+
+Worth knowing: if the Mac is asleep at 09:00, launchd runs the job once when it
+wakes up, and there is no setting here that turns that off. A pre-flight that
+lands at 11:00 is late but not wrong, and it still writes NO_TRADE_TODAY if
+something is broken.

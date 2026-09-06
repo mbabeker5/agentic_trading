@@ -1,0 +1,47 @@
+# The market recorder for the replay harness. Read by scripts/gen_launchd.py.
+
+[job]
+name = recorder
+exit_timeout = 300
+run_at_load = false
+
+[program]
+{VENV_PYTHON}
+{ROOT}/agent/replay/record_day.py
+--once
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+every 5 minutes from 09:25 to 16:05 on weekdays
+
+[comment]
+The market recorder, run by launchd.
+
+It wakes {ROOT}/agent/replay/record_day.py with the once flag every five minutes
+from 09:25 to 16:05, Monday to Friday. That is 81 wake ups a day and 405 entries
+below.
+
+WHY THIS EXISTS. Before any of the five books is allowed to place a real paper
+order, the whole loop has to be replayed against a recorded trading day with a
+fake broker, and every guardrail has to be seen to fire. This job records the
+day. What it records, and what the replay then proves, is written up in
+{ROOT}/docs/REPLAY.md.
+
+It is meant for one day at a time, which is why the weekday entries are here
+rather than a single date: launchd has no way to say "just this one Tuesday", so
+it is loaded on the day and unloaded afterwards.
+
+WHY ONE WAKE UP PER TICK RATHER THAN LETTING THE SCRIPT LOOP. record_day.py can
+run its own six and a half hour loop, and for a person watching a terminal that
+is the easier way. Under launchd it is the wrong way: a script that loops for
+six and a half hours is one crash away from losing the rest of the day, and a
+Mac that sleeps at noon wakes up with a loop that thinks it is still 11:55. One
+wake up per tick means a tick that dies costs one tick.
+
+IT PLACES NO ORDERS AND CANNOT. record_day.py connects to IB Gateway read only
+and calls nothing but quotes and historical bars. The 09:35 and 09:40 ticks also
+run agent/scanner.py, which is read only for the same reason.

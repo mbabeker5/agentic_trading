@@ -62,7 +62,7 @@ Members have up to 45 days to disclose, and most use a good part of it, so a pur
 | Minimum band to count | $15,001 to $50,000 alone, or $1,001 to $15,000 when two or more members bought | |
 | Staleness limit | Skip trades more than 60 days old on arrival | Late filers |
 | Shorting | No, long only | |
-| Day trades | Hard limit of three per five business days | A day trade is buying and selling the same stock the same day. This book is meant to hold for weeks, so a day trade here is a mistake. US rules require $25,000 of account equity for anyone making four or more in five business days, so the limit also keeps a live account clear of that rule |
+| Day trades | Hard limit of three per five business days while the old pattern day trader regime applies | A day trade is buying and selling the same stock the same day. This book is meant to hold for weeks, so a day trade here is a mistake. Under the old regime (four or more in five business days needs $25,000 of equity) the limit keeps a live account clear of the rule. FINRA retired that rule on 2026-06-04 with a phase-in to 2027-10-20; a migrated account instead must never create an intraday margin deficit, which this book's no-borrowing sizing makes impossible. Which regime applies is read from the account on the first trading day and logged |
 | Order types | Limit entries, stops held in code, market exits on time stop | |
 
 ## What the code enforces versus what Claude decides

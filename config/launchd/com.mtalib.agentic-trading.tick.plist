@@ -1,15 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  GENERATED FILE. Do not edit it by hand, your edit will be overwritten.
+  Written by /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+  from /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/tick.template
+
+  launchd works in this Mac's own local time. There is no setting in here
+  that pins a time zone, so the times below are this Mac's clock. The
+  market keeps New York hours whatever the Mac thinks. Keep the Mac on
+  Eastern, or change every time in the template and generate again.
+
+  NOT LOADED by writing this file. Loading is a separate, deliberate step,
+  one command, written out in full in:
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md
+-->
+<!--
   The five minute trading loop, run by launchd. One wake up is one tick for all
   five books in config/books.yaml.
 
-  It wakes /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/run_tick.sh
-  every five minutes from 09:25 to 16:05, Monday to Friday, plus three extra
-  times a day for the filing sweeps. That is 84 wake ups a day and 420 entries
-  below, one per weekday per time. 09:25 is five minutes before the market
-  opens, so the first tick has already checked that IB Gateway and the MCP
-  server are up before anything matters.
+  It runs /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/run_tick.sh every five minutes from 09:25 to 16:05, Monday
+  to Friday, plus three extra times a day for the filing sweeps. That is 84 wake
+  ups a day and 420 entries below.
 
   The three extra times, and which book each is for:
 
@@ -17,23 +28,16 @@
     07:30  book D sweeps Congress disclosures, agent/sweep_congress.py
     16:30  book C sweeps again for tomorrow morning
 
-  The five minute run now ends at 16:05 rather than 16:00, because the tick at
-  or after the close is the one that writes each book's end of day line, and a
-  job that fires exactly on the close can land a second early.
-
-  launchd works in this Mac's own time zone, not in a time zone you can set here.
-  This Mac is in Eastern (checked with `date +%Z` on 2026-09-02, which said EDT),
-  so the times below are already New York times and need no shifting. If the Mac
-  ever moves to another time zone, these numbers are wrong and have to be
-  regenerated, because the market keeps New York hours whatever the Mac thinks.
-
-  NOT LOADED. This file is a definition sitting in the repo, nothing more.
-  Loading it, unloading it and checking that it ran are all in
-  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md.
-
   What it runs is dry run only. Every book in config/books.yaml is in dry_run
   mode, so a loaded job works out what each of them would trade and sends
-  nothing. run_tick.sh unsets AGENTIC_TRADING_LIVE_ORDERS before every tick.
+  nothing. run_tick.sh clears AGENTIC_TRADING_LIVE_ORDERS before every tick.
+
+  Worth knowing: if the Mac is asleep at one of these times, launchd runs the job
+  once when it wakes up, and there is no setting here that turns that off. It is
+  harmless, because agent/loop.py reads the real clock and works out which part of
+  the day it is actually in. A tick meant for 10:15 that lands at 14:00 does the
+  14:00 thing. That is exactly why the phase comes from the clock rather than from
+  which slot woke it.
 -->
 <plist version="1.0">
 <dict>
@@ -49,8 +53,6 @@
     <key>WorkingDirectory</key>
     <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading</string>
 
-    <!-- run_tick.sh writes the real log, one file per day. These two catch
-         anything that goes wrong before the script gets that far. -->
     <key>StandardOutPath</key>
     <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_tick.out.log</string>
     <key>StandardErrorPath</key>
@@ -58,11 +60,12 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-      <key>TZ</key><string>America/New_York</string>
+      <key>AGENTIC_TRADING_ROOT</key><string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading</string>
       <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+      <key>TZ</key><string>America/New_York</string>
     </dict>
 
-    <!-- A tick that overruns must never have a second one land on top of it. -->
+    <!-- A run that overruns must never have a second one land on top of it. -->
     <key>AbandonProcessGroup</key>
     <false/>
     <key>ExitTimeOut</key>
@@ -72,18 +75,9 @@
     <key>RunAtLoad</key>
     <false/>
 
-    <!-- Worth knowing: if the Mac is asleep at one of these times, launchd runs
-         the job once when it wakes up, and there is no setting here that turns
-         that off. It is harmless, because agent/loop.py reads the real clock
-         and works out which part of the day it is actually in. A tick that was
-         meant for 10:15 and lands at 14:00 does the 14:00 thing, not the 10:15
-         thing. That is exactly why the phase comes from the clock rather than
-         from which slot woke it. -->
-
+    <!-- 420 wake ups a week. -->
     <key>StartCalendarInterval</key>
     <array>
-      <!-- Monday is 1 and Friday is 5. Weekday 1: the two morning sweeps, then
-           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
       <dict>
         <key>Weekday</key><integer>1</integer>
         <key>Hour</key><integer>7</integer>
@@ -504,8 +498,6 @@
         <key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>30</integer>
       </dict>
-      <!-- Monday is 1 and Friday is 5. Weekday 2: the two morning sweeps, then
-           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
       <dict>
         <key>Weekday</key><integer>2</integer>
         <key>Hour</key><integer>7</integer>
@@ -926,8 +918,6 @@
         <key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>30</integer>
       </dict>
-      <!-- Monday is 1 and Friday is 5. Weekday 3: the two morning sweeps, then
-           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
       <dict>
         <key>Weekday</key><integer>3</integer>
         <key>Hour</key><integer>7</integer>
@@ -1348,8 +1338,6 @@
         <key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>30</integer>
       </dict>
-      <!-- Monday is 1 and Friday is 5. Weekday 4: the two morning sweeps, then
-           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
       <dict>
         <key>Weekday</key><integer>4</integer>
         <key>Hour</key><integer>7</integer>
@@ -1770,8 +1758,6 @@
         <key>Hour</key><integer>16</integer>
         <key>Minute</key><integer>30</integer>
       </dict>
-      <!-- Monday is 1 and Friday is 5. Weekday 5: the two morning sweeps, then
-           every five minutes from 09:25 to 16:05, then the 16:30 insider sweep. -->
       <dict>
         <key>Weekday</key><integer>5</integer>
         <key>Hour</key><integer>7</integer>
@@ -2193,5 +2179,6 @@
         <key>Minute</key><integer>30</integer>
       </dict>
     </array>
+
 </dict>
 </plist>
