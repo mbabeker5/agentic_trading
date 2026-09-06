@@ -1,0 +1,3 @@
+# Opening momentum, rules only: no prompt
+
+Book B runs this strategy with `model: none`, so no model is ever called and there is nothing to prompt. The picks come from `decide()` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/decide.py`, which takes the top three candidates by score, enters at the opening range high (the opening range low for a candidate that gapped down), stops where `strategy.yaml` says, targets twice the stop distance, and writes "rules only" as the reason on every row. This file exists so the folder looks like the others; an empty folder would read as something gone missing. Book B is the control that books A and E are measured against.

@@ -1,0 +1,458 @@
+{
+  "what_this_is": "Real token counts for every decision prompt in the month one eval, measured against OpenRouter on 2026-09-06, plus the month one cost table computed from them. Regenerate the token counts with: agent/decide.py --measure --real",
+  "measured_at": "2026-09-06",
+  "measured_by": "agent/decide.py --measure --real, plus two isolating calls",
+  "prices_usd_per_million_tokens": {
+    "openrouter/anthropic/claude-fable-5.1": {
+      "input": 10.0,
+      "output": 50.0,
+      "cache_read": 0.25,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0
+    },
+    "openrouter/openai/gpt-6-astra": {
+      "input": 10.0,
+      "output": 50.0,
+      "cache_read": 1.0,
+      "cache_write": 12.5
+    }
+  },
+  "how_the_calls_were_made": {
+    "total_real_calls": 12,
+    "max_tokens_per_call": 600,
+    "actual_spend_usd": 0.713985,
+    "spend_source": "https://openrouter.ai/api/v1/key, field byok_usage_daily. This key routes through BYOK, so the per call 'cost' field in every chat completion came back as 0 and the real figure only shows up in the key's byok_usage counters. The ledger must not read that 0 as free.",
+    "packets_used": {
+      "momentum_hybrid": "output/decision_packet_2026-09-02_0936.json, the real 16 candidate packet",
+      "insider": "synthetic, 15 candidates for pick and 8 open positions for manage, built by agent/decide.py",
+      "congress": "synthetic, 15 candidates for pick and 8 open positions for manage, built by agent/decide.py"
+    }
+  },
+  "measurements": [
+    {
+      "strategy": "momentum_hybrid",
+      "shape": "pick",
+      "model": "openrouter/anthropic/claude-fable-5.1",
+      "prompt_tokens": 6581,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false,
+      "note": "reasoning tokens used the whole 600 token budget, so no JSON came back"
+    },
+    {
+      "strategy": "momentum_hybrid",
+      "shape": "pick",
+      "model": "openrouter/openai/gpt-6-astra",
+      "prompt_tokens": 5046,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false
+    },
+    {
+      "strategy": "momentum_hybrid",
+      "shape": "manage",
+      "model": "openrouter/anthropic/claude-fable-5.1",
+      "prompt_tokens": 2125,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false,
+      "latency_s": 14.8
+    },
+    {
+      "strategy": "momentum_hybrid",
+      "shape": "manage",
+      "model": "openrouter/openai/gpt-6-astra",
+      "prompt_tokens": 1674,
+      "completion_tokens": 390,
+      "finish_reason": "stop",
+      "completion_hit_the_cap": false,
+      "text_returned": true,
+      "note": "the only untruncated answer of the eight: valid JSON, one action and one reason for each of 4 positions"
+    },
+    {
+      "strategy": "insider",
+      "shape": "pick",
+      "model": "openrouter/anthropic/claude-fable-5.1",
+      "prompt_tokens": 7859,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false
+    },
+    {
+      "strategy": "insider",
+      "shape": "manage",
+      "model": "openrouter/anthropic/claude-fable-5.1",
+      "prompt_tokens": 2238,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false
+    },
+    {
+      "strategy": "congress",
+      "shape": "pick",
+      "model": "openrouter/anthropic/claude-fable-5.1",
+      "prompt_tokens": 6719,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false
+    },
+    {
+      "strategy": "congress",
+      "shape": "manage",
+      "model": "openrouter/anthropic/claude-fable-5.1",
+      "prompt_tokens": 2133,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "completion_hit_the_cap": true,
+      "text_returned": false
+    }
+  ],
+  "extra_calls": [
+    {
+      "why": "does a low reasoning effort leave room for an answer at 600 tokens",
+      "call": "openrouter/anthropic/claude-fable-5.1, momentum_hybrid manage, reasoning effort low",
+      "prompt_tokens": 2125,
+      "completion_tokens": 600,
+      "finish_reason": "length",
+      "result": "no. Even at low effort Fable used the whole 600 tokens and returned no text."
+    },
+    {
+      "why": "how many tokens is the system prompt on its own, which is the part caching could hold",
+      "call": "openrouter/anthropic/claude-fable-5.1, momentum pick system prompt plus a one character user message",
+      "prompt_tokens": 1144,
+      "system_prompt_chars": 3244,
+      "result": "2.84 characters per token for Fable on this prose"
+    },
+    {
+      "why": "the same isolating call on the other model",
+      "call": "openrouter/openai/gpt-6-astra, momentum pick system prompt plus a one character user message",
+      "prompt_tokens": 793,
+      "system_prompt_chars": 3244,
+      "result": "4.09 characters per token for Astra, so the same prompt costs Astra about 30 percent fewer tokens"
+    }
+  ],
+  "system_and_user_split": {
+    "how": "system tokens are the character count of the rendered system prompt divided by the characters per token measured above. user tokens are the measured total minus that.",
+    "per_book": {
+      "A": {
+        "system_tokens": {
+          "pick": 1091,
+          "manage": 633
+        },
+        "user_tokens": {
+          "pick": 5490,
+          "manage": 1492
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 600
+        }
+      },
+      "C": {
+        "system_tokens": {
+          "pick": 1224,
+          "manage": 699
+        },
+        "user_tokens": {
+          "pick": 6635,
+          "manage": 1539
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 600
+        }
+      },
+      "D": {
+        "system_tokens": {
+          "pick": 1289,
+          "manage": 706
+        },
+        "user_tokens": {
+          "pick": 5430,
+          "manage": 1427
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 600
+        }
+      },
+      "E": {
+        "system_tokens": {
+          "pick": 756,
+          "manage": 439
+        },
+        "user_tokens": {
+          "pick": 4290,
+          "manage": 1235
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 390
+        }
+      }
+    }
+  },
+  "prompt_drift_since_measurement": {
+    "what_happened": "the prompts were rewritten after the eight calls so that every placeholder name is the exact key name in the book's strategy.yaml",
+    "size_change": "pick prompts grew 101 to 151 characters, manage prompts grew 4 to 6, which is 35 to 55 Fable tokens on a 6581 token prompt, under one percent. The cost table was not re-measured for it.",
+    "system_chars_when_measured": {
+      "momentum_hybrid/pick": 3093,
+      "momentum_hybrid/manage": 1795,
+      "insider/pick": 3471,
+      "insider/manage": 1983,
+      "congress/pick": 3654,
+      "congress/manage": 2003
+    },
+    "system_chars_now": {
+      "momentum_hybrid/pick": 3244,
+      "momentum_hybrid/manage": 1801,
+      "insider/pick": 3575,
+      "insider/manage": 1987,
+      "congress/pick": 3755,
+      "congress/manage": 2008
+    }
+  },
+  "caching_rules_checked_2026_09_06": {
+    "anthropic_claude_fable_5_1": {
+      "automatic": false,
+      "how_to_turn_it_on": "a cache_control breakpoint, either {'type':'ephemeral'} at the top level of the request body, or on a content block: {'type':'text','text':'...','cache_control':{'type':'ephemeral'}}",
+      "max_breakpoints": 4,
+      "minimum_cacheable_tokens": 512,
+      "minimum_note": "OpenRouter's own page does not list Fable and its stated tiers are stale. 512 comes from Anthropic's current table. A prompt under the minimum is processed with no caching and no error.",
+      "cache_read_multiplier": 0.025,
+      "cache_read_note": "Fable 5.1 and Mythos 5.1 only. Every other Anthropic model is 0.1x. OpenRouter's prose still says 0.1x; its live pricing API says 0.025x and agrees with Anthropic.",
+      "cache_write_multiplier_5m": 1.25,
+      "cache_write_multiplier_1h": 2.0,
+      "default_ttl": "5 minutes, extendable to 1 hour with ttl: '1h' on the breakpoint",
+      "ttl_note": "the clock starts when the writing request starts, not when its response ends, so a 15 second answer eats 15 seconds of a 5 minute cache",
+      "breakpoint_placement": "the end of the system message works and is the documented example. Caching covers tools, then system, then messages, in that order, up to the breakpoint."
+    },
+    "openai_gpt_6_astra": {
+      "automatic": true,
+      "minimum_cacheable_tokens": 1024,
+      "cache_read_multiplier": 0.1,
+      "cache_read_note": "OpenRouter's prose says 0.25x or 0.5x, which is the GPT-4 era. Every GPT-5 and GPT-6 model computes to 0.1x and OpenAI's own guide says 0.1x.",
+      "cache_write_multiplier": 1.25,
+      "cache_write_note": "GPT-5.6 and later charge for writes even though caching is automatic",
+      "retention": "30 minutes from the last write or reuse, refreshed free on reuse",
+      "prefix_matching": "strict. The whole rendered prefix has to match, and response_format counts as part of it, so changing the JSON schema busts the cache."
+    },
+    "how_openrouter_reports_it": {
+      "usage.prompt_tokens_details.cached_tokens": "tokens read from cache",
+      "usage.prompt_tokens_details.cache_write_tokens": "tokens written, only on models with paid writes",
+      "cache_discount": "not in the chat response, only on the /api/v1/generation metadata endpoint",
+      "usage_include_true": "deprecated and ignored, usage is always returned now"
+    },
+    "routing": "OpenRouter keeps a sticky session to the provider that holds the cache for 10 minutes, unless provider.order is set by hand, which turns stickiness off. Pass a session_id to make stickiness reliable for a loop whose messages keep changing."
+  },
+  "cost_table": {
+    "rows": [
+      {
+        "book": "A",
+        "label": "Opening momentum, Claude Fable 5.1",
+        "strategy": "momentum_hybrid",
+        "model": "fable",
+        "system_tokens": {
+          "pick": 1091,
+          "manage": 633
+        },
+        "user_tokens": {
+          "pick": 5490,
+          "manage": 1492
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 600
+        },
+        "low": 34.29951,
+        "low_pick": 2.01201,
+        "low_manage": 32.2875,
+        "calls_low": 651,
+        "low_cached": 32.24906475,
+        "low_cache_writes": 147,
+        "high": 83.80701,
+        "high_pick": 2.01201,
+        "high_manage": 81.795,
+        "calls_high": 1617,
+        "high_cached": 75.79465425000001,
+        "high_cache_writes": 147
+      },
+      {
+        "book": "B",
+        "label": "Opening momentum, rules only, no model",
+        "strategy": null,
+        "model": null,
+        "low": 0.0,
+        "high": 0.0,
+        "low_cached": 0.0,
+        "high_cached": 0.0,
+        "calls_low": 0,
+        "calls_high": 0
+      },
+      {
+        "book": "C",
+        "label": "Insider buying, Claude Fable 5.1",
+        "strategy": "insider",
+        "model": "fable",
+        "system_tokens": {
+          "pick": 1224,
+          "manage": 699
+        },
+        "user_tokens": {
+          "pick": 6635,
+          "manage": 1539
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 600
+        },
+        "low": 7.72791,
+        "low_pick": 2.28039,
+        "low_manage": 5.44752,
+        "calls_low": 125,
+        "low_cached": 7.72791,
+        "low_cache_writes": 0,
+        "high": 16.58013,
+        "high_pick": 2.28039,
+        "high_manage": 14.299740000000002,
+        "calls_high": 294,
+        "high_cached": 16.58013,
+        "high_cache_writes": 0
+      },
+      {
+        "book": "D",
+        "label": "Congress trades, Claude Fable 5.1",
+        "strategy": "congress",
+        "model": "fable",
+        "system_tokens": {
+          "pick": 1289,
+          "manage": 706
+        },
+        "user_tokens": {
+          "pick": 5430,
+          "manage": 1427
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 600
+        },
+        "low": 5.37744,
+        "low_pick": 2.04099,
+        "low_manage": 3.33645,
+        "calls_low": 86,
+        "low_cached": 5.37744,
+        "low_cache_writes": 0,
+        "high": 16.05408,
+        "high_pick": 2.04099,
+        "high_manage": 14.01309,
+        "calls_high": 294,
+        "high_cached": 16.05408,
+        "high_cache_writes": 0
+      },
+      {
+        "book": "E",
+        "label": "Opening momentum, GPT-6 Astra",
+        "strategy": "momentum_hybrid",
+        "model": "astra",
+        "system_tokens": {
+          "pick": 756,
+          "manage": 439
+        },
+        "user_tokens": {
+          "pick": 4290,
+          "manage": 1235
+        },
+        "output_tokens": {
+          "pick": 600,
+          "manage": 390
+        },
+        "low": 24.520860000000003,
+        "low_pick": 1.6896600000000002,
+        "low_manage": 22.831200000000003,
+        "calls_low": 651,
+        "low_cached": 24.520860000000003,
+        "low_cache_writes": 0,
+        "high": 59.52870000000001,
+        "high_pick": 1.6896600000000002,
+        "high_manage": 57.839040000000004,
+        "calls_high": 1617,
+        "high_cached": 59.52870000000001,
+        "high_cache_writes": 0
+      }
+    ],
+    "totals": {
+      "low": 71.92572,
+      "high": 175.96992,
+      "low_cached": 69.87527475,
+      "high_cached": 167.95756425000002
+    },
+    "sensitivity_production_caps": {
+      "low": 96.61072,
+      "high": 233.88792
+    },
+    "calls_per_month": {
+      "A": {
+        "low": [
+          21,
+          630
+        ],
+        "high": [
+          21,
+          1596
+        ]
+      },
+      "E": {
+        "low": [
+          21,
+          630
+        ],
+        "high": [
+          21,
+          1596
+        ]
+      },
+      "C": {
+        "low": [
+          21,
+          104
+        ],
+        "high": [
+          21,
+          273
+        ]
+      },
+      "D": {
+        "low": [
+          21,
+          65
+        ],
+        "high": [
+          21,
+          273
+        ]
+      }
+    },
+    "system_chars_measured": {
+      "momentum_hybrid/pick": 3093,
+      "momentum_hybrid/manage": 1795,
+      "insider/pick": 3471,
+      "insider/manage": 1983,
+      "congress/pick": 3654,
+      "congress/manage": 2003
+    },
+    "system_chars_final": {
+      "momentum_hybrid/pick": 3244,
+      "momentum_hybrid/manage": 1801,
+      "insider/pick": 3575,
+      "insider/manage": 1987,
+      "congress/pick": 3755,
+      "congress/manage": 2008
+    }
+  }
+}

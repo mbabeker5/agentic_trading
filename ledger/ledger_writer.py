@@ -19,6 +19,22 @@ Four ways in:
   log_rule(...)         one guardrail firing, onto the Rules Log tab
   upsert_daily(...)     one trading day, onto the Daily tab
 
+Five books share the one paper account, so every row has to say which book it
+belongs to and which model decided it. log_trade, log_decision and log_rule all
+take the same four extras, and all four default to None so an older call still
+works:
+
+  book_id         "A" to "E", the book the row belongs to
+  model           the model that made the call, or "none" for the rules only book
+  model_cost_usd  what that call cost, in dollars
+  prompt_hash     sha256 hex of the rendered system prompt, so a prompt change
+                  mid-month is visible in the ledger rather than invisible
+
+model_cost_usd is left blank when it is not known. OpenRouter finalises the cost
+of a call a few seconds after answering, so a 0 in hand at write time usually
+means "not settled yet" rather than "free", and writing that 0 would be a lie the
+month end cost comparison then repeats.
+
 Two promises every one of them keeps:
 
 1. It never raises. If the wifi is off, the token has expired or Google is
@@ -36,6 +52,7 @@ Self test, writes nothing:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -72,6 +89,10 @@ TRADES_COLUMNS: list[tuple[str, tuple[str, ...]]] = [
     ("Reason", ("reason", "rationale")),
     ("Realised P&L", ("realised_pnl", "realized_pnl", "pnl")),
     ("Notes", ("notes", "note")),
+    ("Book", ("book", "book_id")),
+    ("Model", ("model",)),
+    ("Model Cost USD", ("model_cost_usd", "model_cost", "cost_usd")),
+    ("Prompt Hash", ("prompt_hash", "hash")),
 ]
 
 # The Daily tab is mostly formulas. These are the only columns the agent owns.
@@ -91,6 +112,7 @@ DAILY_INPUT_COLUMNS = {
     "trades_count": "K",
     "rules_triggered": "L",
     "notes": "M",
+    "model_cost_usd": "N",
 }
 DAILY_FIRST_DATA_ROW = 2
 
@@ -111,6 +133,25 @@ def _safe_cell(value: Any) -> Any:
     if value is None:
         return ""
     return value
+
+
+def _cost_cell(value: Any) -> Any:
+    """Turn a model cost into a cell, leaving it blank when the cost is unknown.
+
+    None, an empty string, something that is not a number, and 0 all come back
+    as an empty cell. 0 is included on purpose: OpenRouter reports 0 in the
+    immediate reply and settles the real figure seconds later, so a 0 in the
+    ledger would claim a call was free when nobody knows yet what it cost. A
+    blank cell still counts as nothing inside the Books tab SUMIFS, so leaving
+    it empty costs no total anywhere.
+    """
+    if value is None or value == "":
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return "" if number == 0 else number
 
 
 def _now_et_string() -> str:
@@ -189,7 +230,9 @@ def _append(tab: str, row: Sequence[Any], dry_run: bool) -> bool:
 
 # --------------------------------------------------------------------- Trades
 
-def log_trade(row: dict, dry_run: bool = False) -> bool:
+def log_trade(row: dict, book_id: Any = None, model: Any = None,
+              model_cost_usd: Any = None, prompt_hash: Any = None,
+              dry_run: bool = False) -> bool:
     """Record one fill on the Trades tab.
 
     Accepts either the exact column headings or the shorter names listed in
@@ -197,6 +240,14 @@ def log_trade(row: dict, dry_run: bool = False) -> bool:
 
         log_trade({"Symbol": "AAPL", "Side": "BUY", "Qty": 50})
         log_trade({"symbol": "AAPL", "side": "BUY", "qty": 50, "price": 231.4})
+
+    The book and the model can be passed either way too, whichever suits the
+    caller. These two lines do the same thing:
+
+        log_trade({"symbol": "AAPL", "book": "A", "model": "claude-fable-5.1"})
+        log_trade({"symbol": "AAPL"}, book_id="A", model="claude-fable-5.1")
+
+    An argument passed on its own wins over the same thing inside the dict.
 
     Anything left out is written as an empty cell. Notional is worked out from
     quantity times price when it was not supplied.
@@ -227,6 +278,13 @@ def log_trade(row: dict, dry_run: bool = False) -> bool:
         except (TypeError, ValueError):
             pass
 
+    for heading, argument in (("Book", book_id), ("Model", model),
+                              ("Model Cost USD", model_cost_usd),
+                              ("Prompt Hash", prompt_hash)):
+        if argument is not None:
+            filled[heading] = argument
+    filled["Model Cost USD"] = _cost_cell(filled["Model Cost USD"])
+
     unknown = set(row) - {h for h, _ in TRADES_COLUMNS} - {a for _, al in TRADES_COLUMNS for a in al}
     if unknown:
         _warn(f"log_trade ignored fields it has no column for: {sorted(unknown)}")
@@ -237,35 +295,51 @@ def log_trade(row: dict, dry_run: bool = False) -> bool:
 # ------------------------------------------------------------------ Rules Log
 
 def log_decision(timestamp: Any, symbol: str, decision: str, rationale: str,
-                 mode: str = "dry-run", dry_run: bool = False) -> bool:
+                 mode: str = "dry-run", book_id: Any = None, model: Any = None,
+                 model_cost_usd: Any = None, prompt_hash: Any = None,
+                 dry_run: bool = False) -> bool:
     """Record one judgement call on the Rules Log tab.
 
-    The tab has four columns, so the five things worth knowing are folded in
-    like this:
+    The first four columns fold the judgement itself in like this:
 
       Timestamp     when
       Rule          the word "decision", so these are easy to filter out
       Detail        the symbol, then why
       Action Taken  the mode in brackets, then what was decided
 
+    The last four say who made it and what it cost: Book, Model, Model Cost USD
+    and Prompt Hash. Most of the month's model spend lands here rather than on
+    the Trades tab, because a model is asked on every tick and only some ticks
+    end in a fill.
+
     "Do nothing" is a decision and belongs here too. That is the strategy's
     rule, not a preference: every choice gets a written reason.
     """
     detail = f"{symbol}: {rationale}" if symbol else str(rationale)
     row = [_as_text(timestamp) or _now_et_string(), "decision", detail,
-           f"[{mode}] {decision}"]
+           f"[{mode}] {decision}", book_id, model,
+           _cost_cell(model_cost_usd), prompt_hash]
     return _append(RULES_TAB, row, dry_run)
 
 
 def log_rule(timestamp: Any, rule_id: str, detail: str, action: str,
+             book_id: Any = None, model: Any = None,
+             model_cost_usd: Any = None, prompt_hash: Any = None,
              dry_run: bool = False) -> bool:
     """Record one guardrail firing on the Rules Log tab.
 
     rule_id is the guardrail's own name, for example daily_loss_cap or
     max_open_positions, so the month end review can count how often each limit
-    actually bit.
+    actually bit. book_id says which book it bit, which is the whole point of
+    running five of them: a limit that only ever fires on one book is telling
+    you something about that book.
+
+    A guardrail is code, not a model, so model and model_cost_usd are usually
+    left out here. They are accepted anyway for the case where a rule fires on
+    the back of a model call, for instance a refusal being logged as a rule.
     """
-    row = [_as_text(timestamp) or _now_et_string(), str(rule_id), str(detail), str(action)]
+    row = [_as_text(timestamp) or _now_et_string(), str(rule_id), str(detail),
+           str(action), book_id, model, _cost_cell(model_cost_usd), prompt_hash]
     return _append(RULES_TAB, row, dry_run)
 
 
@@ -315,13 +389,19 @@ def _daily_row_for_date(session, sheet_id: str, date_text: str) -> int | None:
 def upsert_daily(date: Any, starting_equity: Any = None, ending_equity: Any = None,
                  spy_close: Any = None, trades_count: Any = None,
                  rules_triggered: Any = None, notes: Any = None,
-                 dry_run: bool = False) -> bool:
+                 model_cost_usd: Any = None, dry_run: bool = False) -> bool:
     """Fill in one day on the Daily tab, adding the row or updating it in place.
 
-    Only the seven columns the agent owns are touched: A Date, B Starting
-    Equity, C Ending Equity, G SPY Close, K Trades Count, L Rules Triggered and
-    M Notes. The profit, return and alpha columns are formulas and are left
-    exactly as they are.
+    Only the eight columns the agent owns are touched: A Date, B Starting
+    Equity, C Ending Equity, G SPY Close, K Trades Count, L Rules Triggered,
+    M Notes and N Model Cost USD. The profit, return and alpha columns are
+    formulas and are left exactly as they are.
+
+    There is no book column here on purpose. The Daily tab tracks the one paper
+    account all five books share, so a day is a day, not a day per book. Per
+    book figures live on the Books tab, which slices Trades and Rules Log by
+    their Book column. model_cost_usd is the day's total spend across every
+    book, and is left blank rather than written as 0 when it is not known.
 
     Leaving an argument out leaves that cell alone, so calling this at 9:30 with
     just the date and starting equity and again at 4:00 with the closing figures
@@ -340,6 +420,7 @@ def upsert_daily(date: Any, starting_equity: Any = None, ending_equity: Any = No
         "trades_count": trades_count,
         "rules_triggered": rules_triggered,
         "notes": notes,
+        "model_cost_usd": _cost_cell(model_cost_usd) if model_cost_usd is not None else None,
     }
     supplied = {name: value for name, value in values.items() if value is not None}
 
@@ -396,17 +477,27 @@ def _cli() -> int:
     print(f"token:     {TOKEN_PATH}")
     print(f"mode:      {'dry run, nothing is written' if dry else 'WRITING to the live ledger'}")
     now = _now_et_string()
+    # A stand in for the sha256 of a rendered system prompt.
+    sample_hash = hashlib.sha256(b"sample system prompt").hexdigest()
     ok = [
         log_trade({"symbol": "SPY", "side": "BUY", "qty": 10, "price": 765.25,
                    "order_type": "LMT", "signal": "opening range break",
-                   "reason": "sample row from the self test"}, dry_run=dry),
+                   "reason": "sample row from the self test"},
+                  book_id="A", model="openrouter/anthropic/claude-fable-5.1",
+                  model_cost_usd=0.0184, prompt_hash=sample_hash, dry_run=dry),
         log_decision(now, "SPY", "no entry", "sample row from the self test",
-                     mode="dry-run", dry_run=dry),
-        log_rule(now, "max_open_positions", "5 already open", "entry refused", dry_run=dry),
+                     mode="dry-run", book_id="A",
+                     model="openrouter/anthropic/claude-fable-5.1",
+                     model_cost_usd=None, prompt_hash=sample_hash, dry_run=dry),
+        log_rule(now, "max_open_positions", "5 already open", "entry refused",
+                 book_id="B", model="none", dry_run=dry),
         upsert_daily(now[:10], starting_equity=100000, ending_equity=100120,
                      spy_close=765.25, trades_count=2, rules_triggered="none",
-                     notes="sample row from the self test", dry_run=dry),
+                     notes="sample row from the self test", model_cost_usd=0.4211,
+                     dry_run=dry),
     ]
+    print("the decision row above has an empty model cost on purpose: "
+          "None means the cost is not settled yet, and 0 would be a lie.")
     print(f"all four writers returned True: {all(ok)}")
     return 0 if all(ok) else 1
 

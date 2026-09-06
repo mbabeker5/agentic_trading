@@ -53,6 +53,9 @@ HEADER_TEXT = {"red": 25 / 255, "green": 25 / 255, "blue": 25 / 255}
 FMT_DATE = ("DATE", "yyyy-mm-dd")
 FMT_DATETIME = ("DATE_TIME", "yyyy-mm-dd hh:mm:ss")
 FMT_MONEY = ("CURRENCY", "$#,##0.00")
+# Model calls cost fractions of a cent, so their own money format keeps four
+# decimal places. $#,##0.00 would round a real cost down to $0.00.
+FMT_MONEY_FINE = ("CURRENCY", "$#,##0.0000")
 FMT_PERCENT = ("NUMBER", "0.00%")
 FMT_WHOLE = ("NUMBER", "#,##0")
 FMT_DECIMAL = ("NUMBER", "0.00")
@@ -60,6 +63,20 @@ FMT_DECIMAL = ("NUMBER", "0.00")
 # How many Daily rows get the live formulas filled in ahead of time. A month of
 # US trading is about 21 days, so 40 leaves plenty of room.
 DAILY_FORMULA_ROWS = 40
+
+# The five books the eval runs side by side inside the one paper account.
+# Book id, strategy, model. Every trade and every decision is stamped with the
+# book that made it, so the tabs can be sliced per book at the end of the month.
+BOOKS = [
+    ("A", "Opening momentum", "Claude Fable 5.1"),
+    ("B", "Opening momentum", "none"),
+    ("C", "Insider buying", "Claude Fable 5.1"),
+    ("D", "Congress trades", "Claude Fable 5.1"),
+    ("E", "Opening momentum", "GPT-6 Astra"),
+]
+
+# Each book is scored as if it started with its own $100,000.
+BOOK_CAPITAL = 100000
 
 TRADES_HEADERS = [
     "Timestamp (ET)",
@@ -76,6 +93,10 @@ TRADES_HEADERS = [
     "Reason",
     "Realised P&L",
     "Notes",
+    "Book",
+    "Model",
+    "Model Cost USD",
+    "Prompt Hash",
 ]
 
 DAILY_HEADERS = [
@@ -92,23 +113,59 @@ DAILY_HEADERS = [
     "Trades Count",
     "Rules Triggered",
     "Notes",
+    "Model Cost USD",
 ]
 
 SUMMARY_HEADERS = ["Metric", "Value", "What it means"]
-RULES_LOG_HEADERS = ["Timestamp", "Rule", "Detail", "Action Taken"]
+RULES_LOG_HEADERS = [
+    "Timestamp",
+    "Rule",
+    "Detail",
+    "Action Taken",
+    "Book",
+    "Model",
+    "Model Cost USD",
+    "Prompt Hash",
+]
 CONFIG_HEADERS = ["Setting", "Value", "Notes"]
+BOOKS_HEADERS = [
+    "Book",
+    "Strategy",
+    "Model",
+    "Capital",
+    "Equity",
+    "Return %",
+    "SPY %",
+    "Alpha",
+    "Max DD",
+    "Trades",
+    "Commissions",
+    "Model Cost USD",
+    "Rule Triggers",
+    "Missed Ticks",
+]
 
 # Column widths in pixels, one entry per column, in order.
-TRADES_WIDTHS = [150, 95, 80, 70, 70, 95, 110, 100, 100, 110, 150, 240, 110, 240]
-DAILY_WIDTHS = [95, 120, 120, 110, 100, 135, 95, 105, 135, 145, 100, 170, 240]
+TRADES_WIDTHS = [150, 95, 80, 70, 70, 95, 110, 100, 100, 110, 150, 240, 110, 240,
+                 60, 220, 125, 130]
+DAILY_WIDTHS = [95, 120, 120, 110, 100, 135, 95, 105, 135, 145, 100, 170, 240, 125]
 SUMMARY_WIDTHS = [190, 130, 380]
-RULES_LOG_WIDTHS = [150, 170, 340, 260]
+RULES_LOG_WIDTHS = [150, 170, 340, 260, 60, 220, 125, 130]
 CONFIG_WIDTHS = [170, 150, 260]
+BOOKS_WIDTHS = [60, 165, 150, 100, 110, 90, 90, 90, 90, 80, 115, 125, 110, 110]
 
 SPY_CLOSE_NOTE = (
     "SPY Close is typed in by the agent each day from its own price source. "
     "It is deliberately not a GOOGLEFINANCE formula, so the agent controls "
     "where the number comes from and the benchmark cannot silently change."
+)
+
+BOOKS_NOTE = (
+    "Blank cells here are the numbers the sheet cannot work out on its own yet. "
+    "Equity, Max DD and Missed Ticks have to be written in by the agent, because "
+    "the other tabs hold one running account, not five separate equity curves. "
+    "Return % and Alpha are live formulas and fill themselves in the moment "
+    "Equity has a number in it."
 )
 
 CONFIG_NOTE = (
@@ -152,6 +209,13 @@ TABS = [
         "headers": CONFIG_HEADERS,
         "rows": 30,
         "widths": CONFIG_WIDTHS,
+    },
+    {
+        "id": 5,
+        "title": "Books",
+        "headers": BOOKS_HEADERS,
+        "rows": 20,
+        "widths": BOOKS_WIDTHS,
     },
 ]
 
@@ -321,6 +385,55 @@ def summary_rows():
     ]
 
 
+def books_rows():
+    """One row per book, mostly live formulas that slice the other tabs by book.
+
+    Every fill on the Trades tab and every line on the Rules Log now carries the
+    book that made it, so the counting can be left to the spreadsheet. The
+    columns those formulas read:
+
+      Trades     H Commission, O Book, Q Model Cost USD
+      Rules Log  B Rule, E Book, G Model Cost USD
+
+    Books tab column letters:
+      A Book, B Strategy, C Model, D Capital, E Equity, F Return %, G SPY %,
+      H Alpha, I Max DD, J Trades, K Commissions, L Model Cost USD,
+      M Rule Triggers, N Missed Ticks.
+
+    Equity, Max DD and Missed Ticks are left blank on purpose. The Daily tab
+    tracks the one paper account, not a separate equity curve per book, so
+    there is nothing in this sheet to work them out from yet. Return % and
+    Alpha are written as live formulas anyway, so they start working the moment
+    an Equity figure is filled in.
+    """
+    rows = []
+    for offset, (book_id, strategy, model) in enumerate(BOOKS):
+        row = 2 + offset
+        # Return against the book's own starting capital.
+        f = f'=IF(OR($E{row}="",$D{row}="",$D{row}=0),"",$E{row}/$D{row}-1)'
+        # SPY is the same benchmark for all five books, so it is read once off
+        # the Summary tab rather than worked out again per book.
+        g = '=IF(Summary!$B$7="","",Summary!$B$7)'
+        # Alpha: this book\'s return minus what SPY did over the same days.
+        h = f'=IF(OR($F{row}="",$G{row}=""),"",$F{row}-$G{row})'
+        # Fills logged against this book.
+        j = f"=COUNTIFS(Trades!$O$2:$O,$A{row})"
+        # Commission this book paid.
+        k = f"=SUMIFS(Trades!$H$2:$H,Trades!$O$2:$O,$A{row})"
+        # What the model calls cost. Cost can land on either tab, so both are
+        # added: a decision row on the Rules Log, a fill row on Trades.
+        cost = (f"=SUMIFS(Trades!$Q$2:$Q,Trades!$O$2:$O,$A{row})"
+                f"+SUMIFS('Rules Log'!$G$2:$G,'Rules Log'!$E$2:$E,$A{row})")
+        # Guardrails that actually fired. The Rules Log also holds the "decision"
+        # rows, which are judgements rather than a limit biting, so they are left
+        # out of this count.
+        m = (f"=COUNTIFS('Rules Log'!$E$2:$E,$A{row},"
+             f"'Rules Log'!$B$2:$B,\"<>decision\")")
+        rows.append([book_id, strategy, model, BOOK_CAPITAL, "", f, g, h, "",
+                     j, k, cost, m, ""])
+    return rows
+
+
 def config_rows():
     """Config keys, deliberately left with no values yet."""
     return [
@@ -370,6 +483,8 @@ def write_values(session, spreadsheet_id):
         {"range": "Rules Log!A1", "values": [RULES_LOG_HEADERS]},
         {"range": "Config!A1", "values": [CONFIG_HEADERS]},
         {"range": "Config!A2", "values": config_rows()},
+        {"range": "Books!A1", "values": [BOOKS_HEADERS]},
+        {"range": "Books!A2", "values": books_rows()},
     ]
     api(
         session,
@@ -481,6 +596,7 @@ def format_spreadsheet(session, spreadsheet_id):
         number_format_request(0, 4, 4, FMT_WHOLE),  # Qty
         number_format_request(0, 5, 7, FMT_MONEY),  # Fill Price, Notional, Commission
         number_format_request(0, 12, 12, FMT_MONEY),  # Realised P&L
+        number_format_request(0, 16, 16, FMT_MONEY_FINE),  # Model Cost USD
     ]
 
     # Daily tab number formats.
@@ -491,6 +607,7 @@ def format_spreadsheet(session, spreadsheet_id):
         number_format_request(1, 6, 6, FMT_MONEY),  # SPY Close
         number_format_request(1, 7, 9, FMT_PERCENT),  # SPY daily, SPY cum, Alpha
         number_format_request(1, 10, 10, FMT_WHOLE),  # Trades Count
+        number_format_request(1, 13, 13, FMT_MONEY_FINE),  # Model Cost USD
     ]
 
     # Summary values are one per row, so each cell gets its own format.
@@ -514,12 +631,24 @@ def format_spreadsheet(session, spreadsheet_id):
             number_format_request(2, 1, 1, fmt, first_row=row_index, last_row=row_index + 1)
         )
 
-    # Rules Log timestamps.
+    # Rules Log timestamps and model cost.
     requests.append(number_format_request(3, 0, 0, FMT_DATETIME))
+    requests.append(number_format_request(3, 6, 6, FMT_MONEY_FINE))  # Model Cost USD
 
-    # Notes that explain the two things a reader would otherwise guess wrong.
+    # Books tab number formats.
+    requests += [
+        number_format_request(5, 3, 4, FMT_MONEY),  # Capital, Equity
+        number_format_request(5, 5, 8, FMT_PERCENT),  # Return %, SPY %, Alpha, Max DD
+        number_format_request(5, 9, 9, FMT_WHOLE),  # Trades
+        number_format_request(5, 10, 10, FMT_MONEY),  # Commissions
+        number_format_request(5, 11, 11, FMT_MONEY_FINE),  # Model Cost USD
+        number_format_request(5, 12, 13, FMT_WHOLE),  # Rule Triggers, Missed Ticks
+    ]
+
+    # Notes that explain the three things a reader would otherwise guess wrong.
     requests.append(note_request(1, 0, 6, SPY_CLOSE_NOTE))  # Daily, SPY Close header
     requests.append(note_request(4, 0, 0, CONFIG_NOTE))  # Config, first header cell
+    requests.append(note_request(5, 0, 4, BOOKS_NOTE))  # Books, Equity header
 
     api(
         session,
