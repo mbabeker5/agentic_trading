@@ -183,9 +183,32 @@ whole of how running the migration again does nothing.
 
 ## How a caller switches from ledger_writer to db
 
-Nothing has been switched over yet. `agent/loop.py`, `agent/watchdog.py`,
-`agent/preflight.py` and the rest still write where they always did, and wiring
-them up is the next job. This is what it looks like when they are.
+Switched over on 2026-09-06. `agent/loop.py`, `agent/alerts.py`,
+`agent/preflight.py` and `agent/watchdog.py` all write here first now, and to
+the Google Sheet second where they wrote to it before. The Sheet writes stay
+until `ledger/sync_sheet.py` takes that job over at 16:35, because two records
+for a fortnight is cheaper than a gap of one.
+
+What each of them writes:
+
+| Caller | Table | When |
+|---|---|---|
+| `agent/loop.py` | `ticks` | one row per book per tick, whether or not anything happened |
+| `agent/loop.py` | `decisions` | every judgement, and every guardrail firing as a row marked `rejected` with the rule's own id in `reject_reason` |
+| `agent/loop.py` | `orders` | every order sent, and every order a dry run only worked out |
+| `agent/loop.py` | `fills` | every execution read back off the broker, deduplicated on IBKR's own execution id |
+| `agent/loop.py` | `position_snapshots` | what each book held at each tick, with the stop and the target on it |
+| `agent/alerts.py` | `alerts` | every alert and which channels actually delivered it |
+| `agent/preflight.py` | `preflight_results` | one row per morning check per day, updated if the checks run again |
+| `agent/watchdog.py` | `watchdog_checks` | one row per check per run, piling up all day |
+
+Every one of those calls is wrapped so a database problem is complained about
+once and the run carries on. `db_call()` in `agent/loop.py` is that wrapper, and
+`tests/test_db_wiring.py` is where it is proved: a database that will not answer
+costs a row, never a tick. The loop is what holds the risk limits, so recording
+what it did must never be the thing that stops it doing it.
+
+This is what the change looks like at one call site.
 
 Today, in `agent/loop.py`:
 

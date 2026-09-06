@@ -120,6 +120,14 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import alerts as alerts_module  # noqa: E402
+
+# SQLite is the system of record (docs/DATA.md), so every check lands in the
+# preflight_results table as well as in the day's JSON report. Optional, because
+# a database that cannot be opened is no reason to skip the 9 AM checks.
+try:
+    import db as db_module  # noqa: E402
+except Exception:           # noqa: BLE001
+    db_module = None        # type: ignore[assignment]
 import mcp_client as mcp  # noqa: E402
 import watchdog as wd  # noqa: E402
 from margin_regime import (  # noqa: E402
@@ -837,6 +845,32 @@ def write_no_trade_today(failed: list[str], now: datetime) -> Path:
     return path
 
 
+def record_checks(results, verdict: str, now: datetime) -> int:
+    """Every check into the database, one row per check per day. Returns how many.
+
+    Written for a dry run too. A rehearsal nobody wrote down is worth very
+    little, and record_preflight updates the row rather than adding a second
+    opinion, so running the checks twice in a morning leaves one honest row.
+
+    Never raises. A pre-flight that fell over because it could not write down
+    its own answer would be a worse morning than one with no database.
+    """
+    if db_module is None:
+        return 0
+    written = 0
+    for result in results:
+        try:
+            db_module.record_preflight(
+                check_name=result.name, passed=result.passed,
+                detail={"detail": result.detail, "facts": result.facts},
+                verdict=verdict, date=now.date(), ts=now)
+            written += 1
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"preflight: could not record {result.name} in the database: "
+                  f"{exc!r}", file=sys.stderr)
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="The 9 AM check that says whether today is a trading day. "
@@ -896,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     path = report_path(now, args.dry_run)
     path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    record_checks(results, verdict, now)
     print(f"\nverdict: {verdict}")
     print(f"report: {path}")
 

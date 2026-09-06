@@ -74,6 +74,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from paths import output_dir, secrets_dir  # noqa: E402
 
+# SQLite is the system of record, so every alert lands in the alerts table as
+# well as in output/alerts.log. This is the one funnel every alerting caller in
+# the project already goes through, which is why the row is written here rather
+# than in each of them: the loop, the watchdog, the pre-flight, the kill switch
+# and the dead man's handle all call alert(), and none of them has to remember.
+# Optional, because an alert that cannot be recorded is still worth sending.
+try:
+    import db as _db                        # noqa: E402
+except Exception:                           # noqa: BLE001
+    _db = None                              # type: ignore[assignment]
+
 #: The Slack account the alerts go to. Looked up by email, once, then cached.
 SLACK_EMAIL = "mo@thetaste.ai"
 
@@ -367,6 +378,19 @@ def alert(level: str, title: str, body: str) -> list[str]:
     detail = body
     if problems:
         detail = f"{body} [channels that failed: {'; '.join(problems)}]"
+
+    # The database first, because it is the system of record and it is a file on
+    # the same disk. It never raises for the ordinary reasons and this swallows
+    # the rest, because an alert that cannot be recorded is still worth sending
+    # and the caller is usually in the middle of handling a real problem.
+    if _db is not None:
+        try:
+            _db.record_alert(level=level, title=title, body=detail,
+                             channels=list(delivered))
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"alerts: could not record the alert in the database: {exc!r}",
+                  file=sys.stderr)
+
     try:
         append_log(level, title, detail, delivered)
         delivered.append("log")

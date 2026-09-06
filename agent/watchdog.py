@@ -102,6 +102,17 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import alerts as alerts_module  # noqa: E402
+
+# SQLite is the system of record (docs/DATA.md), so every look the watchdog
+# takes lands in the watchdog_checks table as well as in output/watchdog.log.
+# These pile up all day on purpose: the question worth asking of the watchdog is
+# almost always "when did this start failing", and that needs the whole run of
+# checks rather than the most recent verdict. Optional, because a database that
+# cannot be opened is no reason to stop watching IB Gateway.
+try:
+    import db as db_module  # noqa: E402
+except Exception:           # noqa: BLE001
+    db_module = None        # type: ignore[assignment]
 from paths import agent_dir, config_dir, output_dir, project_root  # noqa: E402
 
 EASTERN = ZoneInfo("America/New_York")
@@ -1000,6 +1011,40 @@ def perform(actions: list[Action], allow_restart: bool) -> tuple[list[str], list
     return done, happened
 
 
+def record_checks(checks: dict, now: datetime, done: list[str] | None = None) -> int:
+    """Every check into the database, one row each, every run. Returns how many.
+
+    Unlike the pre-flight these are not updated in place. The whole run of them
+    is the record, because "when did this start failing" cannot be answered from
+    the latest verdict alone.
+
+    What was done about it goes on the row too, so a Gateway restart is visible
+    next to the check that asked for it rather than only in a log file.
+
+    Never raises. A watchdog that fell over writing down its own answer would be
+    worse than no watchdog.
+    """
+    if db_module is None:
+        return 0
+    action = "; ".join(done or []) or None
+    written = 0
+    for name in CHECK_ORDER:
+        check = checks.get(name)
+        if check is None:
+            continue
+        try:
+            db_module.record_watchdog(
+                check_name=name,
+                ok=(None if check.skipped else check.ok),
+                detail=(f"skipped: {check.detail}" if check.skipped else check.detail),
+                action_taken=action, ts=now)
+            written += 1
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"watchdog: could not record {name} in the database: {exc!r}",
+                  file=sys.stderr)
+    return written
+
+
 def append_run_log(line: str) -> None:
     try:
         with (output_dir() / "watchdog.log").open("a", encoding="utf-8") as handle:
@@ -1067,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
     for line in lines:
         print(f"  {line}")
     save_state(update_state(checks, now, state, happened))
+    record_checks(checks, now, lines)
 
     failed = [name for name, check in checks.items() if not check.ok and not check.skipped]
     append_run_log(f"{now:%Y-%m-%d %H:%M:%S %Z} | {summarise(checks)} | "

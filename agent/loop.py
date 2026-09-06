@@ -121,6 +121,29 @@ except Exception as exc:                    # noqa: BLE001
     preopen_mod = None                      # type: ignore[assignment]
     PREOPEN_ERROR = f"{type(exc).__name__}: {exc}"
 
+# SQLite is the system of record and the Google Sheet is a nightly view of it,
+# so every writer in this file goes to agent/db.py first and to the Sheet second.
+# See docs/DATA.md. Optional in exactly the same way as the modules above,
+# because a database that cannot be opened must not cost a tick: the loop is what
+# holds the risk limits, and losing the record of a tick is a smaller problem
+# than losing the management of a position.
+try:
+    import db as db_mod                       # noqa: E402
+    DB_ERROR: str | None = None
+except Exception as exc:                      # noqa: BLE001
+    db_mod = None                             # type: ignore[assignment]
+    DB_ERROR = f"{type(exc).__name__}: {exc}"
+
+# How Mo hears about anything worth waking him for. Optional for the same
+# reason: an alert that cannot be sent is a bad day, and a tick that stopped
+# because an alert could not be sent is a worse one.
+try:
+    import alerts as alerts_mod               # noqa: E402
+    ALERTS_ERROR: str | None = None
+except Exception as exc:                      # noqa: BLE001
+    alerts_mod = None                         # type: ignore[assignment]
+    ALERTS_ERROR = f"{type(exc).__name__}: {exc}"
+
 LIVE_ENV_VAR = "AGENTIC_TRADING_LIVE_ORDERS"
 PAPER_ACCOUNT_PREFIX = "DU"
 LIVE_MODES = ("tiny", "full")
@@ -152,6 +175,52 @@ def output_dir() -> Path:
     path = project_root() / "output"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# ------------------------------------------------------------ the written record
+
+#: Database problems already complained about in this process, so a tick that
+#: writes a dozen rows does not print the same sentence a dozen times. Twelve
+#: copies of one complaint is how a real message gets lost.
+_DB_TROUBLE: set[str] = set()
+
+
+def _db_trouble(message: str) -> None:
+    """Say a database write did not happen, once per process per problem."""
+    if message in _DB_TROUBLE:
+        return
+    _DB_TROUBLE.add(message)
+    print(f"loop: {message}. The tick carries on and the Sheet still has it.",
+          file=sys.stderr)
+
+
+def db_call(name: str, *args, **kwargs) -> Any:
+    """Call one agent/db.py writer, and never let it stop a tick.
+
+    SQLite is the system of record since 2026-09-06 and the Google Sheet is a
+    nightly view of it (docs/DATA.md), so every writer in this file comes here
+    first and writes to the Sheet second. The Sheet writes stay for now, until
+    the nightly sync in ledger/sync_sheet.py takes over.
+
+    agent/db.py already turns an ordinary database error into a warning and a
+    None, on purpose. This catches everything else: a module that would not
+    import, a schema nobody migrated, a bad argument. Recording what happened
+    must never be the thing that stops the loop, because the loop is what holds
+    the risk limits.
+    """
+    if db_mod is None:
+        _db_trouble(f"agent/db.py could not be imported ({DB_ERROR}), so nothing "
+                    "is being written to the database")
+        return None
+    writer = getattr(db_mod, name, None)
+    if writer is None:
+        _db_trouble(f"agent/db.py has no {name}(), so that row is not being written")
+        return None
+    try:
+        return writer(*args, **kwargs)
+    except Exception as exc:                 # noqa: BLE001
+        _db_trouble(f"db.{name}() raised {type(exc).__name__}: {exc}")
+        return None
 
 
 #: Touched at the end of every tick that got all the way through. The dead man's
@@ -1094,9 +1163,21 @@ class BookTick:
     def record(self, state: bs.BookState, symbol: str, decision: str, rationale: str,
                model: str | None = None, cost: Any = None,
                prompt_hash: str = "") -> None:
-        """Write one judgement to the book's file and to the Rules Log."""
+        """Write one judgement to the book's file, the database and the Sheet.
+
+        The database first, because it is the system of record and it is a file
+        on the same disk. The Sheet second, because it is a network call and it
+        is a nightly view of the database rather than the truth. See
+        docs/DATA.md. The Sheet write stays until ledger/sync_sheet.py takes
+        that job over.
+        """
         state.note_decision(self.now.isoformat(), symbol, decision, rationale,
                             phase=self.phase, rules_commit=self.rules)
+        db_call("record_decision", ts=self.now, book_id=self.book.book_id,
+                shape=self.phase, rules_commit=self.rules, symbol=symbol or None,
+                action=decision, rationale=rationale, prompt_hash=prompt_hash or None,
+                model=model if model is not None else (self.book.model or "none"),
+                cost_usd=(None if cost is None else _number(cost)))
         ledger_writer.log_decision(
             self.now, symbol, decision, f"{rationale} [rules {self.rules}]",
             mode=str(self.book.mode), book_id=self.book.book_id,
@@ -1105,7 +1186,18 @@ class BookTick:
             dry_run=not self.write_ledger)
 
     def rule(self, rule_id: str, detail: str, action: str) -> None:
-        """Write one guardrail firing to the Rules Log, tagged with the book."""
+        """Write one guardrail firing to the database and to the Rules Log.
+
+        In the database a guardrail firing is a decisions row marked rejected
+        with the rule's own id in reject_reason, which is what db.rules_log_rows
+        reads back out as the Rules Log and what the month end count of which
+        limit actually bit is built from.
+        """
+        db_call("record_decision", ts=self.now, book_id=self.book.book_id,
+                shape=self.phase, rules_commit=self.rules,
+                symbol=_symbol_in(detail), action=action, rationale=detail,
+                rejected=True, reject_reason=rule_id,
+                model=self.book.model or "none")
         ledger_writer.log_rule(
             self.now, rule_id, f"{detail} [rules {self.rules}]", action,
             book_id=self.book.book_id, dry_run=not self.write_ledger)
@@ -1149,6 +1241,21 @@ def put_the_pick_down(tick: BookTick, state: bs.BookState, symbol: str,
     tick.note(f"{symbol}: refused by {settled}, and that answer cannot change "
               "again today, so this pick is put down rather than worked out "
               "again on every tick")
+
+
+def _symbol_in(detail: str) -> str | None:
+    """The ticker a guardrail line starts with, when it starts with one.
+
+    Every rule() call in this file writes "SYMBOL: what happened", so the name
+    is there to be lifted into its own column rather than left buried in a
+    sentence. A line that does not begin that way, such as a daily summary,
+    gets None, which is the honest answer.
+    """
+    head = str(detail or "").split(":", 1)[0].strip()
+    if head and 1 <= len(head) <= 6 and head.replace(".", "").isalnum() \
+            and head.upper() == head:
+        return head
+    return None
 
 
 def describe(intent: gr.OrderIntent) -> str:
@@ -1230,6 +1337,11 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
         tick.record(state, intent.symbol, f"would place {summary}",
                     f"{verdict}. {because}", model=model, cost=cost,
                     prompt_hash=prompt_hash)
+        # The order that was not sent is written down too. A month of the orders
+        # a dry run would have sent is the whole of what a dry run is for, and
+        # it is worthless if it only lives in a log file. See docs/DATA.md.
+        record_order_row(tick, guard, intent, stop=stop,
+                         status=("refused" if not decision.allowed else "dry_run"))
         for rule_id, reason in zip(decision.rule_ids, decision.reasons):
             tick.rule(rule_id, f"{intent.symbol}: {reason}", "the order was not placed")
         return decision
@@ -1242,6 +1354,27 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
                 f"{result.get('confirmed_by')}",
                 model=model, cost=cost, prompt_hash=prompt_hash)
     return decision
+
+
+def record_order_row(tick: BookTick, guard: gr.Guardrails, intent: gr.OrderIntent,
+                     stop: float = 0.0, status: str = "dry_run",
+                     broker_order_id: Any = None,
+                     oca_group: str | None = None) -> int | None:
+    """One order into the database, sent or only worked out. Returns its row id.
+
+    Written in dry run too, and that is the point rather than an oversight: all
+    five books are on dry run, so the orders they did not send are the entire
+    result so far. status says which this was, one of dry_run, refused,
+    submitted, filled, cancelled or rejected.
+    """
+    return db_call(
+        "record_order", ts=tick.now, book_id=tick.book.book_id,
+        order_ref=guard.order_ref or tick.tag, broker_order_id=broker_order_id,
+        oca_group=oca_group, symbol=intent.symbol, side=intent.side,
+        qty=int(intent.qty),
+        order_type=("LMT" if intent.limit_price else "MKT"),
+        limit_price=intent.limit_price, stop_price=(_number(stop) or None),
+        tif="DAY", purpose=intent.purpose, status=status)
 
 
 def order_dict(intent: gr.OrderIntent) -> dict:
@@ -1379,6 +1512,14 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     filled = _number(result.get("filled_qty"))
     price = _number(result.get("avg_fill_price"))
 
+    # The order itself, into the database, with whatever the broker called it.
+    # The row id comes back so a fill can point at the order that made it.
+    row_id = record_order_row(
+        tick, guard, intent, stop=stop, broker_order_id=result.get("order_id"),
+        oca_group=result.get("oca_group"),
+        status=("filled" if filled > 0 else
+                "submitted" if result.get("working") else "rejected"))
+
     if filled > 0:
         tick.say(f"filled {filled:g} {intent.symbol} at {price:.4f}, confirmed by "
                  f"{result.get('confirmed_by')}")
@@ -1411,7 +1552,7 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
             "symbol": intent.symbol, "side": intent.side, "qty": int(intent.qty),
             "remaining": int(intent.qty), "limit_price": intent.limit_price,
             "purpose": intent.purpose, "placed_at": tick.now.isoformat(),
-            "order_ref": guard.order_ref,
+            "order_ref": guard.order_ref, "db_order_id": row_id,
         }
         tick.say(f"order {order_id} is working, {intent.qty} {intent.symbol} unfilled")
     else:
@@ -3287,11 +3428,51 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     state.tick_count += 1
     state.last_tick = now.isoformat()
     state.last_phase = phase
+
+    # The attendance register, and the picture of what this book held while it
+    # was awake. Both go to the database, which is the system of record: a tick
+    # with no row is a tick that never ran, and that is the only place a missed
+    # tick can be counted from.
+    db_call("record_tick", ts=now, book_id=book.book_id, phase=phase,
+            mode=str(book.mode), rules_commit=rules,
+            outcome=("halted" if state.halted else "ok"),
+            notes="; ".join(tick.notes[:5]) or None)
+    snapshot_book_positions(tick, state)
+
     path = bs.save_state(state)
     if not quiet:
         print(f"  {tick.would_be_orders} would be orders, {tick.approved} allowed, "
               f"{tick.refused} refused, {tick.sent} sent | state {path}")
     return tick, state
+
+
+def snapshot_book_positions(tick: BookTick, state: bs.BookState) -> None:
+    """What this book was holding at this moment, into the database.
+
+    Every tick, so a day can be replayed afterwards rather than guessed at from
+    the fills. The stop and the target go in with it, which is what would make a
+    stop that quietly went missing visible in the history instead of invisible.
+
+    A flat book writes nothing and that is correct: the snapshot for a book
+    holding nothing is the absence of rows, and the tick row above is what
+    proves the loop was awake at the time.
+    """
+    rows = []
+    for symbol, position in state.all_positions().items():
+        rows.append({
+            "symbol": symbol,
+            "qty": int(round(position.qty)),
+            "avg_cost": round(_number(position.avg_cost), 4),
+            "market_price": position.last_close,
+            "market_value": round(_number(position.market_value), 2),
+            "unrealized_pnl": (
+                round((_number(position.last_close) - _number(position.avg_cost))
+                      * position.qty, 2) if position.last_close else None),
+            "stop": _number(position.stop) or None,
+            "target": _number(position.target) or None,
+        })
+    if rows:
+        db_call("snapshot_positions", rows, ts=tick.now, book_id=tick.book.book_id)
 
 
 # ----------------------------------------------------------------- the driver
