@@ -78,12 +78,16 @@ sweep:
   # Read by agent/sweep_congress.py. None of these are order limits, so the
   # guardrails do not enforce them; they shape the shortlist instead, the same
   # way the scanner block does for the momentum books.
-  sources: [house_stock_watcher, senate_stock_watcher]
-                              # free community mirrors that parse the official
-                              # filings into clean JSON
-  fallback_source: capital_trades
-                              # a website, read only as a cross-check, never
-                              # depended on
+  sources: [house_clerk, senate_efd]
+                              # the official House Clerk filings and the official
+                              # Senate eFD search, parsed directly (2026-09-06).
+                              # Both Stock Watcher datasets are dead (HTTP 403).
+  fallback_source: github_house_feed
+                              # an independent GitHub feed (TattooedHead/
+                              # house-stock-watcher-data) that itself scrapes the
+                              # House Clerk; used only when both official sources
+                              # fail, rows marked degraded. Capitol Trades is
+                              # unreachable and not implemented.
   disclosure_sweep_at: "07:30"  # pull new filings once a morning
   max_candidates: 15          # the shortlist handed to the model is capped here
   purchases_only: true        # sales are not a usable signal
