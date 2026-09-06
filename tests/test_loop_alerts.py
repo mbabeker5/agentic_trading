@@ -245,6 +245,23 @@ def test_a_clean_reconciliation_says_nothing(sent):
     assert sent == []
 
 
+def test_an_orphan_on_its_own_does_not_make_reconciliation_shout(sent):
+    """This account has held an unclaimed SPY share since 2026-09-02.
+
+    So the reconciliation's own verdict is "not ok" on every tick of every day
+    and will stay that way. Shouting about it would be nine identical messages a
+    day saying nothing has changed. report_orphans() says it once instead.
+    """
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=[],
+        lines=("1 share of SPY at the broker belongs to no book.",),
+        orphans=[object()], note="1 problem, with no book to blame")
+    assert outcome.books_agree is True
+
+    loop.alert_on_reconciliation(outcome, at(9, 50), "testhash")
+    assert sent == []
+
+
 def test_the_three_files_that_stop_the_loop_are_each_alerted(sent, tmp_path):
     output = tmp_path / "output"
     for name in ("LOOP_DISABLED", "STOP", "NO_TRADE_TODAY"):
@@ -260,6 +277,86 @@ def test_the_three_files_that_stop_the_loop_are_each_alerted(sent, tmp_path):
 def test_nothing_is_said_when_none_of_the_three_files_is_there(sent, tmp_path):
     loop.alert_on_guard_files(loop.read_guards(tmp_path), at(9, 50))
     assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# A position nobody claims: told about once a day, and never halted on
+# ---------------------------------------------------------------------------
+
+
+class _Orphan:
+    def __init__(self, symbol, expected=False):
+        self.symbol = symbol
+        self.expected = expected
+        self.line = f"{symbol} at the broker belongs to no book."
+
+
+class _Unclaimed:
+    def __init__(self, order_id):
+        self.book_id = None
+        self.order_id = order_id
+        self.line = f"Order {order_id} at the broker carries no book tag."
+
+
+def test_an_orphan_is_told_about_once_and_halts_nobody(sent, monkeypatch):
+    monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=[], orphans=[_Orphan("GHOST")],
+        note="1 problem, with no book to blame")
+
+    assert loop.report_orphans(outcome, at(11, 40), "testhash", False) == 1
+    assert titles(sent) == ["GHOST at the broker belongs to no book"]
+    assert outcome.books_agree is True, "an orphan is not a book being wrong"
+
+    for hour in (12, 14, 15):
+        loop.report_orphans(outcome, at(hour, 40), "testhash", False)
+    assert len(sent) == 1, "it is the same fact at 11:40 and at 15:40"
+
+
+def test_an_orphan_somebody_has_already_looked_at_is_not_alerted(sent, monkeypatch):
+    monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=[],
+        orphans=[_Orphan("SPY", expected=True)],
+        note="1 problem, with no book to blame")
+
+    assert loop.report_orphans(outcome, at(9, 40), "testhash", False) == 1
+    assert sent == [], (
+        "output/expected_orphans.json is somebody saying they have looked at it")
+
+
+def test_the_alert_says_how_to_stop_it_being_said_again(sent, monkeypatch):
+    monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
+    loop.report_orphans(
+        loop.ReconcileOutcome(available=True, ok=False, orphans=[_Orphan("SPY")]),
+        at(9, 40), "testhash", False)
+    body = sent[0][2]
+    assert "expected_orphans.json" in body
+    assert '["SPY"]' in body
+    assert "Nothing is managing it" in body
+
+
+def test_an_order_nobody_tagged_is_the_same_situation(sent, monkeypatch):
+    monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=[], unclaimed=[_Unclaimed("4")],
+        note="1 problem, with no book to blame")
+
+    assert loop.report_orphans(outcome, at(9, 40), "testhash", False) == 1
+    assert titles(sent) == ["Order 4 at the broker belongs to no book"]
+    assert outcome.books_agree is True
+
+
+def test_a_book_that_is_actually_out_of_step_still_holds_the_books_apart():
+    """books_agree is narrower than ok, and this is where the two differ."""
+    orphan_only = loop.ReconcileOutcome(available=True, ok=False, books_to_halt=[],
+                                        orphans=[_Orphan("SPY")])
+    real = loop.ReconcileOutcome(available=True, ok=False, books_to_halt=["A"])
+    blind = loop.ReconcileOutcome(available=False, ok=False, books_to_halt=["A"])
+
+    assert orphan_only.books_agree is True
+    assert real.books_agree is False
+    assert blind.books_agree is False, "nobody could ask, so nobody may say yes"
 
 
 def test_falling_back_to_the_rules_because_no_model_answered_is_alerted(sent):

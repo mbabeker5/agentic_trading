@@ -123,7 +123,13 @@ If `agent/reconcile.py` cannot be imported at all, every book is halted for that
 
 ### Positions nobody claims
 
-The paper account holds one share of SPY from the manual test on 2026-09-02, and there is a working order id 4 with no tag on it from the same session. Neither belongs to a book, so neither halts one, but both are reported on every tick. To stop that noise once someone has looked at them, write `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/expected_orphans.json` as either
+The paper account holds one share of SPY from the manual test on 2026-09-02, and there is a working order id 4 with no tag on it from the same session. Neither belongs to a book.
+
+**Neither halts one, and that is a decision rather than a gap.** Halting on an orphan would mean halting all five books on every tick of every day for the rest of the month over a share nobody is managing and nobody is at risk from, and a safety rule that fires every five minutes forever is not a safety rule. What the loop does instead is write a line into the record every tick, so a reader can see it was noticed rather than missed, and tell Mo once per name per day. An orphan named in `output/expected_orphans.json` gets the line and no alert, because somebody has already looked at that one and said so.
+
+This is also why the loop reads `books_agree` rather than reconciliation's own `ok`. The unclaimed SPY share makes `ok` false on every tick of every day and will keep doing so. Reading that as "the books are wrong" would mean no reconciliation halt could ever be lifted, because the condition for lifting one would never be true again.
+
+To stop the alert once someone has looked at them, write `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/expected_orphans.json` as either
 
 ```json
 ["SPY"]

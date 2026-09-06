@@ -734,14 +734,39 @@ def close_positions_flattened_by_the_kill_switch(
 
 @dataclass
 class ReconcileOutcome:
-    """What the reconciliation said, in the shape this loop acts on."""
+    """What the reconciliation said, in the shape this loop acts on.
+
+    ok is the reconciliation's own verdict: nothing wrong at all, orphans
+    included. books_agree is narrower and is the one the loop acts on, because
+    those are two different questions:
+
+        ok           is anything about this account unexplained?
+        books_agree  is any BOOK out of step with the broker?
+
+    The paper account holds one share of SPY nobody bought and a working order
+    with no tag on it, both left over from a manual test on 2026-09-02. Neither
+    belongs to a book and neither ever will, so ok is False every single tick and
+    will stay False. Reading that as "the books are wrong" would mean no
+    reconciliation halt could ever be lifted, and no book could ever be told the
+    disagreement it was halted for has gone away.
+    """
 
     available: bool
     ok: bool
     books_to_halt: list = field(default_factory=list)
     lines: list = field(default_factory=list)
     orphans: list = field(default_factory=list)
+    unclaimed: list = field(default_factory=list)
     note: str = ""
+
+    @property
+    def books_agree(self) -> bool:
+        """True when no book is out of step with the broker.
+
+        An orphan position and an order nobody tagged are both reported and both
+        alerted, and neither of them is a book being wrong about what it holds.
+        """
+        return self.available and not self.books_to_halt
 
 
 def expected_orphans(root: Path | None = None) -> Any:
@@ -829,13 +854,18 @@ def run_reconciliation(broker_positions: list, broker_open_orders: list,
     halt = [str(b) for b in (getattr(report, "books_to_halt", ()) or ())]
     lines = list(getattr(report, "lines", ()) or ())
     found = list(getattr(report, "orphans", ()) or ())
+    unclaimed = [m for m in (getattr(report, "mismatches", ()) or ())
+                 if getattr(m, "book_id", None) is None]
     note = str(getattr(report, "summary", "")) or (
         "everything matched" if ok else "the books and the broker disagree")
-    if not ok and not halt and not found:
-        # It said no but named no book, so the safe reading is all of them.
+    if not ok and not halt and not found and not unclaimed:
+        # It said no, named no book, found no orphan and named no untagged
+        # order, so nothing here explains the no and the safe reading is that it
+        # is about all of them.
         halt = list(books_state)
     return ReconcileOutcome(available=True, ok=ok, books_to_halt=halt,
-                            lines=lines, orphans=found, note=note)
+                            lines=lines, orphans=found, unclaimed=unclaimed,
+                            note=note)
 
 
 # ---------------------------------------------------------- the day trade count
@@ -4029,9 +4059,13 @@ def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
     to a log file and to a spreadsheet and to nobody. One alert per tick that
     finds one, quiet for half an hour afterwards, because reconciliation runs
     every five minutes and the same disagreement is still there at 09:55.
+
+    Only a BOOK being out of step is shouted about here. This account has held
+    an unclaimed share of SPY since a manual test on 2026-09-02, so the
+    reconciliation's own verdict is "not ok" on every tick of every day and will
+    stay that way. Alerting on that would be nine identical messages a day
+    saying nothing has changed. report_orphans() says that once a day instead.
     """
-    if outcome.ok:
-        return
     if not outcome.available:
         raise_alert(
             "error", "Reconciliation could not run at all",
@@ -4039,16 +4073,90 @@ def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
             "the designed answer: a missing referee means no.",
             key="reconcile:unavailable", now=now)
         return
+    if outcome.books_agree:
+        return
     lines = "\n".join(f"- {line}" for line in outcome.lines[:6])
     raise_alert(
         "error", f"The books and the broker disagree: {outcome.note}",
         f"{outcome.note}\n\n{lines}\n\n"
-        + (f"Halted: {', '.join(outcome.books_to_halt)}. Each of them opens "
-           "nothing more today and may still close what it holds.\n"
-           if outcome.books_to_halt else "")
-        + f"Rules {rules}, {now:%Y-%m-%d %H:%M} New York.",
-        key="reconcile:" + ",".join(sorted(outcome.books_to_halt)) or "reconcile",
+        f"Halted: {', '.join(outcome.books_to_halt)}. Each of them opens nothing "
+        "more today and may still close what it holds.\n"
+        f"Rules {rules}, {now:%Y-%m-%d %H:%M} New York.",
+        key="reconcile:" + ",".join(sorted(outcome.books_to_halt)),
         now=now)
+
+
+def report_orphans(outcome: ReconcileOutcome, now: datetime, rules: str,
+                   write_ledger: bool) -> int:
+    """Say who is holding what nobody claims. Halt nobody. Returns how many.
+
+    THE DECISION HERE, because it looks like the loop being lax and it is not.
+    An orphan NEVER halts a book. The paper account holds one share of SPY
+    bought by hand on 2026-09-02 and a working order with no tag on it from the
+    same session. Neither belongs to a book and neither ever will. Halting on an
+    orphan would mean halting all five books on every tick of every day for the
+    rest of the month, over a share nobody is managing and nobody is at risk
+    from, and a safety rule that fires every five minutes forever is not a
+    safety rule, it is noise with a halt attached.
+
+    What it does instead is tell somebody, once per name per day, and write a
+    line into the record every tick so a reader can see it was noticed rather
+    than missed. An orphan named in output/expected_orphans.json gets the line
+    and no alert, because somebody has already looked at that one and said so.
+
+    An order at the broker with no book tag on it is the same situation in a
+    different shape and is handled the same way.
+    """
+    said = 0
+    for orphan in outcome.orphans:
+        symbol = str(getattr(orphan, "symbol", "") or "").upper()
+        expected = bool(getattr(orphan, "expected", False))
+        line = str(getattr(orphan, "line", "")) or f"{symbol} belongs to no book"
+        ledger_writer.log_rule(
+            now, "orphan_position", f"{symbol}: {line} [rules {rules}]",
+            "written down. No book is halted for a position no book claims.",
+            dry_run=not write_ledger)
+        db_call("record_decision", ts=now, shape="reconcile", rules_commit=rules,
+                symbol=symbol or None, action="orphan position", rationale=line,
+                rejected=True, reject_reason="orphan_position")
+        said += 1
+        if expected:
+            print(f"  orphan {symbol}: known about and forgiven in "
+                  "output/expected_orphans.json")
+            continue
+        print(f"  orphan {symbol}: {line}")
+        raise_alert(
+            "warn", f"{symbol} at the broker belongs to no book",
+            f"{line}\n\nNo book is halted for it: a position no book claims is "
+            "not a book being wrong about what it holds, and this account has "
+            "held an unclaimed share of SPY since a manual test on 2026-09-02. "
+            "Nothing is managing it, so nothing will close it either.\n\n"
+            "To stop this being said again, look at it and then write it into "
+            f"output/expected_orphans.json as [\"{symbol}\"] to forgive any "
+            f"quantity, or {{\"{symbol}\": N}} to forgive exactly N shares and "
+            "complain again if the number changes.\n"
+            f"Rules {rules}.",
+            key=f"orphan:{symbol}", now=now,
+            quiet_minutes=ALERT_ONCE_A_DAY_MINUTES)
+
+    for mismatch in outcome.unclaimed:
+        order_id = str(getattr(mismatch, "order_id", "") or "unknown")
+        line = str(getattr(mismatch, "line", "")) or f"order {order_id} has no book"
+        ledger_writer.log_rule(
+            now, "unclaimed_order", f"order {order_id}: {line} [rules {rules}]",
+            "written down. No book is halted for an order no book sent.",
+            dry_run=not write_ledger)
+        said += 1
+        print(f"  unclaimed order {order_id}: {line}")
+        raise_alert(
+            "warn", f"Order {order_id} at the broker belongs to no book",
+            f"{line}\n\nNo book is halted for it. The paper account has carried "
+            "an untagged order since the manual test on 2026-09-02, and an order "
+            "no book sent is not a book being wrong about what it sent.\n"
+            f"Rules {rules}.",
+            key=f"unclaimed_order:{order_id}", now=now,
+            quiet_minutes=ALERT_ONCE_A_DAY_MINUTES)
+    return said
 
 
 def read_broker_facts(broker: broker_mod.Broker,
@@ -4293,6 +4401,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     if halts:
         print(f"  halted this tick: {', '.join(sorted(halts))}")
     alert_on_reconciliation(outcome, now, rules)
+    report_orphans(outcome, now, rules, args.write_ledger)
 
     lines: list[str] = []
     totals = {"would_be": 0, "approved": 0, "refused": 0, "sent": 0, "cost": 0.0,
@@ -4316,7 +4425,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                                halt_reason=halts.get(book.book_id),
                                account_wide=account_wide,
                                broker_orders=broker_orders,
-                               reconciliation_clean=outcome.ok)
+                               reconciliation_clean=outcome.books_agree)
         # Fold this book's own answer back in before the next one takes its
         # turn, so one ticker, one book is a rule about right now rather than a
         # rule about how the day started. Without this, book B is told nobody is

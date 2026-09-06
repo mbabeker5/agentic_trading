@@ -1056,15 +1056,22 @@ def flatten_at_close(day: date_type) -> Scenario:
 def phantom_position(day: date_type) -> Scenario:
     """A holding appears at the broker that the books cannot account for.
 
-    Two shapes, one after the other, because agent/reconcile.py treats them very
-    differently and only one of them halts anybody.
+    Two shapes, one after the other, because they are genuinely different
+    situations and only one of them halts anybody.
 
     10:30  the account holds more OWNED than book A claims. That is a quantity
-           mismatch with book A's name on it, so book A halts and book B does
-           not, which is the behaviour docs/REPLAY.md asks for.
+           mismatch with book A's name on it, so book A halts, book B does not,
+           and Mo is told.
     11:35  the account holds GHOST, which no book has ever claimed. That is an
-           orphan, and an orphan carries no book id, so agent/reconcile.py names
-           nobody to halt and the loop halts nobody.
+           orphan. Nobody halts, and Mo is told once for that name for the day.
+
+    THE SECOND ONE IS A DECISION, not the loop being lax, and this scenario used
+    to assert the opposite. The paper account holds one share of SPY bought by
+    hand on 2026-09-02 and a working order with no tag on it from the same
+    session, and neither will ever belong to a book. Halting on an orphan means
+    halting all five books on every tick of every day for the rest of the month
+    over a share nobody is managing and nobody is at risk from. A safety rule
+    that fires every five minutes forever is not a safety rule.
 
     Crafted bars and no picks, so the only thing that changes across the day is
     the fault. Neither book trades: a scenario about reconciliation should not
@@ -1129,40 +1136,66 @@ def phantom_position(day: date_type) -> Scenario:
             failures.append(f"the account held 100 {ghost} that no book claims and "
                             "reconciliation said everything matched")
 
+        # AN ORPHAN MUST NOT HALT ANYBODY, and that is a decision rather than a
+        # gap. This scenario used to fail unless a book halted for GHOST. The
+        # paper account holds one share of SPY bought by hand on 2026-09-02 and
+        # an untagged order from the same session, and neither will ever belong
+        # to a book, so halting on an orphan means halting all five books on
+        # every tick of every day for the rest of the month over a share nobody
+        # is managing and nobody is at risk from. What the loop does instead is
+        # say so, once per name per day, and write a line every tick.
         halted_late = watch.get("11:40", {})
-        if "B" not in halted_late:
+        if halted_late:
             failures.append(
-                f"the account held 100 {ghost} that no book claims and no book was "
-                "halted for it. agent/reconcile.py gives an orphan no book id, "
-                "agent/loop.py halts only the books reconcile names, and the catch "
-                "all in run_reconciliation() that would halt everybody is skipped "
-                "whenever any orphan was found. So the loop carries on trading "
-                "around a position nobody understands, which is what "
-                "docs/REPLAY.md says it must not do.")
+                f"the account held 100 {ghost} that no book claims and "
+                f"{', '.join(sorted(halted_late))} halted for it. An orphan is not "
+                "a book being wrong about what it holds, and halting on one would "
+                "halt every book every day forever over the SPY share left behind "
+                "by the manual test on 2026-09-02.")
+        else:
+            evidence.append(f"no book was halted for the unclaimed {ghost}, which "
+                            "is the decision: an orphan is told about, not halted "
+                            "on")
 
-        if context.alerts.alerts:
-            evidence.append("alerts raised: "
-                            + ", ".join(a.title for a in context.alerts.alerts))
+        titles = [a.title for a in context.alerts.alerts]
+        if any(ghost in title for title in titles):
+            evidence.append(f"somebody was told about the unclaimed {ghost}: "
+                            + next(t for t in titles if ghost in t))
         else:
             failures.append(
-                "nothing was alerted. agent/loop.py does not import agent/alerts.py "
-                "at all and has no alert call on any path, so a reconciliation halt "
-                "is written to the ledger and to a log file and nobody is told.")
+                f"the account held 100 {ghost} that no book claims and nobody was "
+                f"told. Alerts raised: {titles or 'none'}")
+
+        if any("halted" in title for title in titles):
+            evidence.append("somebody was told about the halt: "
+                            + next(t for t in titles if "halted" in t))
+        else:
+            failures.append(
+                "book A was halted and nobody was told. Alerts raised: "
+                f"{titles or 'none'}")
+
+        said_once = [t for t in titles if ghost in t]
+        if len(said_once) > 1:
+            failures.append(
+                f"the unclaimed {ghost} was alerted {len(said_once)} times in one "
+                "day. Once per name per day is the rule, because it is the same "
+                "fact at 11:40 and at 15:40.")
 
         evidence.append(
-            "worth knowing: the fake broker reports the phantom as a second row for "
-            "the same symbol, and agent/loop.py's read_broker_facts() keys its "
-            "positions by symbol, so the second row replaces the first instead of "
-            "being added to it. The mismatch is still caught, and the share count in "
-            "the message is the phantom's rather than the total.")
+            f"the fake broker reports the phantom as a SECOND ROW for {owned} "
+            "rather than a larger one, and agent/loop.py now keys the account's "
+            "positions by (symbol, account) and adds two rows that land on the "
+            "same key, so the share count in the message is the total rather than "
+            "whichever row happened to be read last.")
 
         return not failures, evidence, failures
 
     return Scenario(
         key="phantom_position",
-        title="A position nobody claims halts the book it belongs to, and alerts",
-        proves="that a quantity mismatch halts only the book it belongs to, that an "
-               "unclaimed holding is noticed, and that somebody is told",
+        title="A mismatch halts one book, an orphan halts nobody, and Mo hears both",
+        proves="that a quantity mismatch halts only the book it belongs to, that a "
+               "holding no book claims halts nobody at all, and that somebody is "
+               "told about each of them",
         day=day, symbols=(ghost,), build_broker=build,
         book_patches=only("A", "B"),
         faults=(
