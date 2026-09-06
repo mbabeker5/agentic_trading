@@ -19,3 +19,4 @@ Jts/
 
 # non-secret settings files that happen to end in .env
 !config/mcp_ibkr.env
+!config/gateway.env
