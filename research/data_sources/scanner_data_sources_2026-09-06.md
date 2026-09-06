@@ -1,0 +1,9 @@
+# Data sources for the 9:30 to 9:35 gap scan (ScannerScout research, 2026-09-06)
+
+Month one: IBKR TWS scanner (real-time once the paper account inherits a live subscription) with Finviz Elite (39.50 USD/month, export endpoint, native gap and relative-volume filters) as a cross-check. Real money: Massive (formerly Polygon) Advanced at 199 USD/month for a full-market snapshot in one call, or Alpaca Algo Trader Plus at 99 USD/month on real SIP.
+
+IBKR scanner facts: 104 scan codes including TOP_PERC_GAIN, HIGH_OPEN_GAP, HOT_BY_VOLUME, HIGH_STVOLUME_5MIN; 87 filter tags including openGapPercAbove, stVolume5MinAbove, marketCapAbove. 50 rows per scan, 10 concurrent scans. Returns ticker names only, no price or volume, so a second quote step is needed. No delayed mode: unsubscribed accounts get empty results with error 162 or 165 in the log, indistinguishable from "nothing gapped". TOP_OPEN_PERC_GAIN returns nothing before regular hours (IBKR staff confirmed), use TOP_PERC_GAIN. volumeAbove is day-cumulative and near zero at 9:31, use stVolume5MinAbove.
+
+Sources: https://www.interactivebrokers.com/docs/tws-api/doc/market-scanner/introduction , https://www.interactivebrokers.com/en/trading/papertrader-delayed-data.php , https://massive.com/pricing , https://docs.alpaca.markets/us/docs/about-market-data-api , https://finviz.com/elite , https://www.tradingview.com/support/solutions/43000674726-why-is-my-account-banned-due-to-suspicious-activity/ , https://databento.com/pricing , https://intrinio.com/pricing , https://www.tiingo.com/pricing , https://eodhd.com/pricing , https://www.ctaplan.com/pricing
+
+Rejected: TradingView (terms forbid automation, 15 min delayed without a session), Trade Ideas (Windows app only, 127 USD), EODHD (15 min delayed), Intrinio (modelled prices, not the tape), Tiingo (IEX only), own SIP feed (39,000 to 71,000 USD per year).
