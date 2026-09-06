@@ -149,7 +149,7 @@ A note on sourcing before you read. The two Zarattini day-trading papers are the
 
 ---
 
-## Part 1. Replications, refutations and follow-ups on the Zarattini ORB papers
+### Part 1. Replications, refutations and follow-ups on the Zarattini ORB papers
 
 ### The two originals, for reference
 
@@ -165,7 +165,7 @@ Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/researc
 
 ---
 
-### C1. Brusco, G. (2026). "Independent replication of the 5-minute Opening Range Breakout on QQQ (Zarattini & Aziz 2023), stress-tested for execution costs." Public GitHub repository with code and results.
+#### C1. Brusco, G. (2026). "Independent replication of the 5-minute Opening Range Breakout on QQQ (Zarattini & Aziz 2023), stress-tested for execution costs." Public GitHub repository with code and results.
 Link: https://github.com/giovannibrusco/zarattini-2023-orb-qqq
 Local file: not downloaded (code repository, not a PDF)
 Status: self-published, not peer reviewed. Exact publication date **still unverified**.
@@ -180,7 +180,7 @@ Status: self-published, not peer reviewed. Exact publication date **still unveri
 
 ---
 
-### C2. Crabel, T. (20 April 2026). "The Evolution of the Opening Range Breakout." Toby Crabel, Substack.
+#### C2. Crabel, T. (20 April 2026). "The Evolution of the Opening Range Breakout." Toby Crabel, Substack.
 Link: https://tobycrabel.substack.com/p/the-evolution-of-the-opening-range
 Local file: not downloaded (paywalled newsletter post, no PDF)
 
@@ -194,7 +194,7 @@ Local file: not downloaded (paywalled newsletter post, no PDF)
 
 ---
 
-### C3. Mesfin, M. (May 2026). "Structural Limits of OHLCV-Based Intraday Signals in MNQ Futures: A Systematic Falsification Study." arXiv:2605.04004.
+#### C3. Mesfin, M. (May 2026). "Structural Limits of OHLCV-Based Intraday Signals in MNQ Futures: A Systematic Falsification Study." arXiv:2605.04004.
 Link: https://arxiv.org/abs/2605.04004
 Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/Mesfin_2026_StructuralLimitsOHLCVIntradaySignals.pdf` (15 pages, verified)
 Status: arXiv preprint by an independent researcher, not peer reviewed.
@@ -209,7 +209,7 @@ Status: arXiv preprint by an independent researcher, not peer reviewed.
 
 ---
 
-### C4. QuantConnect Research (2024). "Opening Range Breakout for Stocks in Play." QuantConnect research notebook and community thread.
+#### C4. QuantConnect Research (2024). "Opening Range Breakout for Stocks in Play." QuantConnect research notebook and community thread.
 Link: https://www.quantconnect.com/research/18444/opening-range-breakout-for-stocks-in-play/
 Discussion thread: https://www.quantconnect.com/forum/discussion/19456/opening-range-break-paper/
 Local file: not downloaded (interactive notebook, no PDF)
@@ -224,7 +224,7 @@ Local file: not downloaded (interactive notebook, no PDF)
 
 ---
 
-### C5. Concretum Research (2026). "ORB Strategy Backtest in Python Using Alpaca (10+ Years of Free Data)." Concretum Group, with companion Google Colab notebook.
+#### C5. Concretum Research (2026). "ORB Strategy Backtest in Python Using Alpaca (10+ Years of Free Data)." Concretum Group, with companion Google Colab notebook.
 Link: https://concretumgroup.com/orb-strategy-backtest-in-python-using-alpaca-10-years-of-free-data/
 Substack version: https://concretumgroup.substack.com/p/how-to-backtest-a-orb-strategy-in
 Local file: not downloaded (web article plus notebook)
@@ -239,7 +239,7 @@ Local file: not downloaded (web article plus notebook)
 
 ---
 
-### C6. Zarattini's later papers, 2024 to 2026 (the Concretum Group research listing)
+#### C6. Zarattini's later papers, 2024 to 2026 (the Concretum Group research listing)
 Link to full listing: https://concretumgroup.com/papers/
 Articles listing: https://concretumgroup.com/articles/
 
@@ -282,7 +282,7 @@ Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/researc
 
 ---
 
-### C7. Reviews and vendor statistics: useful context, not evidence
+#### C7. Reviews and vendor statistics: useful context, not evidence
 
 These are grouped because none is an independent test, and you should not weight them as one.
 
@@ -308,9 +308,9 @@ A commercial site's own dataset, methodology unpublished and unaudited, so treat
 
 ---
 
-## Part 2. Pre-market gap statistics
+### Part 2. Pre-market gap statistics
 
-### C8. Plastun, A., Sibande, X., Gupta, R. and Wohar, M. E. (2020). "Price gap anomaly in the US stock market: The whole story." The North American Journal of Economics and Finance, vol. 52 (article number 101137; exact page range still unverified).
+#### C8. Plastun, A., Sibande, X., Gupta, R. and Wohar, M. E. (2020). "Price gap anomaly in the US stock market: The whole story." The North American Journal of Economics and Finance, vol. 52 (article number 101137; exact page range still unverified).
 Link (published): https://www.sciencedirect.com/science/article/abs/pii/S1062940820300747
 Free working-paper PDF (University of Pretoria): https://repository.up.ac.za/server/api/core/bitstreams/f829a6c1-5762-48b1-89eb-a1ef54125843/content
 SSRN: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3461283
@@ -324,7 +324,7 @@ Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/researc
 
 ---
 
-### C9. Berkman, H., Koch, P. D., Tuttle, L. and Zhang, Y. J. (2012). "Paying Attention: Overnight Returns and the Hidden Cost of Buying at the Open." Journal of Financial and Quantitative Analysis, vol. 47, 715-741.
+#### C9. Berkman, H., Koch, P. D., Tuttle, L. and Zhang, Y. J. (2012). "Paying Attention: Overnight Returns and the Hidden Cost of Buying at the Open." Journal of Financial and Quantitative Analysis, vol. 47, 715-741.
 Link (published): https://www.cambridge.org/core/journals/journal-of-financial-and-quantitative-analysis/article/abs/paying-attention-overnight-returns-and-the-hidden-cost-of-buying-at-the-open/F9AAD159B512C651F09D5D52011D88E0
 SSRN: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1625495
 Local file: **not downloaded**, paywalled. Manual-click links below in the Downloads table.
@@ -339,7 +339,7 @@ Local file: **not downloaded**, paywalled. Manual-click links below in the Downl
 
 ---
 
-### C10. Mesfin, M. (May 2026). "Structural Limits of OHLCV-Based Intraday Signals in MNQ Futures." arXiv:2605.04004. (Cross-referenced from C3, gap-specific findings.)
+#### C10. Mesfin, M. (May 2026). "Structural Limits of OHLCV-Based Intraday Signals in MNQ Futures." arXiv:2605.04004. (Cross-referenced from C3, gap-specific findings.)
 Link: https://arxiv.org/abs/2605.04004
 Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/Mesfin_2026_StructuralLimitsOHLCVIntradaySignals.pdf` (15 pages, verified)
 
@@ -367,9 +367,9 @@ The important fact first: over the past thirty years nearly all US stock market 
 
 ---
 
-## Part 3. The earnings-announcement premium
+### Part 3. The earnings-announcement premium
 
-### C11. Frazzini, A. and Lamont, O. A. (2007). "The Earnings Announcement Premium and Trading Volume." NBER Working Paper 13090.
+#### C11. Frazzini, A. and Lamont, O. A. (2007). "The Earnings Announcement Premium and Trading Volume." NBER Working Paper 13090.
 Link: https://www.nber.org/papers/w13090
 Direct PDF: https://www.nber.org/system/files/working_papers/w13090/w13090.pdf
 Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/FrazziniLamont_2007_EarningsAnnouncementPremium.pdf` (53 pages, verified)
@@ -382,7 +382,7 @@ Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/researc
 
 ---
 
-### C12. Barber, B. M., De George, E. T., Lehavy, R. and Trueman, B. (2013). "The earnings announcement premium around the globe." Journal of Financial Economics, 108(1), 118–138.
+#### C12. Barber, B. M., De George, E. T., Lehavy, R. and Trueman, B. (2013). "The earnings announcement premium around the globe." Journal of Financial Economics, 108(1), 118–138.
 Link (published): https://www.sciencedirect.com/science/article/abs/pii/S0304405X12002188
 SSRN: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1872183
 Free PDF (Tel Aviv University seminar copy): https://en-coller.tau.ac.il/sites/nihul_en.tau.ac.il/files/media_server/Recanati/management/seminars/account/barber.pdf
@@ -396,7 +396,7 @@ Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/researc
 
 ---
 
-### C13. Savor, P. and Wilson, M. (2016). "Earnings Announcements and Systematic Risk." The Journal of Finance, 71(1), 83–138.
+#### C13. Savor, P. and Wilson, M. (2016). "Earnings Announcements and Systematic Risk." The Journal of Finance, 71(1), 83–138.
 Link (published): https://onlinelibrary.wiley.com/doi/abs/10.1111/jofi.12361
 SSRN: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1786308
 Free working-paper PDF (Wharton, December 2011 version): https://faculty.wharton.upenn.edu/wp-content/uploads/2012/04/Draft20111215p_edited.pdf
@@ -412,7 +412,7 @@ Local file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/researc
 
 ---
 
-### C14. Heitz, A., Narayanamoorthy, G. S. and Zekhnini, M. (working paper, most recent version 2025). "The Disappearing Earnings Announcement Premium."
+#### C14. Heitz, A., Narayanamoorthy, G. S. and Zekhnini, M. (working paper, most recent version 2025). "The Disappearing Earnings Announcement Premium."
 Link: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3296537
 Local file: **not downloaded.** SSRN blocks scripted downloads and the University of Toronto seminar copy now returns a server error. Manual-click links in the Downloads table.
 Status: still a working paper as of 2025, **not peer reviewed**. Best Paper Award, Wellington Finance Summit 2019.
@@ -436,7 +436,7 @@ A distinct effect from the premium, and the authors are explicit that it is unre
 
 ---
 
-## Searched for and not found
+### Searched for and not found
 
 - **A peer-reviewed academic replication or refutation of either Zarattini paper.** I searched Semantic Scholar, RePEc, SSRN and general web for papers citing Zarattini and Aziz 2023 or Zarattini, Barbon and Aziz 2024. The citations that exist are practitioner implementations and a machine-learning breakout-identification paper, not replications. As of September 2026 no journal-published independent test appears to exist. Both papers remain unrefereed SSRN working papers themselves.
 - **A Quantpedia article specifically replicating either Zarattini ORB paper.** Quantpedia gave the SPY intraday momentum paper fourth place in its 2025 awards and the VIX ETN paper fifth place in 2026, and it lists an "Earnings Announcement Premium" strategy page, but I found no Quantpedia replication of the ORB papers with their own data.
@@ -451,7 +451,7 @@ A distinct effect from the premium, and the authors are explicit that it is unre
 
 ---
 
-## Downloads
+### Downloads
 
 | Filename | Size | First page verified | Notes |
 |---|---|---|---|
@@ -931,7 +931,7 @@ Also excluded on purpose: Karadas and Schlosky (2024), International Review of E
 
 ---
 
-## Part 3. Insider-trading signals after 2024
+### Part 3. Insider-trading signals after 2024
 
 Part 2 was about politicians. This part is about company insiders, which is the other book: officers, directors and 10% shareholders filing SEC Form 4. The economics are better here. Form 4 has a two business day deadline instead of 45 days, the filings are structured XML rather than scanned PDFs, and the SEC hosts the whole archive for free.
 
