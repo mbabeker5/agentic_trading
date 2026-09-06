@@ -442,11 +442,18 @@ class FakeBroker:
             bucket[str(symbol).upper()] = cleaned
 
     def _first_bar_moment(self) -> datetime | None:
+        """The earliest bar in the fill series.
+
+        The fill series and not every series, on purpose. A replay usually
+        carries forty days of daily bars behind the few days it actually trades,
+        and those are history the strategy is meant to be able to read on the
+        first tick. Starting the clock before them would put the whole liquidity
+        record in the future, where nothing can see it.
+        """
         moments = []
-        for per_symbol in self.bar_series.values():
-            for rows in per_symbol.values():
-                if rows:
-                    moments.append(common.bar_moment(rows[0]))
+        for rows in self._series(self.fill_bar_size).values():
+            if rows:
+                moments.append(common.bar_moment(rows[0]))
         moments = [m for m in moments if m is not None]
         return min(moments) if moments else None
 
@@ -1371,11 +1378,7 @@ class FakeBroker:
             return {"bars": [], "notes": notes}
 
         rows = self.bars_for(symbol, size, up_to=cutoff)
-        span = _parse_duration(duration)
-        if span is not None and rows and cutoff is not None:
-            earliest = cutoff - span
-            rows = [row for row in rows
-                    if (common.bar_moment(row) or earliest) >= earliest]
+        rows = _trim_to_duration(rows, duration)
         return {"bars": [dict(row) for row in rows], "notes": notes}
 
     def bars_5m_today(self, contract: Any) -> list:
@@ -1434,24 +1437,56 @@ class FakeBroker:
         }
 
 
-def _parse_duration(duration: str) -> timedelta | None:
-    """IBKR's "10 D" or "2 W" turned into a span of time.
+def _trim_to_duration(rows: list, duration: str) -> list:
+    """Keep only the last "10 D" or "2 W" worth of bars, IBKR's way.
 
-    Returns None when it cannot be read, which means "no limit" rather than an
-    error: a replay holds only what was recorded anyway, so handing back
-    everything is the safe answer.
+    IBKR counts a duration in TRADING time, not clock time. "40 D" means forty
+    sessions, not the last forty days on a calendar, and the two are nowhere
+    near the same thing: forty calendar days back from a Friday in September
+    covers about twenty eight sessions. Reading it as calendar time is how a
+    request for forty daily bars quietly comes back with thirty, and the
+    strategy's thirty session dollar volume test then measures the wrong window.
+
+    The same is true of intraday durations. A 900 second window ending at 09:40
+    reaches back through the overnight gap into the previous afternoon, which is
+    how the history fetcher nearly filed yesterday's close as today's opening
+    range. Verified against Gateway on 2026-09-06.
+
+    So "D" counts distinct session dates, and the rest fall back to clock time
+    because a replay only holds what was recorded anyway. An unreadable duration
+    means no limit, which is the safe answer for the same reason.
     """
     parts = str(duration or "").strip().split()
-    if len(parts) != 2:
-        return None
+    if len(parts) != 2 or not rows:
+        return rows
     try:
         count = int(parts[0])
     except ValueError:
-        return None
+        return rows
     unit = parts[1].upper()
-    per_unit = {"S": timedelta(seconds=1), "D": timedelta(days=1),
-                "W": timedelta(weeks=1), "M": timedelta(days=31),
+
+    if unit in ("D", "W"):
+        sessions = count * (5 if unit == "W" else 1)
+        dates = []
+        for row in rows:
+            moment = common.bar_moment(row)
+            if moment is None:
+                continue
+            day = moment.date()
+            if day not in dates:
+                dates.append(day)
+        keep = set(dates[-sessions:])
+        return [row for row in rows
+                if (common.bar_moment(row) or None) is not None
+                and common.bar_moment(row).date() in keep]
+
+    per_unit = {"S": timedelta(seconds=1), "M": timedelta(days=31),
                 "Y": timedelta(days=366)}
     if unit not in per_unit:
-        return None
-    return count * per_unit[unit]
+        return rows
+    latest = common.bar_moment(rows[-1])
+    if latest is None:
+        return rows
+    earliest = latest - count * per_unit[unit]
+    return [row for row in rows
+            if (common.bar_moment(row) or earliest) >= earliest]
