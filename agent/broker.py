@@ -118,6 +118,34 @@ class Broker(Protocol):
             confirmed_by    how we know: "executions", "open_orders" or "neither"
         """
 
+    def bracket_order(self, contract: dict, entry: dict, stop: dict,
+                      target: dict | None, order_ref: str) -> dict:
+        """Send an entry with its protective orders attached to it.
+
+        This is how a stop actually protects a position. place_order above
+        leaves the loop holding shares and nothing else: if the Mac sleeps, the
+        network drops or a tick crashes, nothing at the broker knows where the
+        stop was. A bracket leaves the stop resting at IBKR, where it works
+        whether or not this code is running.
+
+        The three legs are plain IBKR order dictionaries, the same shape
+        place_order takes:
+
+            entry   the parent, a limit order in the direction of the trade
+            stop    a STP child on the other side, with auxPrice at the stop
+            target  a LMT child on the other side, or None when the pick has no
+                    usable target. The children are one-cancels-the-other, so a
+                    fill on either pulls the other.
+
+        Every leg carries order_ref, because a child order nobody can trace back
+        to a book cannot be reconciled.
+
+        Returns the same keys place_order does, describing the parent, plus:
+
+            legs        one dict per leg: purpose, order_id, and what was sent
+            bracketed   True when the protective children really went out
+        """
+
     def cancel_order(self, order_id: Any) -> dict:
         """Cancel one working order by its broker id."""
 
@@ -281,6 +309,103 @@ class McpBroker:
             # the error is worth believing.
             result["sent"] = False
         return result
+
+    def bracket_order(self, contract: dict, entry: dict, stop: dict,
+                      target: dict | None = None, order_ref: str = "") -> dict:
+        """Send a bracket: the entry, and the stop and target that protect it.
+
+        The server's own tool is ibkr_bracket_order, and its shape decides this
+        one. It does not take three order dictionaries. It takes the entry's
+        action, quantity and limit price as separate arguments plus a
+        takeProfitPrice and a stopLossPrice, and it builds the three IBKR orders
+        itself: a limit parent, a limit take profit child and a stop loss child,
+        both children hung off the parent's id. Anything else that has to be on
+        every leg goes in orderOptions, which the server copies onto all three.
+        orderRef and account go there, so a child order is traceable to its book
+        exactly like the parent.
+
+        Its takeProfitPrice is not optional, so a pick whose target was dropped
+        cannot use it. That case sends the parent and then the stop child as two
+        ordinary orders instead, which leaves the same stop resting at IBKR. The
+        loss is the one-cancels-the-other link, and with no target there is
+        nothing for the stop to be cancelled against, so nothing is lost.
+
+        Checked against the pinned server in
+        /Users/mtalib/workspace_repos/personal_repo/agentic_trading/requirements-312.txt
+        on 2026-09-06 by reading its source. It has never been called: no order
+        may leave this machine, so this path is read, tested against the fake
+        broker, and locked.
+        """
+        if not live_orders_enabled():
+            raise _refuse(f"place a bracket in {contract.get('symbol', '?')}")
+
+        ref = str(order_ref)
+        options: dict[str, Any] = {"orderRef": ref}
+        if self.account:
+            options["account"] = self.account
+        tif = str(entry.get("tif") or "DAY").upper()
+        if tif:
+            options["tif"] = tif
+
+        quantity = float(entry.get("totalQuantity") or entry.get("quantity") or 0)
+        limit_price = entry.get("lmtPrice")
+        stop_price = stop.get("auxPrice", stop.get("stopPrice"))
+        target_price = (target or {}).get("lmtPrice")
+
+        if limit_price is None or stop_price is None:
+            raise BrokerError(
+                "a bracket needs a limit price on the entry and a stop price on the "
+                f"stop leg, and it was given {limit_price!r} and {stop_price!r}.")
+
+        if target_price is None:
+            return self._stop_without_target(contract, entry, stop, ref)
+
+        raw: Any = None
+        error: str | None = None
+        try:
+            raw = self.client.call("ibkr_bracket_order", {
+                "contract": contract,
+                "action": str(entry.get("action") or "").upper(),
+                "quantity": quantity,
+                "limitPrice": round(float(limit_price), 2),
+                "takeProfitPrice": round(float(target_price), 2),
+                "stopLossPrice": round(float(stop_price), 2),
+                "confirm": True,
+                "dry_run": False,
+                "transmit": True,
+                "orderOptions": options,
+            })
+        except mcp.McpError as exc:
+            error = str(exc)
+
+        result = self._confirm(contract, entry, ref, raw, error)
+        ids = list((raw or {}).get("orderIds") or []) if isinstance(raw, dict) else []
+        result["bracketed"] = bool(ids) or result["confirmed_by"] != "neither"
+        result["legs"] = [
+            {"purpose": purpose, "order_id": ids[i] if i < len(ids) else None,
+             "order_ref": ref, "price": price}
+            for i, (purpose, price) in enumerate((
+                ("entry", round(float(limit_price), 2)),
+                ("target", round(float(target_price), 2)),
+                ("stop", round(float(stop_price), 2)))) ]
+        return result
+
+    def _stop_without_target(self, contract: dict, entry: dict, stop: dict,
+                             ref: str) -> dict:
+        """A pick with no target: the parent, then the stop, as two plain orders."""
+        parent = self.place_order(contract, entry, ref)
+        child = self.place_order(contract, stop, ref)
+        parent["bracketed"] = bool(child.get("sent"))
+        parent["legs"] = [
+            {"purpose": "entry", "order_id": parent.get("order_id"),
+             "order_ref": ref, "price": entry.get("lmtPrice")},
+            {"purpose": "stop", "order_id": child.get("order_id"),
+             "order_ref": ref, "price": stop.get("auxPrice")},
+        ]
+        if child.get("error"):
+            parent["error"] = _join(parent.get("error"),
+                                    f"the stop leg: {child['error']}")
+        return parent
 
     def cancel_order(self, order_id: Any) -> dict:
         if not live_orders_enabled():

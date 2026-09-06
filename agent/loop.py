@@ -807,12 +807,18 @@ def live_locks(book: gr.BookConfig, account_id: str,
 def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
              account_state, intent: gr.OrderIntent, broker: broker_mod.Broker,
              guards: Guards, extra: str = "", model: str | None = None,
-             cost: Any = None, prompt_hash: str = "") -> gr.Decision:
+             cost: Any = None, prompt_hash: str = "", stop: float = 0.0,
+             target: float = 0.0) -> gr.Decision:
     """Put one would be order through every check, and write down the answer.
 
     This is the only route from "this book thinks it should trade" to anything
     else happening, and in dry run it stops at the printed line, which is where
     it stops today for all five books.
+
+    stop and target are the protective levels an entry is opened with. They are
+    printed as their own lines in a dry run and sent as the bracket's children
+    in the live path, so a rehearsal shows exactly the three orders the real
+    thing would send.
     """
     tick.would_be_orders += 1
     decision = gr.check_order(guard, account_state, intent)
@@ -831,6 +837,10 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
 
     if tick.dry or not open_locks or not decision.allowed:
         tick.say(f"DRY RUN {tick.tag} would place {summary}")
+        if intent.purpose == "entry":
+            for line in bracket_lines(intent, stop, target,
+                                      guard.order_ref or tick.tag):
+                tick.say(f"    leg: {line}")
         tick.say(f"  guardrails: {verdict}. {because}"
                  + (f" [rules: {', '.join(decision.rule_ids)}]"
                     if decision.rule_ids else ""))
@@ -845,7 +855,7 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
 
     # Not reachable today. All four locks would have to be open at once, and the
     # first of them needs a book promoted by hand with the hub's approval on it.
-    result = submit(tick, state, intent, broker, guard)
+    result = submit(tick, state, intent, broker, guard, stop=stop, target=target)
     tick.record(state, intent.symbol, f"placed {summary}",
                 f"{verdict}. {because}. The broker confirmed by "
                 f"{result.get('confirmed_by')}",
@@ -853,14 +863,8 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
     return decision
 
 
-def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
-           broker: broker_mod.Broker, guard: gr.Guardrails) -> dict:
-    """Send one order to the broker and write down what actually came back.
-
-    Nothing reaches this today. It exists so the live path is real, visible code
-    with its locks on it rather than something to be invented in a hurry later.
-    """
-    contract = contract_for({"symbol": intent.symbol})
+def order_dict(intent: gr.OrderIntent) -> dict:
+    """One OrderIntent as the plain IBKR order dictionary the broker takes."""
     order: dict[str, Any] = {
         "action": intent.side,
         "totalQuantity": int(intent.qty),
@@ -869,8 +873,111 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     }
     if intent.limit_price:
         order["lmtPrice"] = round(float(intent.limit_price), 2)
+    return order
 
-    result = broker.place_order(contract, order, guard.order_ref or tick.tag)
+
+def _other_side(side: str) -> str:
+    return "SELL" if str(side).upper() == "BUY" else "BUY"
+
+
+def child_orders(intent: gr.OrderIntent, stop: float,
+                 target: float) -> tuple[dict | None, dict | None]:
+    """The two protective legs that hang off an entry: the stop, and the target.
+
+    Both are on the opposite side to the entry and for the same number of
+    shares, because their whole job is to close what the entry opened. The stop
+    is a STP order, so it becomes a market order when the price trades through
+    it. The target is a plain limit.
+    """
+    other = _other_side(intent.side)
+    stop_order = None
+    if _number(stop) > 0:
+        stop_order = {"action": other, "totalQuantity": int(intent.qty),
+                      "orderType": "STP", "auxPrice": round(float(stop), 2),
+                      "tif": "DAY"}
+    target_order = None
+    if _number(target) > 0:
+        target_order = {"action": other, "totalQuantity": int(intent.qty),
+                        "orderType": "LMT", "lmtPrice": round(float(target), 2),
+                        "tif": "DAY"}
+    return stop_order, target_order
+
+
+def bracket_lines(intent: gr.OrderIntent, stop: float, target: float,
+                  order_ref: str) -> list[str]:
+    """The legs of a would-be bracket, one readable line each, for a dry run."""
+    lines = [f"entry  {describe(intent)} tagged {order_ref}"]
+    stop_order, target_order = child_orders(intent, stop, target)
+    if stop_order:
+        lines.append(f"stop   {stop_order['action']} {stop_order['totalQuantity']} "
+                     f"{intent.symbol} stop {stop_order['auxPrice']:.2f} tagged {order_ref}")
+    else:
+        lines.append("stop   none, and an entry with no stop is refused above")
+    if target_order:
+        lines.append(f"target {target_order['action']} {target_order['totalQuantity']} "
+                     f"{intent.symbol} limit {target_order['lmtPrice']:.2f} tagged "
+                     f"{order_ref}")
+    return lines
+
+
+def remember_legs(state: bs.BookState, symbol: str, result: dict, order_ref: str,
+                  now: datetime) -> None:
+    """Write the bracket's children into the book file so a later tick can find them.
+
+    A stop that has to be moved has to be cancelled first, and cancelling it
+    means knowing its order id. That id only exists in the broker's reply, so it
+    is written down the moment it arrives.
+    """
+    for leg in result.get("legs") or []:
+        if not isinstance(leg, dict) or leg.get("purpose") == "entry":
+            continue
+        order_id = leg.get("order_id")
+        if order_id is None:
+            continue
+        state.working_orders[str(order_id)] = {
+            "symbol": symbol, "purpose": str(leg.get("purpose") or "child"),
+            "price": leg.get("price"), "order_ref": order_ref,
+            "placed_at": now.isoformat(), "is_child": True,
+        }
+
+
+def resting_stop_id(state: bs.BookState, symbol: str) -> str | None:
+    """The order id of the stop resting at the broker for this name, if there is one."""
+    for order_id, row in (state.working_orders or {}).items():
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol") or "").upper() != symbol.upper():
+            continue
+        if str(row.get("purpose") or "").lower() == "stop":
+            return str(order_id)
+    return None
+
+
+def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
+           broker: broker_mod.Broker, guard: gr.Guardrails, stop: float = 0.0,
+           target: float = 0.0) -> dict:
+    """Send one order to the broker and write down what actually came back.
+
+    An entry goes out as a bracket, so its stop rests at IBKR instead of only in
+    this Mac's memory. Everything else, an exit or a flatten, is one plain
+    order: there is nothing left to protect.
+
+    Nothing reaches this today. It exists so the live path is real, visible code
+    with its locks on it rather than something to be invented in a hurry later.
+    """
+    contract = contract_for({"symbol": intent.symbol})
+    order = order_dict(intent)
+    ref = guard.order_ref or tick.tag
+
+    stop_order, target_order = child_orders(intent, stop, target)
+    if intent.purpose == "entry" and stop_order is not None:
+        result = broker.bracket_order(contract, order, stop_order, target_order, ref)
+        remember_legs(state, intent.symbol, result, ref, tick.now)
+        if not result.get("bracketed"):
+            tick.note(f"{intent.symbol}: the protective legs did not go out with the "
+                      "entry, so this position has no stop resting at the broker")
+    else:
+        result = broker.place_order(contract, order, ref)
     tick.sent += 1
     filled = _number(result.get("filled_qty"))
     price = _number(result.get("avg_fill_price"))
@@ -878,7 +985,8 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     if filled > 0:
         tick.say(f"filled {filled:g} {intent.symbol} at {price:.4f}, confirmed by "
                  f"{result.get('confirmed_by')}")
-        record_fill(state, intent, filled, price, tick.now)
+        for message in record_fill(state, intent, filled, price, tick.now, guard):
+            tick.note(f"{intent.symbol}: {message}")
         counter = make_day_trade_counter(guard)
         if counter is not None:
             try:
@@ -909,20 +1017,33 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
 
 
 def record_fill(state: bs.BookState, intent: gr.OrderIntent, filled: float,
-                price: float, now: datetime) -> None:
-    """Update the book's own file after a real fill. Only the live path calls this."""
+                price: float, now: datetime,
+                guard: gr.Guardrails | None = None) -> list[str]:
+    """Update the book's own file after a real fill. Only the live path calls this.
+
+    A new position is opened with its stop and its target on it, taken from the
+    trigger record the pick wrote and re-clamped against the price actually
+    paid. Before 2026-09-06 both were left at zero, which meant exit_reason_for
+    below skipped them and neither the hard stop nor the target could ever fire.
+
+    Returns any notes about how the levels were arrived at, so the caller can
+    write them down.
+    """
     symbol = intent.symbol
     signed = filled if intent.side == "BUY" else -filled
     held = state.position(symbol)
 
     if held is None:
+        short = signed < 0
+        levels = fill_levels(state, symbol, short, price, guard)
         state.put_position(bs.Position(
             symbol=symbol, qty=signed, avg_cost=price,
             opened_on=f"{now.date():%Y-%m-%d}", entry=price,
-            side="short" if signed < 0 else "long", trailing_high_or_low=price))
+            side="short" if short else "long", trailing_high_or_low=price,
+            stop=levels.stop, target=levels.target))
         state.entries_opened_today += 1
         state.cash -= signed * price
-        return
+        return list(levels.notes)
 
     if (held.qty > 0) == (signed > 0):
         total = held.qty + signed
@@ -940,6 +1061,7 @@ def record_fill(state: bs.BookState, intent: gr.OrderIntent, filled: float,
         state.drop_position(symbol)
     else:
         state.put_position(held)
+    return []
 
 
 # ------------------------------------------------------------------ the phases
@@ -1155,6 +1277,31 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
     target = _number(pick.get("target"))
     reason = str(pick.get("rationale") or "no reason given")
 
+    # The stop is checked before the pick is written down as a pick, because a
+    # stop on the wrong side of entry means there was never a tradeable idea
+    # here, only a row that looked like one.
+    if entry > 0:
+        low, high = _opening_range(state, symbol)
+        levels = protective_levels(guard, entry=entry, short=short, model_stop=stop,
+                                   model_target=target, opening_range_low=low,
+                                   opening_range_high=high)
+        if levels.reject:
+            tick.say(f"{symbol}: rejected. {levels.reject}")
+            tick.rule("decision_rejected", f"{symbol}: {levels.reject}",
+                      "the pick was thrown away and no entry order was worked out")
+            tick.record(state, symbol, "decision_rejected",
+                        f"{levels.reject}. The pick said: {reason}",
+                        model=result.model, cost=result.cost_usd,
+                        prompt_hash=result.prompt_hash)
+            state.triggered[symbol] = {
+                "at": tick.now.isoformat(), "price": entry, "allowed": False,
+                "sent": False, "skipped": "decision_rejected",
+                "side": "short" if short else "long"}
+            return
+        stop, target = levels.stop, levels.target
+        for message in levels.notes:
+            tick.note(f"{symbol}: {message}")
+
     tick.say(f"{symbol}: {'short' if short else 'long'} from {entry:.2f}, "
              f"stop {stop:.2f}, target {target:.2f}")
     tick.record(state, symbol,
@@ -1197,7 +1344,7 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
         extra += f", borrow: {borrow.note}"
     decision = consider(tick, state, guard, account_state, intent, broker, guards,
                         extra=extra, model=result.model, cost=None,
-                        prompt_hash=result.prompt_hash)
+                        prompt_hash=result.prompt_hash, stop=stop, target=target)
     state.triggered[symbol] = {
         "at": tick.now.isoformat(), "price": entry, "allowed": decision.allowed,
         "sent": False, "mode": tick.book.mode, "side": "short" if short else "long",
@@ -1246,6 +1393,131 @@ def _entry_intent(symbol: str, short: bool, quantity: int, price: float,
         shares_available_to_borrow=borrow.shares_available if short else None)
 
 
+@dataclass
+class Levels:
+    """Where one position's stop and target actually go, and why.
+
+    reject is set when the pick cannot be traded at all. notes hold anything
+    worth writing into the record: a stop that was moved, a target dropped.
+    """
+
+    stop: float = 0.0
+    target: float = 0.0
+    notes: list[str] = field(default_factory=list)
+    reject: str | None = None
+
+
+def _opening_range(state: bs.BookState, symbol: str) -> tuple[float | None, float | None]:
+    """The low and high of the first five minutes for one name, off the shortlist."""
+    for row in state.shortlist:
+        if isinstance(row, dict) and str(row.get("symbol") or "").upper() == symbol:
+            low = _number(row.get("opening_range_low")) or None
+            high = _number(row.get("opening_range_high")) or None
+            return low, high
+    return None, None
+
+
+def protective_levels(guard: gr.Guardrails, *, entry: float, short: bool,
+                      model_stop: float, model_target: float,
+                      opening_range_low: float | None = None,
+                      opening_range_high: float | None = None) -> Levels:
+    """The stop and the target a position is opened with, after the rules have had them.
+
+    The model proposes both. It may move a stop nearer to the entry price and it
+    may never move one further away, so the rule stop from
+    guardrails.stop_price_for is the outer edge and the model's number is used
+    only when it sits inside that edge. For a long the nearer stop is the higher
+    of the two, for a short the lower, which is why one side takes the maximum
+    and the other the minimum.
+
+    A stop on the wrong side of entry is not a widening, it is nonsense: a long
+    that stops out above the price it bought at would close the instant it
+    opened. Those come back with reject set and the pick is thrown away.
+
+    A target on the wrong side is dropped rather than fatal. A position with no
+    target still has a stop and is still safe; it runs to the trailing stop, the
+    time stop or the close instead.
+    """
+    notes: list[str] = []
+    entry = _number(entry)
+    if entry <= 0:
+        return Levels(reject="there is no entry price to measure a stop from")
+
+    side = "SELL" if short else "BUY"
+    try:
+        rule_stop = gr.stop_price_for(guard, entry, opening_range_low, side,
+                                      opening_range_high)
+    except gr.GuardrailError as exc:
+        return Levels(reject=f"the rule stop could not be worked out: {exc}")
+
+    stop = _number(model_stop)
+    if stop <= 0:
+        notes.append(f"the pick carried no stop, so the rule stop {rule_stop:.2f} is used")
+        stop = rule_stop
+    elif (not short and stop >= entry) or (short and stop <= entry):
+        return Levels(notes=notes, reject=(
+            f"the stop {stop:.2f} is on the wrong side of the entry {entry:.2f} for a "
+            f"{'short' if short else 'long'}, so this pick would close itself the "
+            "moment it opened"))
+    else:
+        clamped = min(stop, rule_stop) if short else max(stop, rule_stop)
+        if abs(clamped - stop) > 0.004:
+            notes.append(
+                f"the stop moved from {stop:.2f} to {clamped:.2f}: the rules allow no "
+                f"stop further from {entry:.2f} than {rule_stop:.2f}, and a model may "
+                "tighten a stop but never widen one")
+        stop = clamped
+
+    target = _number(model_target)
+    if target > 0 and ((not short and target <= entry) or (short and target >= entry)):
+        notes.append(
+            f"the target {target:.2f} is on the wrong side of the entry {entry:.2f} for "
+            f"a {'short' if short else 'long'}, so it is dropped and this position runs "
+            "to its stop, its trailing stop or the close")
+        target = 0.0
+    return Levels(round(stop, 2), round(max(target, 0.0), 2), notes)
+
+
+def fill_levels(state: bs.BookState, symbol: str, short: bool, price: float,
+                guard: gr.Guardrails | None) -> Levels:
+    """The stop and target to open a position with, from the pick that triggered it.
+
+    The trigger record written at pick time holds the levels the decision was
+    made with. They are re-clamped here against the price actually paid rather
+    than the price that was planned, because a stop measured from a plan the
+    market did not honour is not a stop.
+
+    A fill that cannot be clamped still gets the rule stop. A filled position
+    with no stop on it is the exact hole this whole change exists to close, so
+    there is no path out of here that leaves stop at zero.
+    """
+    raw = state.triggered.get(symbol) if isinstance(state.triggered, dict) else None
+    trigger = raw if isinstance(raw, dict) else {}
+    model_stop = _number(trigger.get("stop"))
+    model_target = _number(trigger.get("target"))
+
+    if guard is None or price <= 0:
+        return Levels(round(model_stop, 2), round(model_target, 2),
+                      ["no guardrails were handed to the fill, so the pick's own "
+                       "levels are used unchecked"])
+
+    low, high = _opening_range(state, symbol)
+    levels = protective_levels(guard, entry=price, short=short, model_stop=model_stop,
+                               model_target=model_target, opening_range_low=low,
+                               opening_range_high=high)
+    if not levels.reject:
+        return levels
+
+    # The shares are already ours, so refusing is not on the table. Fall back to
+    # the rule stop, which is always on the right side of the fill price.
+    try:
+        rule = gr.stop_price_for(guard, price, low, "SELL" if short else "BUY", high)
+    except gr.GuardrailError as exc:
+        return Levels(0.0, 0.0, [f"{levels.reject}, and the rule stop failed too: {exc}"])
+    return Levels(rule, 0.0,
+                  [f"{levels.reject}, so the rule stop {rule:.2f} is used instead"])
+
+
 def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
                     today: date_type, last_close: float,
                     vwap: float | None) -> tuple[str | None, str]:
@@ -1264,22 +1536,36 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
 
     Kept as its own function, with no broker and no clock in it, so every rule
     can be checked on paper.
+
+    The hard stop is the first thing checked and it is never skipped. Until
+    2026-09-06 a position was opened with stop and target both left at zero, and
+    a zero stop fell through the check below, so the 1.5 percent stop and the
+    target could not fire at all. record_fill above now sets both. A position
+    that somehow still arrives without a stop, one carried over from a state
+    file written before that change, gets the rule stop measured off its entry
+    rather than no stop at all.
     """
     short = position.is_short
     stop = _number(position.stop)
     target = _number(position.target)
+    entry = _number(position.entry) or _number(position.avg_cost)
 
-    if stop:
+    if stop <= 0 and entry > 0:
+        try:
+            stop = gr.stop_price_for(guard, entry, None, "SELL" if short else "BUY")
+        except gr.GuardrailError:
+            stop = 0.0
+
+    if stop > 0:
         if (not short and last_close <= stop) or (short and last_close >= stop):
             return "stop", f"the close {last_close:.2f} went through the stop {stop:.2f}"
-    if target:
+    if target > 0:
         if (not short and last_close >= target) or (short and last_close <= target):
             return "target", (f"the close {last_close:.2f} reached the target "
                               f"{target:.2f}")
 
     best = position.trailing_high_or_low
     if best:
-        entry = _number(position.entry) or _number(position.avg_cost)
         trailing = None
         if entry > 0:
             trailing = gr.trailing_stop_price(
@@ -1306,6 +1592,82 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
             return "fade", (f"momentum faded, the five minute close {last_close:.2f} is "
                             f"back through the day's vwap {vwap:.2f}")
     return None, ""
+
+
+def tighter_stop_for(position: bs.Position, guard: gr.Guardrails) -> float | None:
+    """Where this position's stop should sit now, when that is nearer than where it is.
+
+    Only ever returns a stop closer to the price than the one already on the
+    position, never further away. A trailing stop that could loosen would give
+    back the whole point of having one.
+    """
+    entry = _number(position.entry) or _number(position.avg_cost)
+    best = position.trailing_high_or_low
+    if entry <= 0 or not best:
+        return None
+    try:
+        trailing = gr.trailing_stop_price(
+            guard, "SELL" if position.is_short else "BUY", float(best), entry)
+    except gr.GuardrailError:
+        return None
+    if trailing is None:
+        return None
+
+    current = _number(position.stop)
+    if current <= 0:
+        return trailing
+    nearer = trailing < current if position.is_short else trailing > current
+    return trailing if nearer else None
+
+
+def move_resting_stop(tick: BookTick, state: bs.BookState, position: bs.Position,
+                      new_stop: float, broker: broker_mod.Broker, guard: gr.Guardrails,
+                      guards: Guards, account_state) -> None:
+    """Move the stop that is resting at the broker, by cancelling it and placing a new one.
+
+    IBKR has no "edit this order" on this path, so tightening a stop is two
+    steps: pull the old child, place a new one for the same shares at the new
+    price, tagged with the same book. The order is deliberate. Cancel first,
+    place second: a moment with no stop is bad, and a moment with two stops
+    would be worse, because both could fill and the book would end up short a
+    position it never opened.
+    """
+    symbol = position.symbol
+    shares = int(round(abs(position.qty)))
+    side = "BUY" if position.is_short else "SELL"
+    order_id = resting_stop_id(state, symbol)
+    replacement = {"action": side, "totalQuantity": shares, "orderType": "STP",
+                   "auxPrice": round(float(new_stop), 2), "tif": "DAY"}
+    ref = guard.order_ref or tick.tag
+
+    open_locks, shut = live_locks(tick.book, account_state.account_id, guards)
+    if tick.dry or not open_locks:
+        tick.say(f"DRY RUN {tick.tag} would cancel the resting stop "
+                 f"{order_id or '(none recorded)'} and place "
+                 f"{side} {shares} {symbol} stop {new_stop:.2f} tagged {ref}")
+        tick.record(state, symbol, f"would move the stop to {new_stop:.2f}",
+                    "the trailing rule tightened the stop, and nothing was sent: "
+                    + ("; ".join(shut) or "this book is in dry run"))
+        return
+
+    if order_id is not None:
+        answer = broker.cancel_order(order_id)
+        state.working_orders.pop(str(order_id), None)
+        if not answer.get("cancelled"):
+            tick.note(f"{symbol}: the old stop {order_id} would not cancel "
+                      f"({answer.get('error') or 'no reason given'}), so no new one was "
+                      "placed and the old one is still the live stop")
+            return
+
+    placed = broker.place_order(contract_for({"symbol": symbol}), replacement, ref)
+    new_id = placed.get("order_id")
+    if new_id is not None:
+        state.working_orders[str(new_id)] = {
+            "symbol": symbol, "purpose": "stop", "price": round(float(new_stop), 2),
+            "order_ref": ref, "placed_at": tick.now.isoformat(), "is_child": True}
+    tick.record(state, symbol, f"moved the stop to {new_stop:.2f}",
+                f"the trailing rule tightened it and order {new_id} is now resting "
+                f"at the broker")
 
 
 def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guardrails,
@@ -1395,6 +1757,20 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
             position.trailing_high_or_low = min(float(best), last_close)
         else:
             position.trailing_high_or_low = max(float(best), last_close)
+
+        # A winner's stop follows it up. The stop on the position and the stop
+        # resting at the broker have to move together, or the file and the
+        # account would disagree about where this trade gets out.
+        nearer = tighter_stop_for(position, guard)
+        if nearer is not None:
+            was = _number(position.stop)
+            position.stop = nearer
+            tick.say(f"  {symbol}: the stop tightens from "
+                     f"{was:.2f} to {nearer:.2f}, following the best price "
+                     f"{float(position.trailing_high_or_low):.2f}")
+            state.put_position(position)
+            move_resting_stop(tick, state, position, nearer, broker, guard, guards,
+                              account_state)
         state.put_position(position)
 
         trigger, why = exit_reason_for(position, plan, guard, today, last_close, vwap)
@@ -1525,16 +1901,39 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
             tick.record(state, symbol, "no entry",
                         f"at {last_close:.2f} this book's limits allow zero shares")
             continue
+        # The trade is entered at the price the market gave, not the one the pick
+        # planned for, so the stop is re-measured from there before anything is
+        # sent. Same clamp, same rejection, same reasons written down.
+        low, high = _opening_range(state, symbol)
+        levels = protective_levels(guard, entry=last_close, short=short,
+                                   model_stop=_number(pick.get("stop")),
+                                   model_target=target, opening_range_low=low,
+                                   opening_range_high=high)
+        if levels.reject:
+            tick.say(f"  {symbol}: rejected. {levels.reject}")
+            tick.rule("decision_rejected", f"{symbol}: {levels.reject}",
+                      "the entry was not worked out")
+            tick.record(state, symbol, "decision_rejected", levels.reject)
+            state.triggered[symbol] = {
+                "at": tick.now.isoformat(), "price": last_close, "allowed": False,
+                "sent": False, "skipped": "decision_rejected"}
+            continue
+        for message in levels.notes:
+            tick.note(f"{symbol}: {message}")
+
         borrow = _borrow_answer(state, symbol)
         intent = _entry_intent(symbol, short, quantity, last_close,
                                tick.book.book_id, borrow)
         tick.say(f"  {symbol} broke its {entry:.2f} trigger, now {last_close:.2f}")
         decision = consider(tick, state, guard, account_state, intent, broker, guards,
-                            extra=f"stop {_number(pick.get('stop')):.2f}"
-                                  + (f", borrow: {borrow.note}" if short else ""))
+                            extra=f"stop {levels.stop:.2f}, target {levels.target:.2f}"
+                                  + (f", borrow: {borrow.note}" if short else ""),
+                            stop=levels.stop, target=levels.target)
         state.triggered[symbol] = {
             "at": tick.now.isoformat(), "price": last_close,
-            "allowed": decision.allowed, "sent": False, "mode": tick.book.mode}
+            "allowed": decision.allowed, "sent": False, "mode": tick.book.mode,
+            "side": "short" if short else "long", "stop": levels.stop,
+            "target": levels.target, "qty": int(quantity)}
         if decision.daily_halt:
             state.halt("a guardrail asked for a halt for the rest of the day")
 

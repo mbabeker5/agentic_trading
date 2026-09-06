@@ -247,9 +247,46 @@ State carries over between days. The insider and Congress books hold for weeks, 
 
 ---
 
+## Where the stop lives, and why it goes to the broker
+
+Every position is opened with two numbers on it: a stop and, usually, a target. They are set at the moment of the fill by `record_fill` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`, taken from the trigger record the pick wrote, and re-measured against the price actually paid rather than the price that was planned.
+
+The model proposes both numbers and does not get the final say on either:
+
+- **The stop is clamped.** `guardrails.stop_price_for` works out the rule stop, 1.5 percent from entry or the opening range level when that is nearer. The model's stop is used only when it sits inside that, so a model may move a stop closer to entry and can never move one further away. For a long the nearer stop is the higher of the two, for a short the lower.
+- **A stop on the wrong side of entry throws the pick away.** A long stopping out above where it bought would close the instant it opened. That is not a widening, it is nonsense, so the pick is refused with a `decision_rejected` row naming the two prices.
+- **A target on the wrong side is dropped, not fatal.** The position still has a stop, so it is still safe. It runs to the trailing stop, the time stop or the close instead, and the drop is written down.
+
+That covers the file. The other half is the account.
+
+### The stop rests at the broker
+
+An entry does not go out as one order. It goes out as a bracket: a limit parent, a stop child on the other side, and a limit target child when the pick has a usable target. All three carry the book's `orderRef`, so a child order can be traced back to the book that owns it exactly like its parent.
+
+The reason is simple. If the stop existed only in this Mac's memory, then a Mac that sleeps, a crashed tick or a dropped network connection would leave a live position with nothing protecting it, and nobody would know until the next tick woke up. A stop resting at IBKR works whether or not this code is running.
+
+`McpBroker.bracket_order` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/broker.py` calls the server's `ibkr_bracket_order` tool. That tool does not take three order dictionaries. It takes the entry's action, quantity and limit price plus a `takeProfitPrice` and a `stopLossPrice`, and builds the three IBKR orders itself with both children hung off the parent's id. Anything that has to be on every leg goes in `orderOptions`, which the server copies onto all three, and that is where `orderRef` and `account` go. Its `takeProfitPrice` is not optional, so a pick whose target was dropped takes a second path instead: the parent, then the stop, as two ordinary orders. The stop still rests at the broker. What is lost is the one-cancels-the-other link between the two children, and with no target there is nothing for the stop to be cancelled against.
+
+### Moving a stop
+
+There is no "edit this order" on this path, so tightening a stop is two steps: cancel the resting child, then place a new one for the same shares at the new price under the same tag. Cancel first and place second, deliberately. A moment with no stop is bad; a moment with two stops would be worse, because both could fill and the book would end up short a position it never opened. If the cancel fails, no replacement is sent and the old stop stays live.
+
+The child order ids are written into the book's state file as `working_orders` entries marked `is_child`, because an order that has to be cancelled later is an order whose id has to survive the tick that placed it.
+
+Today this is all rehearsal. A dry run prints the three legs it would have sent, one line each, under the order it would have placed:
+
+```
+DRY RUN BOOK_A would place BUY 1000 ABC limit 9.38 (purpose: entry)
+    leg: entry  BUY 1000 ABC limit 9.38 (purpose: entry) tagged BOOK_A
+    leg: stop   SELL 1000 ABC stop 9.24 tagged BOOK_A
+    leg: target SELL 1000 ABC limit 9.66 tagged BOOK_A
+```
+
+---
+
 ## The pluggable broker
 
-The loop never talks to IBKR directly. It is handed a `Broker` and calls methods on it. `agent/broker.py` defines the protocol: six read methods (`account_summary`, `portfolio`, `open_orders`, `executions`, `snapshot`, `historical_bars`) and three that act (`place_order`, `cancel_order`, `global_cancel`).
+The loop never talks to IBKR directly. It is handed a `Broker` and calls methods on it. `agent/broker.py` defines the protocol: six read methods (`account_summary`, `portfolio`, `open_orders`, `executions`, `snapshot`, `historical_bars`) and four that act (`place_order`, `bracket_order`, `cancel_order`, `global_cancel`).
 
 That single change is what lets the same loop run three ways without knowing which:
 

@@ -1066,6 +1066,45 @@ class FakeBroker:
         answer["rejected"] = False
         return answer
 
+    def bracket_order(self, contract: Any, entry: Any, stop: Any,
+                      target: Any = None, order_ref: str = "") -> dict:
+        """An entry with its stop, and its target when it has one, all at once.
+
+        The same three legs agent/broker.py sends to IBKR, placed here through
+        place_order above so they fill against the recorded bars like anything
+        else. Two honest differences from the real thing, both of which make
+        life here harder rather than easier, which is the right direction:
+
+          - the children are live from the moment they are placed, rather than
+            waiting for the parent to fill. IBKR hangs them off the parent's id.
+          - the children are not one-cancels-the-other. At IBKR a fill on the
+            target pulls the stop. Here both rest until one fills and the loop
+            has to notice the position is flat.
+
+        Returns the parent's answer with a `legs` list on it, one entry per leg,
+        each carrying the order id and the order_ref it went out under.
+        """
+        legs: list[dict] = []
+        parent = self.place_order(contract, entry, order_ref)
+        legs.append({"purpose": "entry", "order_id": parent.get("orderId"),
+                     "order_ref": order_ref,
+                     "price": self._order_dict(entry).get("lmtPrice")})
+
+        for purpose, leg in (("target", target), ("stop", stop)):
+            if leg is None:
+                continue
+            answer = self.place_order(contract, leg, order_ref)
+            fields = self._order_dict(leg)
+            legs.append({"purpose": purpose, "order_id": answer.get("orderId"),
+                         "order_ref": order_ref,
+                         "price": fields.get("lmtPrice") if purpose == "target"
+                         else fields.get("auxPrice")})
+
+        parent = dict(parent)
+        parent["legs"] = legs
+        parent["bracketed"] = any(leg["purpose"] == "stop" for leg in legs)
+        return parent
+
     def cancel_order(self, order_id: int) -> dict:
         """Pull one order that has not filled yet."""
         self._guard_connection("cancel an order")
