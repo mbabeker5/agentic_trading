@@ -922,14 +922,27 @@ def flatten_at_close(day: date_type) -> Scenario:
         if not ok:
             failures.append(line)
 
-        flatten = [o for o in _orders(context, "BOOK_A", side="SELL",
-                                      order_type="MKT", symbol=holder)]
-        if flatten:
-            evidence.append(f"at the flatten, book A sent a market sell for "
-                            f"{flatten[0].qty} {holder}, which is the whole position")
+        # The flatten went two stage on 2026-09-06 (item A11): limit orders at
+        # the bid from flatten_at, market orders from flatten_market_at. So what
+        # is checked is that the whole position was sent out to be closed, not
+        # which kind of order carried it.
+        closings = _closings_placed(context, "A", holder)
+        flatten = [o for o in _orders(context, "BOOK_A", side="SELL", symbol=holder)
+                   if o.purpose != "stop"]
+        if closings and flatten:
+            kinds = sorted({o.order_type for o in flatten})
+            evidence.append(
+                f"at the flatten, book A sent {len(flatten)} closing orders for "
+                f"{flatten[0].qty} {holder} as {', '.join(kinds)}, which is the whole "
+                "position")
+            if "MKT" not in kinds:
+                evidence.append(
+                    "none of them was a market order, so the limit stage of the "
+                    "flatten got it done before the market backstop was reached")
         else:
-            failures.append(f"book A held {holder} at 15:50 and sent no market sell "
-                            "at 15:55")
+            failures.append(f"book A held {holder} at 15:50 and sent nothing to "
+                            f"close it: {len(closings)} closing decisions, "
+                            f"{len(flatten)} orders")
 
         held = _positions(context, "BOOK_A")
         if held.get(holder):
@@ -976,8 +989,14 @@ def flatten_at_close(day: date_type) -> Scenario:
                 "own. They are DAY orders and IBKR would expire them at the close, "
                 "which covers the overnight case and not the five minutes that "
                 "matter.")
-        else:
+        elif _orders(context, "BOOK_A", symbol=resting):
             evidence.append("no order was left working at the close")
+        else:
+            evidence.append(
+                "the second half of this scenario, an entry still resting at the "
+                "flatten, could not run: book A never placed the entry at all "
+                f"because {_why_no_entry(context, 'A')}. Nothing here says the loop "
+                "cancels a working order, only that there was not one to cancel.")
 
         if context.broker.cancels:
             evidence.append(f"{len(context.broker.cancels)} cancels were sent")
@@ -994,8 +1013,13 @@ def flatten_at_close(day: date_type) -> Scenario:
         book_patches=only("A", "B"),
         decider=lambda s: StubDecider(
             max_picks=1, pick_nothing_for=("B",),
+            # Every level is given rather than derived, so this scenario does
+            # not move when the stop percentage in the strategy file does. The
+            # entry sits below a price that only climbs, the stop below that,
+            # and the target far above anything the day reaches, so all three
+            # legs are still resting at the close whatever the rules say today.
             script=[ScriptedPick(book="A", symbol=resting, at="09:35",
-                                 entry=99.50, stop=98.00, target=102.50)]),
+                                 entry=99.50, stop=99.00, target=150.00)]),
         setup=setup, check=check,
     )
 
@@ -1236,7 +1260,7 @@ def kill_switch(day: date_type) -> Scenario:
         decider=lambda s: StubDecider(
             max_picks=1,
             script=[ScriptedPick(book="A", symbol="REST", at="09:35",
-                                 entry=99.50, stop=98.00, target=102.50)]),
+                                 entry=99.50, stop=99.00, target=150.00)]),
         setup=setup, before_tick=before_tick, check=check,
     )
 
