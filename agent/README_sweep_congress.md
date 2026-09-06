@@ -158,16 +158,24 @@ comparing the words in the two names. This matters: the House Clerk files April
 McClain Delaney under surname "Delaney", while the legislators dataset calls her
 surname "McClain Delaney". Matching on the surname alone loses her entirely.
 
-The district trick has one trap, and the script guards against it. Someone who
-has left Congress can still be filing, because they have 45 days to disclose and
-the clock does not stop when they go. The dataset only lists sitting members, so
-their old district now belongs to whoever replaced them. Taking the district at
-face value would file that trade under the wrong person and hand them somebody
-else's committees. So the script checks that the surname on the filing actually
-matches the person holding the seat, and where it does not, it leaves the
-committees empty and says so in the warnings. A trade with no committee link is a
-worse answer than the truth. A trade attributed to the wrong member is a wrong
-one.
+The district trick has one trap, and the script guards against it by checking
+that the surname on the filing matches the person holding the seat. Where it does
+not match, the script falls back to matching on the name, and if that fails too
+it leaves the committees empty and says so in the warnings. A trade with no
+committee link is an incomplete answer. A trade credited to the wrong member is a
+wrong one.
+
+That guard is not theoretical. It fired on the first live run. The Clerk files
+Rich McCormick's report under Georgia district 6, while the legislators dataset
+has him in district 7 and puts Lucy McBath in district 6. Georgia's map was
+redrawn and the two government sources have not landed on the same number. Taking
+the district at face value credited his Berkshire Hathaway purchase to Lucy
+McBath, along with her committees. With the check in place it resolves to
+McCormick, which is who the Clerk index actually names.
+
+The same guard covers the other version of this problem. Someone who has left
+Congress can still be filing, because the 45 day clock does not stop when they
+go, and their old district now belongs to their replacement.
 
 **The half that is missing is the company's sector.** `ticker_sector` is
 deliberately left empty. The loop fills it in from the industry IBKR reports for
