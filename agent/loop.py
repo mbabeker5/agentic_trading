@@ -223,6 +223,109 @@ def db_call(name: str, *args, **kwargs) -> Any:
         return None
 
 
+# ------------------------------------------------------------------- alerting
+
+#: How long the same alert stays quiet after it has been sent once. Thirty
+#: minutes. Without this the loop would send the same sentence every five
+#: minutes for the rest of the day, and an alert that arrives eighty times is
+#: one nobody reads. The tick that first notices something says so; the ticks
+#: that keep noticing the same thing say nothing.
+ALERT_QUIET_MINUTES = 30
+
+#: How long an alert that is meant once a day stays quiet. An orphan position is
+#: the case: it is the same fact all day and it never halts anything, so saying
+#: it once is the whole of what is useful.
+ALERT_ONCE_A_DAY_MINUTES = 24 * 60
+
+#: Where the last time each alert went out is remembered between ticks. There is
+#: no long running process here, so a rate limit that lives in memory is not a
+#: rate limit at all.
+ALERT_STATE_FILE = "alerts_sent.json"
+
+
+def alert_state_path(root: Path | None = None) -> Path:
+    folder = (root / "output") if root is not None else output_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / ALERT_STATE_FILE
+
+
+def read_alert_state(root: Path | None = None) -> dict:
+    """When each alert key last went out. An unreadable file means none of them."""
+    path = alert_state_path(root)
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text())
+    except Exception:                        # noqa: BLE001
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def write_alert_state(state: dict, root: Path | None = None) -> None:
+    try:
+        alert_state_path(root).write_text(json.dumps(state, indent=2, default=str))
+    except OSError as exc:
+        print(f"loop: could not remember which alerts have gone out ({exc}), so the "
+              "next tick may repeat one", file=sys.stderr)
+
+
+def alert_due(key: str, now: datetime, quiet_minutes: int = ALERT_QUIET_MINUTES,
+              root: Path | None = None) -> bool:
+    """Has this alert been quiet long enough to send again?"""
+    when = (read_alert_state(root) or {}).get(str(key))
+    if not when:
+        return True
+    try:
+        last = datetime.fromisoformat(str(when))
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=now.tzinfo)
+    return (now - last).total_seconds() >= max(0, int(quiet_minutes)) * 60
+
+
+def raise_alert(level: str, title: str, body: str, key: str, now: datetime,
+                quiet_minutes: int = ALERT_QUIET_MINUTES,
+                root: Path | None = None) -> list[str] | None:
+    """Tell Mo something, at most once every quiet_minutes for this key.
+
+    Returns the channels it actually went through, or None when it was held
+    back because the same thing was said recently.
+
+    The database row is written inside agent/alerts.py's alert(), which is the
+    one funnel every alerting caller in this project already goes through, so
+    the row carries which channels really delivered rather than which were
+    attempted. When that module could not be imported at all, the row is written
+    here instead, because an alert nobody could send is still worth having on
+    the record.
+
+    Nothing raised in here escapes. A tick that stopped because it could not
+    send an alert would be a worse tick than one that alerted nobody.
+    """
+    if not alert_due(key, now, quiet_minutes, root):
+        return None
+
+    delivered: list[str] = []
+    if alerts_mod is None:
+        print(f"loop: agent/alerts.py could not be imported ({ALERTS_ERROR}), so "
+              f"nobody was told: [{level}] {title}", file=sys.stderr)
+        db_call("record_alert", level=level, title=title, body=body,
+                channels=[], ts=now)
+    else:
+        try:
+            delivered = list(alerts_mod.alert(level, title, body) or [])
+        except Exception as exc:             # noqa: BLE001
+            print(f"loop: the alert would not go out ({type(exc).__name__}: {exc}): "
+                  f"[{level}] {title}", file=sys.stderr)
+            db_call("record_alert", level=level, title=title, body=body,
+                    channels=[], ts=now)
+
+    state = read_alert_state(root)
+    state[str(key)] = now.isoformat()
+    write_alert_state(state, root)
+    return delivered
+
+
 #: Touched at the end of every tick that got all the way through. The dead man's
 #: handle in agent/deadman.py prefers this file over guessing at the loop's
 #: pulse from log files, because a log line can be written by a tick that then
@@ -1185,6 +1288,16 @@ class BookTick:
             model_cost_usd=cost, prompt_hash=prompt_hash,
             dry_run=not self.write_ledger)
 
+    def alert(self, level: str, title: str, body: str, key: str,
+              quiet_minutes: int = ALERT_QUIET_MINUTES) -> list[str] | None:
+        """Tell Mo something about this book, at most once every quiet_minutes.
+
+        The key is prefixed with the book, so book A halting and book C halting
+        are two alerts rather than one that silences the other.
+        """
+        return raise_alert(level, title, body, f"{self.book.book_id}:{key}",
+                           self.now, quiet_minutes)
+
     def rule(self, rule_id: str, detail: str, action: str) -> None:
         """Write one guardrail firing to the database and to the Rules Log.
 
@@ -1344,6 +1457,7 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
                          status=("refused" if not decision.allowed else "dry_run"))
         for rule_id, reason in zip(decision.rule_ids, decision.reasons):
             tick.rule(rule_id, f"{intent.symbol}: {reason}", "the order was not placed")
+        alert_on_caps(tick, intent, decision)
         return decision
 
     # Not reachable today. All four locks would have to be open at once, and the
@@ -1354,6 +1468,40 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
                 f"{result.get('confirmed_by')}",
                 model=model, cost=cost, prompt_hash=prompt_hash)
     return decision
+
+
+#: The rules that mean a book has stopped for a reason worth a person's
+#: attention, rather than one order having been turned away. Every one of them
+#: pauses the book: it opens nothing more until somebody looks, and it may still
+#: close what it holds.
+CAP_RULES_WORTH_TELLING_MO = {
+    "daily_loss_cap": "is down to its daily loss cap",
+    "weekly_loss_cap": "is down to its weekly loss cap",
+    "monthly_loss_cap": "is down to its monthly loss cap",
+    "losing_streak_pause": "has finished down too many days in a row",
+}
+
+
+def alert_on_caps(tick: BookTick, intent: gr.OrderIntent,
+                  decision: gr.Decision) -> None:
+    """Say so when a loss cap turns an order away. Once every thirty minutes.
+
+    These are the refusals that mean the book has stopped rather than that one
+    order was wrong, and until 2026-09-06 they were written to a log file nobody
+    was watching. The key carries the rule as well as the book, so hitting the
+    daily cap and then the weekly one is two messages.
+    """
+    for rule_id, reason in zip(decision.rule_ids, decision.reasons):
+        what = CAP_RULES_WORTH_TELLING_MO.get(rule_id)
+        if not what:
+            continue
+        tick.alert(
+            "warn", f"Book {tick.book.book_id} {what}",
+            f"{reason}\n\nThe order it turned away was "
+            f"{describe(intent)}.\nBook {tick.book.book_id} opens nothing else "
+            "until this clears, and it may still close what it holds.\n"
+            f"Rules {tick.rules}.",
+            key=f"cap:{rule_id}")
 
 
 def record_order_row(tick: BookTick, guard: gr.Guardrails, intent: gr.OrderIntent,
@@ -1856,6 +2004,15 @@ def record_decision_problems(tick: BookTick, state: bs.BookState, result) -> Non
                   "this book's own rules answered instead of its model")
         tick.record(state, "", "model_unavailable", why, model=result.model,
                     cost=result.cost_usd, prompt_hash=result.prompt_hash)
+        tick.alert(
+            "warn", f"Book {tick.book.book_id} fell back to its own rules",
+            f"{tick.book.model or 'the model'} could not be reached, so book "
+            f"{tick.book.book_id} answered with its own rules instead.\n\n{why}"
+            "\n\nNothing is broken and the book is still trading. It matters "
+            "because month one is measuring what the model is worth, and a rules "
+            "answer must never be counted later as a model answer.\n"
+            f"Rules {tick.rules}.",
+            key="model_unavailable")
         return
 
     if not result.ok:
@@ -3437,6 +3594,21 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
             mode=str(book.mode), rules_commit=rules,
             outcome=("halted" if state.halted else "ok"),
             notes="; ".join(tick.notes[:5]) or None)
+
+    # A halted book opens nothing for the rest of the day. Until 2026-09-06 that
+    # was written to a log file nobody was watching, so a book could stop at
+    # 09:50 and nobody would find out until somebody opened the ledger.
+    if state.halted:
+        held = len(state.all_positions())
+        tick.alert(
+            "error", f"Book {book.book_id} is halted",
+            f"Book {book.book_id} ({book.name}) has stopped opening positions.\n\n"
+            f"Why: {state.halt_reason}\n\n"
+            f"It is still holding {held} position(s) and it may still close them. "
+            "It opens nothing else until this clears.\n"
+            f"Rules {rules}, {now:%Y-%m-%d %H:%M} New York.",
+            key="halt")
+
     snapshot_book_positions(tick, state)
 
     path = bs.save_state(state)
@@ -3624,6 +3796,75 @@ class BrokerFacts:
     problems: list = field(default_factory=list)
 
 
+def alert_on_guard_files(guards: Guards, now: datetime) -> None:
+    """Say so when one of the three files that stop the loop is there.
+
+    The kill switch is pulled by a person or by the dead man's handle, so
+    somebody already knows it happened. What they may not know is that it is
+    STILL there tomorrow morning, which is exactly the way a stopped agent goes
+    unnoticed for a week. Once every thirty minutes, so a day with the handle
+    pulled is a dozen messages rather than eighty.
+    """
+    if guards.loop_disabled_present:
+        raise_alert(
+            "error", "The trading loop is switched off",
+            f"{guards.loop_disabled} exists, so no tick does anything at all.\n\n"
+            "Clear it with agent/reenable.sh when you mean to start again.",
+            key="kill_switch:loop_disabled", now=now)
+    if guards.stop_present:
+        raise_alert(
+            "warn", "The stop file is in place",
+            f"{guards.stop} exists. Every book may close what it holds and none "
+            "may open anything.\n\nClear it with agent/reenable.sh, or "
+            f"rm {guards.stop}.",
+            key="kill_switch:stop", now=now)
+    if guards.no_trade_present:
+        raise_alert(
+            "warn", "No book is opening anything today",
+            f"{guards.no_trade_today} exists, which the 9 AM pre-flight writes "
+            "when one of its checks fails. Exits still work.\n\nIt does not "
+            "clear itself overnight, on purpose. Clear it with agent/reenable.sh "
+            "once you have looked at why the morning failed.",
+            key="kill_switch:no_trade_today", now=now)
+    if kill_switch_flattened():
+        raise_alert(
+            "warn", "The kill switch flattened the account",
+            "The books have been brought into line with an account the kill "
+            "switch emptied, rather than halted over the difference. Nothing has "
+            "gone wrong: somebody pulled the handle and it worked.",
+            key="kill_switch:flattened", now=now)
+
+
+def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
+                            rules: str) -> None:
+    """Say so when the books and the broker disagree, or nobody could ask.
+
+    A mismatch halts a book for the day, and until 2026-09-06 that was written
+    to a log file and to a spreadsheet and to nobody. One alert per tick that
+    finds one, quiet for half an hour afterwards, because reconciliation runs
+    every five minutes and the same disagreement is still there at 09:55.
+    """
+    if outcome.ok:
+        return
+    if not outcome.available:
+        raise_alert(
+            "error", "Reconciliation could not run at all",
+            f"{outcome.note}\n\nEvery book is halted for this tick, which is "
+            "the designed answer: a missing referee means no.",
+            key="reconcile:unavailable", now=now)
+        return
+    lines = "\n".join(f"- {line}" for line in outcome.lines[:6])
+    raise_alert(
+        "error", f"The books and the broker disagree: {outcome.note}",
+        f"{outcome.note}\n\n{lines}\n\n"
+        + (f"Halted: {', '.join(outcome.books_to_halt)}. Each of them opens "
+           "nothing more today and may still close what it holds.\n"
+           if outcome.books_to_halt else "")
+        + f"Rules {rules}, {now:%Y-%m-%d %H:%M} New York.",
+        key="reconcile:" + ",".join(sorted(outcome.books_to_halt)) or "reconcile",
+        now=now)
+
+
 def read_broker_facts(broker: broker_mod.Broker,
                       wanted_account: str | None) -> BrokerFacts:
     """One read of the shared account, used by all five books.
@@ -3714,6 +3955,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     if guards.no_trade_present:
         print(f"\nNO TRADE TODAY: {guards.no_trade_today} exists. No book opens "
               "anything today. Closing orders still work.")
+    alert_on_guard_files(guards, now)
 
     if broker is None:
         broker = broker_mod.McpBroker(account=account_wanted)
@@ -3764,12 +4006,17 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     halts: dict[str, str] = {}
     for book_id in outcome.books_to_halt:
         halts[str(book_id).upper()] = outcome.note
+        db_call("record_decision", ts=now, book_id=str(book_id), shape="reconcile",
+                rules_commit=rules, action="halted by reconciliation",
+                rationale=outcome.note, rejected=True,
+                reject_reason="reconciliation")
         ledger_writer.log_rule(
             now, "reconciliation", f"book {book_id}: {outcome.note} [rules {rules}]",
             "this book opens nothing until it is sorted out, and may still close "
             "positions", book_id=str(book_id), dry_run=not args.write_ledger)
     if halts:
         print(f"  halted this tick: {', '.join(sorted(halts))}")
+    alert_on_reconciliation(outcome, now, rules)
 
     lines: list[str] = []
     totals = {"would_be": 0, "approved": 0, "refused": 0, "sent": 0, "cost": 0.0,
