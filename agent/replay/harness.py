@@ -197,6 +197,28 @@ class Sandbox:
         return self.output / "NO_TRADE_TODAY"
 
 
+def build_sandbox_database(sandbox: "Sandbox", db_module) -> str:
+    """Build this scenario's own SQLite file from the real migrations.
+
+    Its own file, inside the sandbox, so a gate run cannot touch
+    data/trading.sqlite. agent/db.py works the path out from
+    AGENTIC_TRADING_ROOT, which run_day has already repointed, so nothing has to
+    be passed in.
+
+    Returns a sentence for the report, or a reason it could not be built. A
+    sandbox with no database is not a gate failure: every writer in the loop
+    survives one, and there is a test that says so. It is just a gate run that
+    proves less.
+    """
+    if db_module is None:
+        return "agent/db.py could not be imported, so nothing was recorded"
+    try:
+        db_module.migrate(folder=sandbox.root / "data" / "migrations")
+    except Exception as exc:                     # noqa: BLE001
+        return f"the sandbox database could not be built: {type(exc).__name__}: {exc}"
+    return f"the sandbox database is at {db_module.db_path()}"
+
+
 def _patch_yaml_scalar(text: str, key: str, value: str) -> str:
     """Set `key:` to `value` on every line that starts one, keeping the indent.
 
@@ -233,6 +255,13 @@ def build_sandbox(root: Path, *, mode: str = "full",
     and finding neither it gives up politely and reads whatever shortlist file
     is already there. That is exactly what the gate wants: real shortlist
     reading, no IBKR scanner call, no SEC call, no subprocess at all.
+
+    data/migrations/ IS copied, and the sandbox database is built from it before
+    the first tick. Since 2026-09-06 the loop writes its ticks, decisions,
+    orders, fills and position snapshots to SQLite as the system of record, and
+    a gate run against a database that does not exist would prove nothing about
+    that half of the loop while filling the terminal with the same warning
+    eighty times a tick.
     """
     import yaml                                  # noqa: PLC0415
 
@@ -243,6 +272,7 @@ def build_sandbox(root: Path, *, mode: str = "full",
     shutil.copytree(REAL_ROOT / "config", root / "config",
                     ignore=shutil.ignore_patterns("launchd", "*.ini"))
     shutil.copytree(REAL_ROOT / "strategies", root / "strategies")
+    shutil.copytree(REAL_ROOT / "data" / "migrations", root / "data" / "migrations")
 
     source = Path(books_yaml or REAL_BOOKS_YAML)
     text = source.read_text()
@@ -1058,6 +1088,11 @@ def _import_project_modules() -> dict:
         modules["alerts"] = alerts
     except Exception:                             # noqa: BLE001
         modules["alerts"] = None
+    try:
+        import db                                 # noqa: PLC0415
+        modules["db"] = db
+    except Exception:                             # noqa: BLE001
+        modules["db"] = None
     return modules
 
 
@@ -1223,6 +1258,55 @@ def crafted_broker(series: dict[str, list[dict]], *, daily: dict | None = None,
                       **settings)
 
 
+#: Industries handed to the replay's symbols, so a scenario has something for
+#: the sector cap to count. Deterministic, because a gate that shuffles its own
+#: inputs between runs cannot be compared with the run before it. The names are
+#: IBKR's own industry wording, which is what the scanner writes in production.
+REPLAY_SECTORS = ("Technology", "Consumer, Non-cyclical", "Energy",
+                  "Financial", "Industrial", "Communications",
+                  "Basic Materials", "Utilities")
+
+
+def synthetic_sector(symbol: str) -> str:
+    """An industry for one replayed symbol, the same one every run.
+
+    Spread across REPLAY_SECTORS by the symbol's own letters, so a shortlist of
+    several names is not all one industry, which would make the sector cap fire
+    on the second entry of every scenario and test nothing but the cap.
+    """
+    text = str(symbol).upper()
+    return REPLAY_SECTORS[sum(ord(c) for c in text) % len(REPLAY_SECTORS)]
+
+
+def synthetic_atr(daily_bars: list, day: date_type, days: int = 14) -> float:
+    """The average true range out of the recorded daily bars, in dollars.
+
+    The true range of one session is the largest of the day's own high minus
+    low, the gap from the previous close up to today's high, and the gap from
+    the previous close down to today's low. Averaging it over 14 sessions is
+    what the stop is measured from since Momentum v2.
+
+    Falls back to a twentieth of the last close when there are not enough bars,
+    which keeps a thin recording usable rather than leaving a row that cannot be
+    traded. It is an approximation and it is only ever an input to the gate.
+    """
+    prior = [b for b in daily_bars if str(b.get("time", ""))[:10] < f"{day:%Y-%m-%d}"]
+    ranges = []
+    for older, newer in zip(prior, prior[1:]):
+        high = _number(newer.get("high"))
+        low = _number(newer.get("low"))
+        close_before = _number(older.get("close"))
+        if high <= 0 or low <= 0 or close_before <= 0:
+            continue
+        ranges.append(max(high - low, abs(high - close_before),
+                          abs(low - close_before)))
+    if len(ranges) >= 2:
+        wanted = ranges[-days:]
+        return round(sum(wanted) / len(wanted), 4)
+    last = _number(prior[-1].get("close")) if prior else 0.0
+    return round(last / 20.0, 4) if last > 0 else 0.5
+
+
 def synthetic_shortlist(broker: FakeBroker, day: date_type,
                         symbols: Iterable[str]) -> list[dict]:
     """The scanner's answer, worked out from the recorded bars instead.
@@ -1236,6 +1320,24 @@ def synthetic_shortlist(broker: FakeBroker, day: date_type,
     It gives the momentum books real candidates on a real day, and it is honest
     about being an approximation: nothing here proves the scanner works, only
     that the loop does something sensible with a shortlist.
+
+    Since Momentum v2 (Mo, 2026-09-06) a row has to carry more than a price and
+    a range, because the loop now reads five more fields off it and two of them
+    can stop a trade outright:
+
+        sector                   the sector cap refuses an entry whose industry
+                                 nobody can name, so a row without one cannot be
+                                 traded at all. In production the scanner reads
+                                 it from IBKR's contract details.
+        atr                      the stop is 10 percent of it.
+        opening_range_open       the direction rule is the sign of this candle,
+        opening_range_close      and a flat one is no trade.
+        rel_volume, rank         the selection rule.
+
+    Leaving them out does not make the replay stricter, it makes it test the
+    wrong thing: every entry gets refused for a missing field and the scenario
+    underneath never runs. That is exactly what happened on the first gate run
+    after Momentum v2 landed, which is why they are here.
     """
     rows: list[dict] = []
     for symbol in symbols:
@@ -1256,6 +1358,12 @@ def synthetic_shortlist(broker: FakeBroker, day: date_type,
         close = _number(first.get("close"))
         volume = _number(first.get("volume"))
         gain = ((close / prior_close - 1.0) * 100.0) if prior_close > 0 else 0.0
+        average_volume = (sum(_number(b.get("volume")) for b in daily[-20:])
+                          / max(1, len(daily[-20:])))
+        # The first five minutes are about 1.3 percent of a 390 minute session,
+        # so that share of a normal day is what "normal" means at 09:35.
+        expected = average_volume * (5.0 / 390.0)
+        rel_volume = round(volume / expected, 2) if expected > 0 else 0.0
         rows.append({
             "symbol": symbol,
             "last": round(close, 2),
@@ -1263,8 +1371,15 @@ def synthetic_shortlist(broker: FakeBroker, day: date_type,
             "prior_close": round(prior_close, 2),
             "gain_pct": round(gain, 3),
             "volume": int(volume),
+            "volume_today": int(volume),
+            "avg_volume_20d": int(average_volume),
+            "rel_volume": rel_volume,
             "opening_range_high": round(high, 2),
             "opening_range_low": round(low, 2),
+            "opening_range_open": round(_number(first.get("open")) or close, 2),
+            "opening_range_close": round(close, 2),
+            "atr": synthetic_atr(daily, day),
+            "sector": synthetic_sector(symbol),
             "avg_daily_dollar_volume": int(
                 sum(_number(b.get("volume")) * _number(b.get("close"))
                     for b in daily[-20:]) / max(1, len(daily[-20:]))),
@@ -1273,6 +1388,9 @@ def synthetic_shortlist(broker: FakeBroker, day: date_type,
     # Rank by the size of the move first, then by what traded, then by name so
     # two runs of the same day produce the same order.
     rows.sort(key=lambda r: (-abs(r["gain_pct"]), -r["volume"], r["symbol"]))
+    # And stamp the place each one took, which is what the selection rule reads.
+    for place, row in enumerate(rows, start=1):
+        row["rank"] = place
     for place, row in enumerate(rows, start=1):
         row["score"] = round(100.0 - place, 3)
         row["rank"] = place
@@ -1355,6 +1473,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
 
     try:
         os.environ[ROOT_ENV_VAR] = str(sandbox.root)
+        build_sandbox_database(sandbox, modules.get("db"))
         # Opened here and nowhere else, and only while the broker above is a
         # FakeBroker. The finally block below always puts it back.
         os.environ[LIVE_ENV_VAR] = "yes"

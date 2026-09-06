@@ -46,12 +46,28 @@
 #                  is no argument later about which version of the numbers and
 #                  the guardrails was signed off
 #
-# rules_commit is stamped on books A, B and E as of 2026-09-06: 273e928, which is
-# the commit that carries Momentum v2, the numbers Mo approved that day. It says
+# rules_commit is stamped on books A, B and E as of 2026-09-06: 03e5318. It says
 # WHICH RULES THE BOOK RUNS. It is not a promotion: promoted_on is still empty on
 # all five books, every one of them is still on dry_run, and a book cannot be set
 # to tiny or full without both fields filled in. Books C and D keep an empty
-# stamp because their numbers were not part of that approval.
+# stamp because their numbers were not part of Mo's approval.
+#
+# WHEN TO MOVE IT (Mo, 2026-09-06). The stamp has to name the tree as it actually
+# stands, not the moment somebody said yes. It was first set to 273e928, the commit
+# carrying the Momentum v2 numbers Mo approved. Two later commits then changed
+# how the rules behave, so it moved forward to 03e5318.
+#
+# The rule from here: BEFORE THE FIRST TRADE, move this stamp whenever a commit
+# changes guardrail behaviour. Not for a typo, a comment or a test, and not for
+# plumbing that leaves every limit answering exactly as it did. For anything that
+# changes what an order check says yes or no to, move it, because a stamp that
+# names a commit whose guardrails have since changed is worse than no stamp: it
+# looks like an answer.
+#
+# AFTER THE FIRST TRADE it stops being housekeeping and becomes a version. From
+# then on a rules change is a new approved version with its own entry in the
+# strategy's CHANGELOG.md, and the stamp moves with it so every ledger row can
+# still be read against the exact limits it was made under.
 # A book set to tiny or full without both of them filled in refuses to load, so
 # a mode change on its own cannot quietly start sending orders.
 #
@@ -166,7 +182,7 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 273e928          # the git hash of the rules this book runs
+    rules_commit: 03e5318          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06
     start_date: 2026-09-08
@@ -190,7 +206,7 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 273e928          # the git hash of the rules this book runs
+    rules_commit: 03e5318          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06
     start_date: 2026-09-08
@@ -254,7 +270,7 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 273e928          # the git hash of the rules this book runs
+    rules_commit: 03e5318          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06
     start_date: 2026-09-08

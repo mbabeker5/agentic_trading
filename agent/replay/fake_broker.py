@@ -137,6 +137,8 @@ FAULT_KINDS = (
     "competing_session",
     "phantom_position",
     "reject_next_order",
+    "halted",
+    "limit_state",
 )
 
 #: IBKR's code for "another session is already using this connection". Worth
@@ -218,6 +220,24 @@ def _number(value: Any, default: float | None = None) -> float | None:
     if math.isnan(result) or math.isinf(result):
         return default
     return result
+
+
+def _fault_hits(fault: dict, symbol: str) -> bool:
+    """Does an injected halt or limit-state fault apply to this symbol?
+
+    A fault with no symbols named applies to every name, which is the blunt
+    version a scenario wants when it is testing that the loop stops dead. A
+    fault naming symbols applies only to those, so one stock can be halted while
+    the rest of the market carries on, which is what a real halt looks like.
+    """
+    if not fault:
+        return False
+    wanted = fault.get("symbols") or fault.get("symbol")
+    if not wanted:
+        return True
+    if isinstance(wanted, str):
+        wanted = [wanted]
+    return str(symbol).upper() in {str(s).upper() for s in wanted}
 
 
 def _price(value: float) -> float:
@@ -637,6 +657,16 @@ class FakeBroker:
                                (default 100), avg_cost.
             reject_next_order  the next place_order comes back rejected, then
                                the fault clears itself.
+            halted             IBKR's halted tick reports the name as halted, so
+                               nothing may be opened in it and only an exit or a
+                               flatten goes out. Options: symbols, a list, or
+                               symbol, one name. Name none and every name in the
+                               replay is halted.
+            limit_state        the name is pinned at the top of its limit-up
+                               limit-down band, which is the step immediately
+                               before a volatility halt. No new position is
+                               opened in it, and getting out is still allowed.
+                               Same symbol options as halted.
         """
         name = str(kind).strip()
         if name not in FAULT_KINDS:
@@ -1714,6 +1744,21 @@ class FakeBroker:
         Uses the recorded snapshot nearest before now when there is one, and
         falls back to building a quote out of the last bar's close and the
         default spread when there is not. Never looks ahead of the clock.
+
+        EVERY QUOTE CARRIES THE HALT FACTS, because a real Gateway does. IBKR's
+        halted tick is tick type 49 and it comes back as a number, zero meaning
+        the name is trading normally, and the limit-up limit-down band comes
+        back as a pair of prices. agent/loop.py reads both and passes them to
+        the guardrails, where an UNKNOWN halt status refuses an entry rather
+        than being read as a clean name.
+
+        That last rule is why these fields have to be here. A fake broker that
+        left them out would not be modelling a quiet market, it would be
+        modelling a broker that cannot answer, and every entry in every replay
+        would be refused for a reason that has nothing to do with the scenario
+        being tested. So the default is a name that is trading, with a band wide
+        enough not to bite, and the halt fault below is what makes it say
+        otherwise.
         """
         self._guard_connection("read a snapshot")
         if "competing_session" in self._faults:
@@ -1724,11 +1769,19 @@ class FakeBroker:
                 code=COMPETING_SESSION_CODE)
 
         served = 3 if "delayed_data" in self._faults else int(market_data_type)
+
+        # Two faults a scenario can inject to exercise the halted rule. Both
+        # name the symbols they apply to, or all of them when the fault names
+        # none, so a scenario can halt one stock without halting the market.
+        halt_fault = self._fault("halted") or {}
+        band_fault = self._fault("limit_state") or {}
         rows = []
         for contract in contracts or []:
             symbol = common.symbol_of(contract)
             if not symbol:
                 continue
+            halted_now = _fault_hits(halt_fault, symbol)
+            pinned_now = _fault_hits(band_fault, symbol)
             quote = self._quote_near(symbol, self.now) or {}
             bid = _number(quote.get("bid"))
             ask = _number(quote.get("ask"))
@@ -1749,6 +1802,16 @@ class FakeBroker:
                 "last": None if last is None else _price(last),
                 "close": None if close is None else _price(close),
                 "volume": volume,
+                # Tick 49. Zero is trading normally, one is halted.
+                "halted": 1 if halted_now else 0,
+                # The limit-up limit-down band, as the pair of prices IBKR
+                # reports. Ten percent either side of the last price, which is
+                # wide enough that an ordinary bar never touches it, unless the
+                # limit_state fault has pinned the price to the top of it.
+                "limitUpPrice": (None if last is None else
+                                 _price(last * (1.0 if pinned_now else 1.10))),
+                "limitDownPrice": (None if last is None else
+                                   _price(last * 0.90)),
                 "marketDataType": served,
                 "market_data_type": served,
                 "market_data_type_label": common.MARKET_DATA_TYPE_LABELS.get(served, "unknown"),

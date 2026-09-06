@@ -8,7 +8,9 @@ Book B is the rules only control for books A and E. Its numbers are identical to
 
 Approved by Mo from the consolidated critique at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06.md`
 
-Commit: 273e928
+Commit: 03e5318
+
+The numbers Mo approved landed in 273e928. The stamp names 03e5318 instead, because two commits after that one changed how the rules behave: `7937e78` wired the facts several guardrails were reading and nobody was filling, and `03e5318` retired the cross-book symbol exclusivity rule so it reports rather than refuses. A stamp naming a commit whose guardrails have since changed looks like an answer and is not one, so before the first trade the stamp follows any commit that changes guardrail behaviour. Nothing has traded: all five books are still on `dry_run`.
 
 Stamped into `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml` as `rules_commit` for books A, B and E.
 

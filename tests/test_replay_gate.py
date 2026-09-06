@@ -259,15 +259,38 @@ def test_every_fast_scenario_ran_a_whole_day(fast_reports):
 
 
 @needs_history
+#: flatten_at_close came OFF this list on 2026-09-06, and two others went on.
+#: Worth a sentence, because it used to pass.
+#:
+#: It passed for the wrong reason. Before Momentum v2 the replay's synthetic
+#: shortlist carried no industry, so the sector cap refused every entry, so no
+#: book ever held anything, so there was nothing left working at the close for
+#: the scenario to complain about. Once the shortlist grew the fields the real
+#: scanner now writes, entries went out, and the scenario immediately found a
+#: real bug: an entry goes out as a bracket, a parent and a resting stop child,
+#: and NOTHING CANCELS EITHER OF THEM at the flatten. agent/loop.py calls
+#: cancel_order in exactly two places, moving a stop and the sixty second market
+#: backstop, and neither of them runs at 15:45.
+#:
+#: In a live account that is a stop resting at the broker for a position that no
+#: longer exists, plus an unfilled entry that could fill on the next open into a
+#: book that believes it is flat. It belongs to the loop follow-on, backlog item
+#: 0, and it is written down there.
+#:
+#: gateway_down, rejected_order and two_books_one_symbol went on in the same
+#: pass, because all three now pass and a guard that does not name them would
+#: not notice them breaking.
 @pytest.mark.parametrize("key", [
     "daily_loss_cap",
-    "flatten_at_close",
     "kill_switch",
+    "gateway_down",
+    "rejected_order",
+    "two_books_one_symbol",
 ])
 def test_the_scenarios_that_pass_today_still_pass(fast_reports, key):
     """A regression guard, not a specification.
 
-    These three pass against the loop as it stands on 2026-09-06. The other fast
+    These five pass against the loop as it stands on 2026-09-06. The other fast
     scenarios fail, and they are deliberately not asserted on here: the day one
     of them starts passing is the day somebody fixed the loop, and a test that
     went red for that would be telling the wrong story.

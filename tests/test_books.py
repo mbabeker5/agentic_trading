@@ -1647,23 +1647,51 @@ def noted_rule_ids(decision) -> list[str]:
 
 
 def sharing_allowed(guard):
-    """The same book with universe.symbol_exclusive turned off."""
+    """The same book with universe.symbol_exclusive turned off.
+
+    Which is the default since 2026-09-06, so this is now a no-op on a book
+    loaded from the real settings. It is kept because a test that means "with
+    sharing allowed" should say so rather than rely on the default staying put.
+    """
     return dataclasses.replace(
         guard,
         universe=dataclasses.replace(guard.universe, symbol_exclusive=False),
     )
 
 
-def test_the_default_in_the_settings_file_is_one_ticker_one_book():
-    """Nobody has to remember to write the key. Left out, it comes back true."""
+def one_ticker_one_book(guard):
+    """The same book with the old exclusivity rule switched back on.
+
+    The rule was retired on 2026-09-06 but both branches are still built and
+    both are still tested, because overturning the decision has to be one line
+    rather than a rewrite. This is what a test uses to exercise the branch that
+    is not the default.
+    """
+    return dataclasses.replace(
+        guard,
+        universe=dataclasses.replace(guard.universe, symbol_exclusive=True),
+    )
+
+
+def test_the_default_in_the_settings_file_lets_books_share_a_ticker():
+    """The hub retired one ticker one book on 2026-09-06 and Mo confirmed it.
+
+    Left out of a settings file the key comes back FALSE, so a book that says
+    nothing about it shares happily. The old behaviour is one line away and is
+    tested right below.
+    """
     for book_id in ("A", "B", "C", "D", "E"):
         guard = load_book_guardrails(BOOKS_YAML, book_id)
-        assert guard.universe.symbol_exclusive is True, book_id
+        assert guard.universe.symbol_exclusive is False, book_id
 
 
-def test_an_entry_in_a_name_another_book_holds_is_refused_by_default():
-    """Book B has AAPL, so book A may not open in it. The hub's standing rule."""
-    momentum = load_book_guardrails(BOOKS_YAML, "A")
+def test_an_entry_in_a_name_another_book_holds_is_refused_with_the_switch_on():
+    """Book B has AAPL and book A may not open in it, the way the old rule ran.
+
+    Not the default any more. This is the branch Mo would be turning back on if
+    he overturned the decision of 2026-09-06, so it stays tested.
+    """
+    momentum = one_ticker_one_book(load_book_guardrails(BOOKS_YAML, "A"))
     decision = check_order(
         momentum,
         state_with_others("A", {"AAPL": "B"}),
@@ -1810,7 +1838,7 @@ def test_the_map_of_other_books_is_read_however_it_is_typed():
     assert decision.allowed is True, decision.summary
     assert "Book B" in note_for(decision, "symbol_exclusive")
 
-    strict = load_book_guardrails(BOOKS_YAML, "A")
+    strict = one_ticker_one_book(load_book_guardrails(BOOKS_YAML, "A"))
     refused = check_order(
         strict,
         state_with_others("A", {" aapl ": " b "}),
@@ -1948,7 +1976,7 @@ def test_the_two_rule_ids_added_that_day_still_have_something_to_say():
     momentum = load_book_guardrails(BOOKS_YAML, "A")
 
     refusing = check_order(
-        momentum,
+        one_ticker_one_book(momentum),
         state_with_others("A", {"AAPL": "B"}),
         buy("A", symbol="AAPL", qty=10, limit_price=50.0),
     )
