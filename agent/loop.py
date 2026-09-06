@@ -23,8 +23,8 @@ Books A, B and E run the opening momentum strategy on a five minute clock. Book
 C buys insider filings and book D buys Congress filings, both on a thirty minute
 clock, and neither is sold off at the close. Every book has its own money, its
 own limits and its own tag on its orders, and every log line and ledger row says
-which book it came from. What differs is only the clock and where the shortlist
-comes from:
+which book it came from and which commit of the rules it ran under. What differs
+between them is the clock and where the shortlist comes from:
 
     momentum   scanner 09:30 to 09:35, pick 09:35, manage every 5 minutes,
                entries until 11:00, everything sold at 15:55
@@ -41,14 +41,15 @@ broker's own order tools. Every order this file works out is printed as
 that is where it stops. The live path exists below, in submit(), and it is shut
 behind four separate locks that all have to be open at once:
 
-    1. the book's mode in config/books.yaml is tiny or full. It is dry-run for
-       all five, and agent/guardrails.py refuses to load any other value today.
+    1. the book's mode in config/books.yaml is tiny or full. It is dry_run for
+       all five, and a book cannot even be set to tiny or full without a
+       promoted_on date and a rules_commit hash from the hub beside it.
     2. the environment variable AGENTIC_TRADING_LIVE_ORDERS is set to yes.
     3. the account id starts with DU, which is how IBKR names paper accounts.
     4. none of output/STOP, output/LOOP_DISABLED or output/NO_TRADE_TODAY exist.
 
 Do not set that environment variable. Opening these locks is a decision for Mo
-after he has read the numbers in docs/STRATEGY.md, not a step in a script.
+after the hub has approved a book, not a step in a script.
 
 The three files that stop it
 ----------------------------
@@ -91,11 +92,11 @@ import broker as broker_mod                 # noqa: E402
 import decide as decide_mod                 # noqa: E402
 import guardrails as gr                     # noqa: E402
 import ledger_writer                        # noqa: E402
-import mcp_client as mcp                    # noqa: E402
 
-# Two modules another agent is writing at the same time as this one. The loop
-# has to be safe whether or not they have landed, so both are optional and a
-# missing one degrades to the careful answer rather than to a crash.
+# Two modules another agent wrote alongside this one. The loop has to be safe
+# whether or not they are there, so both are optional: a missing one degrades to
+# the careful answer rather than to a crash. Both landed on 2026-09-06 and the
+# real ones are used below.
 try:
     import reconcile as reconcile_mod       # noqa: E402
     RECONCILE_ERROR: str | None = None
@@ -124,18 +125,14 @@ MOMENTUM, INSIDER, CONGRESS = "momentum", "insider", "congress"
 # tick at 07:03 still counts as the 07:00 sweep and one at 09:00 does not.
 SWEEP_WINDOW_MINUTES = 20
 
-# A shortlist file this old is stale and the scanner or sweep is run again. All
-# three momentum books share one scanner run, so whichever ticks first pays for
-# it and the other two read the file.
+# A shortlist file younger than this is used as it stands. All three momentum
+# books share one scanner run, so whichever ticks first pays for it and the
+# other two read the file it wrote.
 SHORTLIST_FRESH_MINUTES = 10
 
-# The classic pattern day trader line: a fourth day trade inside five business
-# days is what the rule is about.
-DAY_TRADE_LIMIT = 3
-
-# Books C and D hold for weeks, so a same day round trip in one of them is a
-# bug rather than a strategy, and it is refused. Books A, B and E are day
-# trading books on purpose, so a day trade there is written down and allowed.
+# Only used when agent/pdt.py cannot be imported. Normally the hard limit comes
+# from pdt.hard_limit in each book's own strategy.yaml, which is true for the
+# insider and Congress books and false for the three momentum ones.
 DAY_TRADE_HARD_LIMIT_BOOKS = ("C", "D")
 
 
@@ -157,7 +154,7 @@ def rules_commit() -> str:
     Every log line and every ledger row carries it, so a month later a decision
     can be read against the exact limits that were in force when it was made.
     Comes back as "unknown" outside a git checkout rather than raising, because
-    not knowing the hash is not a reason to skip a tick.
+    not knowing the hash is no reason to skip a tick.
     """
     try:
         finished = subprocess.run(
@@ -220,10 +217,6 @@ class Guards:
     def no_trade_present(self) -> bool:
         return self.no_trade_today.exists()
 
-    @property
-    def any_present(self) -> bool:
-        return self.loop_disabled_present or self.stop_present or self.no_trade_present
-
 
 def read_guards(root: Path | None = None) -> Guards:
     folder = (root or project_root()) / "output"
@@ -245,7 +238,7 @@ def entries_blocked_reason(guards: Guards, state: bs.BookState) -> str | None:
     return None
 
 
-# ------------------------------------------------------------- what each book does
+# --------------------------------------------------------- what each book does
 
 @dataclass(frozen=True)
 class BookPlan:
@@ -280,16 +273,16 @@ def family_for(book: gr.BookConfig) -> str:
     return MOMENTUM
 
 
-def _clock(text: str) -> clock_time:
-    return datetime.strptime(text, "%H:%M").time()
+def _clock(text: Any) -> clock_time:
+    return datetime.strptime(str(text).strip(), "%H:%M").time()
 
 
 def plan_for(book: gr.BookConfig, guard: gr.Guardrails) -> BookPlan:
     """The book's timetable, read from its own settings.
 
     The sweep times come from the sweep block of the strategy file, which the
-    guardrails carry through untouched because they are not order limits. If a
-    book has no sweep block the times below are the ones written in
+    guardrails carry through untouched because they are not order limits. A book
+    with no sweep block falls back to the times written in
     docs/STRATEGY_INSIDER.md and docs/STRATEGY_CONGRESS.md.
     """
     family = family_for(book)
@@ -297,11 +290,11 @@ def plan_for(book: gr.BookConfig, guard: gr.Guardrails) -> BookPlan:
     sweep = guard.sweep or {}
 
     if family == INSIDER:
-        times = tuple(_clock(str(sweep.get(key) or fallback)) for key, fallback in
+        times = tuple(_clock(sweep.get(key) or fallback) for key, fallback in
                       (("morning_sweep_at", "07:00"), ("afternoon_sweep_at", "16:30")))
         script, prefix = "sweep_insider.py", "insider_shortlist"
     elif family == CONGRESS:
-        times = (_clock(str(sweep.get("disclosure_sweep_at") or "07:30")),)
+        times = (_clock(sweep.get("disclosure_sweep_at") or "07:30"),)
         script, prefix = "sweep_congress.py", "congress_shortlist"
     else:
         times, script, prefix = (), None, "shortlist"
@@ -328,8 +321,8 @@ def manage_due(now: datetime, last_manage_at: str | datetime | None,
 
     The loop wakes every five minutes for everybody. A book on a thirty minute
     clock only looks every sixth wake up, and it works that out from when it
-    last looked rather than from the minute hand, so a tick that was missed
-    because the Mac was asleep does not push the whole day out of step.
+    last looked rather than from the minute hand, so a tick missed because the
+    Mac was asleep does not push the whole day out of step.
     """
     if last_manage_at is None:
         return True
@@ -341,19 +334,19 @@ def manage_due(now: datetime, last_manage_at: str | datetime | None,
             return True
     if when.tzinfo is None:
         when = when.replace(tzinfo=now.tzinfo)
-    # One minute of slack, so a tick that lands a few seconds early still counts.
+    # A minute of slack, so a tick landing a few seconds early still counts.
     return (now - when).total_seconds() >= max(0, int(minutes) * 60 - 60)
 
 
-def sweep_due(now: datetime, plan: BookPlan, swept_at: dict) -> str | None:
+def sweep_due(now: datetime, plan: BookPlan, swept_at: dict | None) -> str | None:
     """Which sweep slot this tick belongs to, or None.
 
-    A slot is named by its time, "07:00", and once a sweep has run for that slot
+    A slot is named by its time, "07:00". Once a sweep has run for that slot
     today it does not run again, however many ticks land inside the window.
     """
     for moment in plan.sweep_times:
         slot = f"{moment:%H:%M}"
-        if swept_at.get(slot):
+        if (swept_at or {}).get(slot):
             continue
         start = datetime.combine(now.date(), moment, tzinfo=now.tzinfo)
         if start <= now < start + timedelta(minutes=SWEEP_WINDOW_MINUTES):
@@ -364,10 +357,10 @@ def sweep_due(now: datetime, plan: BookPlan, swept_at: dict) -> str | None:
 def phase_for(now: datetime, plan: BookPlan, *, pick_done: bool = False,
               last_manage_at: str | datetime | None = None,
               swept_at: dict | None = None) -> tuple[str, str]:
-    """Which part of the day this is for one book, and one sentence saying why.
+    """Which part of the day this is for one book, and a sentence saying why.
 
     Deliberately takes plain values rather than a state object, so every branch
-    can be tested with two lines and no files on disk.
+    can be tested in two lines with no files on disk.
     """
     swept_at = swept_at or {}
     moment = now.time()
@@ -410,66 +403,80 @@ def phase_for(now: datetime, plan: BookPlan, *, pick_done: bool = False,
 
 @dataclass
 class ReconcileOutcome:
-    """What the reconciliation said, in a shape this loop can act on."""
+    """What the reconciliation said, in the shape this loop acts on."""
 
     available: bool
     ok: bool
     books_to_halt: list = field(default_factory=list)
-    mismatches: list = field(default_factory=list)
+    lines: list = field(default_factory=list)
     orphans: list = field(default_factory=list)
     note: str = ""
 
 
-def expected_orphans(root: Path | None = None) -> list:
-    """Positions and orders that belong to no book and are known about.
+def expected_orphans(root: Path | None = None) -> Any:
+    """Positions the books already know nobody will claim.
 
-    The paper account already holds one share of SPY from the manual test on
-    2026-09-02, and nothing in books.yaml owns it. Without a list like this,
-    every single tick would report it as a mismatch and halt all five books.
-    Add a symbol to output/expected_orphans.json to forgive it.
+    The paper account holds one share of SPY from the manual test on 2026-09-02
+    and no book owns it. Without a list like this, every single tick would report
+    it and halt all five books. Write output/expected_orphans.json as either
+    ["SPY"], which forgives any quantity, or {"SPY": 1}, which forgives that
+    exact quantity and complains again if it changes.
     """
     path = ((root or project_root()) / "output" / "expected_orphans.json")
     if not path.exists():
-        return []
+        return None
     try:
         loaded = json.loads(path.read_text())
     except Exception:                        # noqa: BLE001
-        return []
-    if isinstance(loaded, list):
-        return loaded
-    if isinstance(loaded, dict):
-        return list(loaded.get("symbols") or loaded.get("orphans") or [])
-    return []
+        return None
+    return loaded if isinstance(loaded, (list, dict)) else None
+
+
+def broker_positions_for_reconcile(rows: dict[str, dict]) -> list[dict]:
+    """The account's holdings in the three fields agent/reconcile.py reads."""
+    return [{"symbol": symbol,
+             "qty": int(round(_number(row.get("position")))),
+             "avg_cost": round(_number(row.get("avgCost")), 4)}
+            for symbol, row in rows.items()]
+
+
+def broker_orders_for_reconcile(rows: list[dict]) -> list[dict]:
+    """The account's working orders in the five fields agent/reconcile.py reads."""
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        out.append({
+            "orderId": row.get("orderId") or row.get("order_id"),
+            "symbol": row.get("symbol"),
+            "side": row.get("action") or row.get("side"),
+            "qty": row.get("totalQuantity") or row.get("qty") or row.get("remaining"),
+            "order_ref": row.get("orderRef") or row.get("order_ref"),
+        })
+    return out
 
 
 def run_reconciliation(broker_positions: list, broker_open_orders: list,
-                       books_state: dict, orphans: list) -> ReconcileOutcome:
+                       books_state: dict, orphans: Any) -> ReconcileOutcome:
     """Ask agent/reconcile.py whether the books and the broker agree.
 
-    Five books share one account, so the only thing that says which book owns a
+    Five books share one account, so the only thing saying which book owns a
     position is the tag on the order that opened it. If the book files and the
-    broker disagree, nobody knows who owns what, and sizing the next order would
-    be guesswork. So a mismatch halts the book it belongs to.
+    broker disagree, nobody knows who owns what and sizing the next order would
+    be guesswork, so a mismatch halts the book it belongs to.
 
-    That module is being written at the same time as this one. When it is not
-    there, or its answer cannot be read, every book is halted for the tick. A
-    halted book still closes positions, because refusing to close is its own
-    risk, and it opens nothing.
+    When that module is missing, or its answer cannot be read, every book is
+    halted for the tick. A halted book still closes positions, because refusing
+    to close is its own kind of risk, and it opens nothing.
     """
-    if reconcile_mod is None:
+    if reconcile_mod is None or getattr(reconcile_mod, "reconcile", None) is None:
         return ReconcileOutcome(
             available=False, ok=False, books_to_halt=list(books_state),
             note=("reconciliation unavailable, halting all books: agent/reconcile.py "
-                  f"could not be imported ({RECONCILE_ERROR})"))
+                  f"could not be imported "
+                  f"({RECONCILE_ERROR or 'it has no reconcile function'})"))
 
-    function = getattr(reconcile_mod, "reconcile", None)
-    if function is None:
-        return ReconcileOutcome(
-            available=False, ok=False, books_to_halt=list(books_state),
-            note="reconciliation unavailable, halting all books: agent/reconcile.py "
-                 "has no reconcile function")
-
-    report = None
+    function = reconcile_mod.reconcile
     try:
         report = function(broker_positions, broker_open_orders, books_state,
                           expected_orphans=orphans)
@@ -488,16 +495,16 @@ def run_reconciliation(broker_positions: list, broker_open_orders: list,
                  f"{type(exc).__name__}: {exc}")
 
     ok = bool(getattr(report, "ok", False))
-    halt = list(getattr(report, "books_to_halt", []) or [])
-    mismatches = list(getattr(report, "mismatches", []) or [])
-    found_orphans = list(getattr(report, "orphans", []) or [])
-    if not ok and not halt:
-        # It said no but did not say which book, so the safe reading is all of them.
+    halt = [str(b) for b in (getattr(report, "books_to_halt", ()) or ())]
+    lines = list(getattr(report, "lines", ()) or ())
+    found = list(getattr(report, "orphans", ()) or ())
+    note = str(getattr(report, "summary", "")) or (
+        "everything matched" if ok else "the books and the broker disagree")
+    if not ok and not halt and not found:
+        # It said no but named no book, so the safe reading is all of them.
         halt = list(books_state)
-    note = ("the books and the broker agree" if ok else
-            f"{len(mismatches)} mismatch(es) between the books and the broker")
     return ReconcileOutcome(available=True, ok=ok, books_to_halt=halt,
-                            mismatches=mismatches, orphans=found_orphans, note=note)
+                            lines=lines, orphans=found, note=note)
 
 
 # ---------------------------------------------------------- the day trade count
@@ -507,102 +514,75 @@ class DayTradeVerdict:
     """Whether closing this position today is a day trade, and whether that stops it."""
 
     is_day_trade: bool
-    count: int | None
     blocked: bool
     reason: str
+    used: int | None = None
+    would_have_blocked: bool = False
 
 
-def make_day_trade_counter(book_id: str):
-    """A DayTradeCounter from agent/pdt.py, or None when that module is not there."""
+def make_day_trade_counter(guard: gr.Guardrails):
+    """The day trade counter for one book, or None when agent/pdt.py is missing."""
     if pdt_mod is None:
         return None
-    maker = getattr(pdt_mod, "DayTradeCounter", None)
-    if maker is None:
-        return None
-    store = output_dir() / f"day_trades_{book_id}.json"
     try:
-        return maker(book_id, str(store))
+        return pdt_mod.counter_for(guard)
     except Exception:                        # noqa: BLE001
-        try:
-            return maker(book_id=book_id, store_path=str(store))
-        except Exception:                    # noqa: BLE001
-            return None
-
-
-def _try(obj, name: str, *argument_sets):
-    """Call one method with the first set of arguments it will accept."""
-    function = getattr(obj, name, None)
-    if function is None:
         return None
-    for args, kwargs in argument_sets:
-        try:
-            return function(*args, **kwargs)
-        except TypeError:
-            continue
-        except Exception:                    # noqa: BLE001
-            return None
-    return None
 
 
-def day_trade_verdict(book_id: str, symbol: str, opened_on: str, today: date_type,
-                      counter=None) -> DayTradeVerdict:
-    """Would closing this position today count as a day trade, and does it matter here?
+def day_trade_check(guard: gr.Guardrails, intent: gr.OrderIntent, today: date_type,
+                    counter, opened_on: str = "") -> DayTradeVerdict:
+    """Would this closing order be a day trade, and does that matter for this book?
 
-    A day trade is buying and selling the same name on the same day. The book
-    file records the day each position was opened, so the loop can answer that
-    on its own even with agent/pdt.py missing. What it cannot answer on its own
-    is how many day trades the book has already done in the last five business
-    days, which is what the pattern day trader rule counts, so that number comes
-    from pdt.py when it is there and is None when it is not.
+    A day trade is buying and selling the same name on the same day. The count
+    that matters is how many the book has made in the last five business days,
+    and that lives in agent/pdt.py, which keeps one small file per book.
 
-    Books C and D hold for weeks. A same day round trip in one of them means
-    something has gone wrong, so it is refused. Books A, B and E day trade on
-    purpose, so it is written down and allowed through.
+    Whether going over the line refuses the order or merely notes it is the
+    pdt.hard_limit setting in each book's own strategy.yaml. It is true on the
+    insider and Congress books, which hold for weeks, so a same day round trip in
+    one of them is a mistake and is refused. It is false on the three momentum
+    books, which day trade on purpose, so it is written down and allowed. This is
+    the only check in the project that can refuse an order which closes a
+    position.
     """
+    book_id = guard.book_id or "?"
+    if counter is not None:
+        try:
+            decision = counter.check(guard, intent, today)
+        except Exception as exc:             # noqa: BLE001
+            return DayTradeVerdict(
+                False, False,
+                f"the day trade counter could not answer ({type(exc).__name__}: {exc}), "
+                "so this order was let through and the count is unknown")
+        allowed = bool(getattr(decision, "allowed", True))
+        reasons = list(getattr(decision, "reasons", []) or [])
+        flagged = bool(getattr(decision, "would_have_blocked", False))
+        return DayTradeVerdict(
+            is_day_trade=(not allowed) or flagged or bool(reasons),
+            blocked=not allowed,
+            reason="; ".join(reasons) or "not a day trade",
+            used=getattr(decision, "day_trades_used", None),
+            would_have_blocked=flagged)
+
+    # No counter. The book file still knows whether this position was opened
+    # today, which is the day trade test; what it cannot know is how many day
+    # trades came before it, which is the number the rule counts. So it is noted
+    # and let through: refusing to close a position on the strength of a missing
+    # counter is the more dangerous mistake.
     same_day = bool(opened_on) and str(opened_on)[:10] == f"{today:%Y-%m-%d}"
-    if counter is not None:
-        answer = _try(counter, "would_be_day_trade",
-                      ((symbol,), {}), ((), {"symbol": symbol}),
-                      ((symbol, today), {}), ((), {}))
-        if isinstance(answer, bool):
-            same_day = answer
-
-    count = None
-    if counter is not None:
-        answer = _try(counter, "count_last_5_business_days",
-                      ((), {}), ((today,), {}), ((), {"today": today}))
-        if isinstance(answer, (int, float)) and not isinstance(answer, bool):
-            count = int(answer)
-
-    hard = str(book_id).upper() in DAY_TRADE_HARD_LIMIT_BOOKS
     if not same_day:
-        return DayTradeVerdict(False, count, False,
+        return DayTradeVerdict(False, False,
                                "not a day trade, this position was not opened today")
-
-    where = f"book {book_id}"
-    if count is None:
-        counted = ("how many day trades this book has already made is not known, "
-                   f"because agent/pdt.py is not loaded ({PDT_ERROR})")
-    else:
-        counted = f"{where} has made {count} day trade(s) in the last five business days"
-
-    if hard and count is not None and count >= DAY_TRADE_LIMIT:
-        return DayTradeVerdict(
-            True, count, True,
-            f"this would be day trade number {count + 1} for {where}, and the limit is "
-            f"{DAY_TRADE_LIMIT} in five business days. {where.capitalize()} holds for "
-            "weeks, so a same day round trip in it is a mistake rather than a strategy "
-            "and it is refused.")
-    if hard and count is None:
-        return DayTradeVerdict(
-            True, None, False,
-            f"this would be a day trade in {where}, which holds for weeks, and "
-            f"{counted}. Letting it through, because refusing to close a position on "
-            "the strength of a missing counter is the more dangerous mistake.")
+    hard = bool(getattr(getattr(guard, "pdt", None), "hard_limit",
+                        str(book_id).upper() in DAY_TRADE_HARD_LIMIT_BOOKS))
     return DayTradeVerdict(
-        True, count, False,
-        f"this is a day trade in {where}, which day trades on purpose, so it is "
-        f"written down and allowed. {counted}.")
+        True, False,
+        f"this would be a day trade in book {book_id}"
+        + (", which is meant to hold for weeks" if hard
+           else ", which day trades on purpose")
+        + f", and agent/pdt.py is not loaded ({PDT_ERROR}), so the five day count is "
+          "not known. Letting it through and writing it down.")
 
 
 # ------------------------------------------------------- shortlists and packets
@@ -625,10 +605,10 @@ def run_helper(script: str, out_path: Path, timeout: int = 300) -> tuple[bool, s
     and the SEC in the other, and either can hang or fall over. Neither should be
     able to take the loop down with it.
     """
-    path = project_root() / "agent" / script
+    path = project_root() / "agent" / str(script)
     python = project_root() / "venv312" / "bin" / "python"
-    if not path.exists():
-        return False, f"{path} does not exist yet, carrying on with an empty shortlist"
+    if not script or not path.exists():
+        return False, f"{path} does not exist, so the shortlist stays as it is"
     if not python.exists():
         return False, f"{python} does not exist, so the helper cannot be run"
     try:
@@ -644,6 +624,26 @@ def run_helper(script: str, out_path: Path, timeout: int = 300) -> tuple[bool, s
         return False, (f"{script} exited with code {finished.returncode}: "
                        f"{tail[-1] if tail else 'no message'}")
     return True, f"{script} finished and wrote {out_path}"
+
+
+def normalise_candidate(row: dict) -> dict:
+    """One shortlist row with a symbol on it, whatever the source called it.
+
+    The scanner writes "symbol". Both sweeps write "ticker", because that is the
+    word the SEC and the House Clerk use. Everything downstream, the guardrails
+    included, wants "symbol", so the translation happens once, here.
+    """
+    out = dict(row)
+    if not out.get("symbol") and out.get("ticker"):
+        out["symbol"] = out["ticker"]
+    out["symbol"] = str(out.get("symbol") or "").strip().upper()
+    if not out.get("company"):
+        out["company"] = out.get("issuer_name") or out.get("asset_description") or ""
+    if out.get("cluster_count") and not out.get("cluster_size"):
+        out["cluster_size"] = out["cluster_count"]
+    if out.get("crowd_count") and not out.get("crowding"):
+        out["crowding"] = out["crowd_count"]
+    return out
 
 
 def read_shortlist(path: Path) -> tuple[list[dict], str]:
@@ -669,28 +669,6 @@ def read_shortlist(path: Path) -> tuple[list[dict], str]:
     clean = [normalise_candidate(r) for r in rows
              if isinstance(r, dict) and (r.get("symbol") or r.get("ticker"))]
     return clean, f"read {len(clean)} candidates from {path}"
-
-
-def normalise_candidate(row: dict) -> dict:
-    """One shortlist row with a symbol on it, whatever the source called it.
-
-    The scanner writes "symbol". Both sweeps write "ticker", because that is the
-    word the SEC and the House Clerk use. Everything downstream, the guardrails
-    included, wants "symbol", so the translation happens once, here.
-    """
-    out = dict(row)
-    if not out.get("symbol") and out.get("ticker"):
-        out["symbol"] = out["ticker"]
-    out["symbol"] = str(out.get("symbol") or "").strip().upper()
-    if not out.get("company") and out.get("issuer_name"):
-        out["company"] = out["issuer_name"]
-    if not out.get("company") and out.get("asset_description"):
-        out["company"] = out["asset_description"]
-    if out.get("cluster_count") and not out.get("cluster_size"):
-        out["cluster_size"] = out["cluster_count"]
-    if out.get("crowd_count") and not out.get("crowding"):
-        out["crowding"] = out["crowd_count"]
-    return out
 
 
 def contract_for(row: dict) -> dict:
@@ -734,7 +712,7 @@ def snapshot_price(row: dict | None) -> float | None:
     return None
 
 
-# ------------------------------------------------------------------ the tick
+# ------------------------------------------------------------------- the tick
 
 class BookTick:
     """One book's turn in one tick. Holds what happened so the summary is honest."""
@@ -761,7 +739,7 @@ class BookTick:
     @property
     def dry(self) -> bool:
         """True when this book writes down what it would do and sends nothing."""
-        return str(self.book.mode).replace("_", "-").lower() not in LIVE_MODES
+        return str(self.book.mode).replace("-", "_").lower() not in LIVE_MODES
 
     def say(self, message: str) -> None:
         if not self.quiet:
@@ -804,11 +782,11 @@ def live_locks(book: gr.BookConfig, account_id: str,
     """The four locks on the live order path. All four, or nothing is sent.
 
     Returns whether every lock is open, and the list of the ones that are shut.
-    Today every book is in dry-run mode and the environment variable is not set,
+    Today every book is in dry_run mode and the environment variable is not set,
     so at least two of them are always shut.
     """
     shut: list[str] = []
-    mode = str(book.mode).replace("_", "-").lower()
+    mode = str(book.mode).replace("-", "_").lower()
     if mode not in LIVE_MODES:
         shut.append(f"book {book.book_id} is in {mode} mode, and only "
                     f"{' or '.join(LIVE_MODES)} may send an order")
@@ -833,13 +811,14 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
     """Put one would be order through every check, and write down the answer.
 
     This is the only route from "this book thinks it should trade" to anything
-    else happening. In dry run it stops at the printed line, which is where it
-    stops today for all five books.
+    else happening, and in dry run it stops at the printed line, which is where
+    it stops today for all five books.
     """
     tick.would_be_orders += 1
     decision = gr.check_order(guard, account_state, intent)
     summary = describe(intent) + (f" {extra}" if extra else "")
-    verdict = "allowed by the guardrails" if decision.allowed else "refused by the guardrails"
+    verdict = ("allowed by the guardrails" if decision.allowed
+               else "refused by the guardrails")
     because = ("; ".join(decision.reasons)
                or ("no limit was breached" if decision.allowed else "no reason given"))
 
@@ -853,7 +832,8 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
     if tick.dry or not open_locks or not decision.allowed:
         tick.say(f"DRY RUN {tick.tag} would place {summary}")
         tick.say(f"  guardrails: {verdict}. {because}"
-                 + (f" [rules: {', '.join(decision.rule_ids)}]" if decision.rule_ids else ""))
+                 + (f" [rules: {', '.join(decision.rule_ids)}]"
+                    if decision.rule_ids else ""))
         if decision.allowed:
             tick.say("  nothing was sent to the broker: " + "; ".join(shut))
         tick.record(state, intent.symbol, f"would place {summary}",
@@ -864,10 +844,11 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
         return decision
 
     # Not reachable today. All four locks would have to be open at once, and the
-    # first of them is a mode agent/guardrails.py refuses to load.
+    # first of them needs a book promoted by hand with the hub's approval on it.
     result = submit(tick, state, intent, broker, guard)
     tick.record(state, intent.symbol, f"placed {summary}",
-                f"{verdict}. {because}. Broker said: {result.get('confirmed_by')}",
+                f"{verdict}. {because}. The broker confirmed by "
+                f"{result.get('confirmed_by')}",
                 model=model, cost=cost, prompt_hash=prompt_hash)
     return decision
 
@@ -895,9 +876,17 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     price = _number(result.get("avg_fill_price"))
 
     if filled > 0:
-        tick.say(f"filled {filled:g} {intent.symbol} at {price:.4f} "
-                 f"(confirmed by {result.get('confirmed_by')})")
+        tick.say(f"filled {filled:g} {intent.symbol} at {price:.4f}, confirmed by "
+                 f"{result.get('confirmed_by')}")
         record_fill(state, intent, filled, price, tick.now)
+        counter = make_day_trade_counter(guard)
+        if counter is not None:
+            try:
+                counter.record_fill(intent.symbol, intent.side, int(round(filled)),
+                                    tick.now,
+                                    fill_id=str(result.get("order_id") or "") or None)
+            except Exception as exc:         # noqa: BLE001
+                tick.note(f"the day trade counter would not record the fill: {exc}")
         ledger_writer.log_trade(
             {"symbol": intent.symbol, "side": intent.side, "qty": filled,
              "price": price, "notional": round(filled * price, 2),
@@ -928,21 +917,23 @@ def record_fill(state: bs.BookState, intent: gr.OrderIntent, filled: float,
 
     if held is None:
         state.put_position(bs.Position(
-            symbol=symbol, qty=signed, avg_cost=price, opened_on=f"{now.date():%Y-%m-%d}",
-            entry=price, side="short" if signed < 0 else "long",
-            trailing_high_or_low=price))
+            symbol=symbol, qty=signed, avg_cost=price,
+            opened_on=f"{now.date():%Y-%m-%d}", entry=price,
+            side="short" if signed < 0 else "long", trailing_high_or_low=price))
         state.entries_opened_today += 1
         state.cash -= signed * price
         return
 
     if (held.qty > 0) == (signed > 0):
         total = held.qty + signed
-        held.avg_cost = (held.avg_cost * held.qty + price * signed) / total if total else price
+        held.avg_cost = ((held.avg_cost * held.qty + price * signed) / total
+                         if total else price)
         held.qty = total
     else:
         closed = min(abs(signed), abs(held.qty))
         direction = 1.0 if held.qty > 0 else -1.0
-        state.realized_pnl_today += round((price - held.avg_cost) * closed * direction, 2)
+        state.realized_pnl_today = round(
+            state.realized_pnl_today + (price - held.avg_cost) * closed * direction, 2)
         held.qty += signed
     state.cash -= signed * price
     if abs(held.qty) < 1e-9:
@@ -966,8 +957,7 @@ def do_sweep(tick: BookTick, state: bs.BookState, plan: BookPlan, slot: str) -> 
         state.shortlist = rows
         state.shortlist_path = str(path)
         state.shortlist_read_at = tick.now.isoformat()
-    tick.record(state, "", f"{slot} sweep ran",
-                f"{message}. {read_message}")
+    tick.record(state, "", f"the {slot} sweep ran", f"{message}. {read_message}")
 
 
 def do_scan(tick: BookTick, state: bs.BookState, plan: BookPlan) -> None:
@@ -975,8 +965,8 @@ def do_scan(tick: BookTick, state: bs.BookState, plan: BookPlan) -> None:
 
     Books A, B and E share one scanner run. Whichever of them ticks first pays
     for it and the other two read the file, because running the scanner three
-    times in the same minute would spend three times the data budget on three
-    copies of the same answer.
+    times in one minute would spend three times the data budget on three copies
+    of the same answer.
     """
     path = shortlist_path(plan, tick.now.date())
     if _fresh_enough(path, tick.now, SHORTLIST_FRESH_MINUTES):
@@ -992,7 +982,26 @@ def do_scan(tick: BookTick, state: bs.BookState, plan: BookPlan) -> None:
     state.shortlist = rows
     state.shortlist_path = str(path)
     state.shortlist_read_at = tick.now.isoformat()
-    tick.say(f"Shortlist has {len(rows)} names. This book picks at {plan.pick_time:%H:%M}.")
+    tick.say(f"Shortlist has {len(rows)} names. This book picks at "
+             f"{plan.pick_time:%H:%M}.")
+
+
+def _position_row(position: bs.Position) -> dict:
+    return {
+        "symbol": position.symbol, "side": position.side, "qty": position.qty,
+        "avg_cost": position.avg_cost, "entry": position.entry,
+        "stop": position.stop, "target": position.target,
+        "entry_date": position.opened_on, "entry_reason": position.entry_reason,
+        "last_close": position.last_close,
+        "high_close_since_entry": position.trailing_high_or_low,
+    }
+
+
+def book_dict(book: gr.BookConfig) -> dict:
+    """The book in the shape agent/decide.py wants it."""
+    return {"id": book.book_id, "book": book.book_id, "book_id": book.book_id,
+            "model": book.model or "none", "order_ref": book.order_ref,
+            "mode": book.mode, "name": book.name}
 
 
 def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
@@ -1021,7 +1030,8 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
             try:
                 bars = broker_mod.bars_5m_today(broker, contract_for(candidate))
             except Exception as exc:         # noqa: BLE001
-                bars, _ = [], notes.append(f"no five minute bars for {symbol}: {exc}")
+                bars = []
+                notes.append(f"no five minute bars for {symbol}: {exc}")
             candidate["bars_5m"] = bars
             candidate["bar_count"] = len(bars)
             candidate["session_vwap"] = broker_mod.session_vwap(bars)
@@ -1030,21 +1040,21 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
                 if not candidate.get("opening_range_high"):
                     candidate["opening_range_high"] = bars[0].get("high")
                     candidate["opening_range_low"] = bars[0].get("low")
-                    notes.append(f"{symbol}: the opening range was taken from the first "
-                                 "bar, because the scanner did not supply it")
+                    notes.append(f"{symbol}: the opening range was taken from the "
+                                 "first bar, because the scanner did not supply it")
             shortable, why = broker_mod.shortable_from_snapshot(quote)
             candidate["shortable"] = shortable
             candidate["borrow_note"] = why
         else:
-            # The sweeps read filings and have no market data at all, so the
-            # price floor and the liquidity floor are applied here.
+            # The sweeps read filings and have no market data at all, so this is
+            # where the price floor is applied.
             if price is None:
-                notes.append(f"{symbol}: no price came back, so the price floor and the "
-                             "liquidity floor cannot be checked and it is left out")
+                notes.append(f"{symbol}: no price came back, so the price floor cannot "
+                             "be checked and it is left out")
                 continue
             if price < guard.universe.price_floor:
-                notes.append(f"{symbol}: {price:.2f} is under this book's price floor of "
-                             f"{guard.universe.price_floor:.2f}, so it is left out")
+                notes.append(f"{symbol}: {price:.2f} is under this book's price floor "
+                             f"of {guard.universe.price_floor:.2f}, so it is left out")
                 continue
         enriched.append(candidate)
 
@@ -1061,39 +1071,21 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
         "strategy": guard.strategy.name if guard.strategy else "shared settings",
         "schedule": {"pick_time": f"{plan.pick_time:%H:%M}",
                      "entries_until": f"{plan.entries_until:%H:%M}",
-                     "flatten_at": f"{plan.flatten_at:%H:%M}" if plan.flat_by_close
-                     else "this book is not flattened at the close"},
+                     "flatten_at": (f"{plan.flatten_at:%H:%M}" if plan.flat_by_close
+                                    else "this book is not flattened at the close")},
         "account": bs.facts_for(state),
         "candidates": enriched,
         "positions": [_position_row(p) for p in state.all_positions().values()],
         "notes": notes,
     }
-    folder = output_dir()
-    path = folder / f"packet_{tick.book.order_ref}_{tick.now:%Y-%m-%d_%H%M}_pick.json"
+    path = (output_dir()
+            / f"packet_{tick.book.order_ref}_{tick.now:%Y-%m-%d_%H%M}_pick.json")
     path.write_text(json.dumps(packet, indent=2, default=str))
     state.packet_path = str(path)
     for message in notes:
         tick.note(message)
     tick.say(f"Decision packet for {len(enriched)} candidates written to {path}")
     return packet
-
-
-def _position_row(position: bs.Position) -> dict:
-    return {
-        "symbol": position.symbol, "side": position.side, "qty": position.qty,
-        "avg_cost": position.avg_cost, "entry": position.entry,
-        "stop": position.stop, "target": position.target,
-        "entry_date": position.opened_on, "entry_reason": position.entry_reason,
-        "last_close": position.last_close,
-        "high_close_since_entry": position.trailing_high_or_low,
-    }
-
-
-def book_dict(book: gr.BookConfig) -> dict:
-    """The book in the shape agent/decide.py wants it."""
-    return {"id": book.book_id, "book": book.book_id, "book_id": book.book_id,
-            "model": book.model or "none", "order_ref": book.order_ref,
-            "mode": book.mode, "name": book.name}
 
 
 def do_pick(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guardrails,
@@ -1120,8 +1112,9 @@ def do_pick(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guard
         tick.note(message)
     if not result.ok:
         tick.note(f"the decision step could not answer: {result.error}")
-        tick.rule("decision_failed", f"the {tick.book.model or 'rules only'} decision "
-                  f"failed: {result.error}", "no picks were made this tick")
+        tick.rule("decision_failed",
+                  f"the {tick.book.model or 'rules only'} pick failed: {result.error}",
+                  "no picks were made this tick")
 
     if not result.picks:
         tick.say(f"No picks. The shortlist held {len(rows)} names and none of them "
@@ -1132,8 +1125,8 @@ def do_pick(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guard
                     prompt_hash=result.prompt_hash)
         return
 
-    tick.say(f"Picked {len(result.picks)} names "
-             f"({'rules only' if tick.book.model in (None, 'none') else tick.book.model}"
+    which = ("rules only" if tick.book.model in (None, "none") else tick.book.model)
+    tick.say(f"Picked {len(result.picks)} names ({which}"
              f"{', dry run so no model was called' if tick.dry else ''}):")
     for skip in result.skips:
         tick.record(state, str(skip.get("symbol") or ""), "skipped",
@@ -1183,7 +1176,7 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
 
     quantity = int(pick.get("qty_hint") or 0)
     allowed_shares = gr.max_shares_for(guard, account_state, symbol, entry)
-    if allowed_shares < quantity or quantity <= 0:
+    if quantity <= 0 or allowed_shares < quantity:
         if quantity > allowed_shares:
             tick.note(f"{symbol}: cut from {quantity} shares to {allowed_shares}, "
                       "because the money rules say so and the model does not")
@@ -1198,7 +1191,7 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
     intent = gr.OrderIntent(
         symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
         limit_price=round(entry, 2), purpose="entry", book_id=tick.book.book_id,
-        shortable=shortable if short else False)
+        shortable=bool(shortable) if short else False)
     extra = f"stop {stop:.2f}, target {target:.2f}"
     if short:
         extra += f", borrow: {borrow_note}"
@@ -1215,7 +1208,15 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
 
 
 def _borrow_answer(state: bs.BookState, symbol: str) -> tuple[bool, str]:
-    """What the broker said about borrowing this name, from the shortlist row."""
+    """What the broker said about borrowing this name, from the shortlist row.
+
+    Checked against the live MCP server on 2026-09-06: its snapshot carries no
+    shortable flag, no borrow fee and no share availability, and neither does
+    ibkr_get_contract_details, so the answer today is always "the broker has not
+    confirmed it". The momentum books set require_shortable: true, so the
+    shortable_required rule in agent/guardrails.py refuses every short until the
+    server can answer.
+    """
     for row in state.shortlist:
         if isinstance(row, dict) and str(row.get("symbol") or "").upper() == symbol:
             if "shortable" in row:
@@ -1235,9 +1236,9 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
         trailing    the price came back through the trailing stop, which follows
                     the best price the position has seen since it was opened
         time        the position has run out of trading days
-        fade        momentum books only: the five minute close is back below the
-                    day's volume weighted average price, which is the standard
-                    tell that an opening push is over
+        fade        momentum books only: the five minute close is back through
+                    the day's volume weighted average price, which is the
+                    standard tell that an opening push is over
 
     Kept as its own function, with no broker and no clock in it, so every rule
     can be checked on paper.
@@ -1248,8 +1249,7 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
 
     if stop:
         if (not short and last_close <= stop) or (short and last_close >= stop):
-            return "stop", (f"the close {last_close:.2f} went through the stop "
-                            f"{stop:.2f}")
+            return "stop", f"the close {last_close:.2f} went through the stop {stop:.2f}"
     if target:
         if (not short and last_close >= target) or (short and last_close <= target):
             return "target", (f"the close {last_close:.2f} reached the target "
@@ -1257,11 +1257,14 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
 
     best = position.trailing_high_or_low
     if best:
-        trailing = gr.trailing_stop_price(
-            guard, "SELL" if short else "BUY", float(best), _number(position.entry)
-            or _number(position.avg_cost))
+        entry = _number(position.entry) or _number(position.avg_cost)
+        trailing = None
+        if entry > 0:
+            trailing = gr.trailing_stop_price(
+                guard, "SELL" if short else "BUY", float(best), entry)
         if trailing is not None:
-            if (not short and last_close <= trailing) or (short and last_close >= trailing):
+            if (not short and last_close <= trailing) \
+                    or (short and last_close >= trailing):
                 return "trailing", (f"the close {last_close:.2f} came back through the "
                                     f"trailing stop {trailing:.2f}, which was following "
                                     f"the best price of {float(best):.2f}")
@@ -1273,8 +1276,8 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
             opened = None
         if opened is not None and gr.time_stop_due(guard, opened, today):
             return "time", (f"this position was opened on {opened:%Y-%m-%d} and has run "
-                            f"out of the {guard.risk.time_stop_trading_days} trading days "
-                            "this book gives one")
+                            f"out of the {guard.risk.time_stop_trading_days} trading "
+                            "days this book gives one")
 
     if plan.family == MOMENTUM and vwap:
         if (not short and last_close < vwap) or (short and last_close > vwap):
@@ -1293,17 +1296,19 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
 
     prices: dict[str, tuple[float | None, float | None]] = {}
     if positions:
-        rows = [{"symbol": s} for s in positions]
-        quotes = snapshot_by_symbol(broker, rows, notes)
+        quotes = snapshot_by_symbol(broker, [{"symbol": s} for s in positions], notes)
         for symbol in positions:
             if plan.family == MOMENTUM:
                 try:
-                    bars = broker_mod.bars_5m_today(broker, contract_for({"symbol": symbol}))
+                    bars = broker_mod.bars_5m_today(
+                        broker, contract_for({"symbol": symbol}))
                 except Exception as exc:     # noqa: BLE001
                     bars = []
                     notes.append(f"no five minute bars for {symbol}: {exc}")
-                last = bars[-1].get("close") if bars else snapshot_price(quotes.get(symbol))
-                prices[symbol] = (_number(last, 0.0) or None, broker_mod.session_vwap(bars))
+                last = (bars[-1].get("close") if bars
+                        else snapshot_price(quotes.get(symbol)))
+                prices[symbol] = (_number(last, 0.0) or None,
+                                  broker_mod.session_vwap(bars))
             else:
                 prices[symbol] = (snapshot_price(quotes.get(symbol)), None)
     for message in notes:
@@ -1329,6 +1334,8 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
         "working_orders": [dict(o, orderId=k) for k, o in state.working_orders.items()
                            if isinstance(o, dict)],
     }
+
+    result = None
     model_view: dict[str, dict] = {}
     if positions:
         strategy_dir = project_root() / str(tick.book.strategy_dir)
@@ -1340,22 +1347,22 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
         if not result.ok:
             tick.note(f"the manage decision could not answer: {result.error}")
         model_view = {str(e.get("symbol") or "").upper(): e for e in result.exits}
-    else:
-        result = None
 
-    counter = make_day_trade_counter(tick.book.book_id)
+    counter = make_day_trade_counter(guard)
 
     for symbol, position in positions.items():
         last_close, vwap = prices.get(symbol, (None, None))
-        held = (f"{symbol}: holding {position.qty:g} shares "
-                f"({position.side}) bought around {position.avg_cost:.2f}")
+        held = (f"{symbol}: holding {position.qty:g} shares ({position.side}) "
+                f"bought around {position.avg_cost:.2f}")
         if last_close is None:
             tick.say(held)
             tick.note(f"{symbol}: no price came back, so it is left alone this tick")
-            tick.record(state, symbol, "hold", "no price came back this tick, so no "
-                        "rule could be checked against it")
+            tick.record(state, symbol, "hold",
+                        "no price came back this tick, so no rule could be checked "
+                        "against it")
             continue
-        tick.say(held + f", last {last_close:.2f}" + (f", vwap {vwap:.2f}" if vwap else ""))
+        tick.say(held + f", last {last_close:.2f}"
+                 + (f", vwap {vwap:.2f}" if vwap else ""))
 
         # The best price since entry is what a trailing stop follows, so it is
         # updated before the rules are checked and it is kept in the book file.
@@ -1377,32 +1384,37 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
             trigger = "model"
             why = f"the model asked to close it: {model_reason}"
         elif trigger is not None and model_reason:
-            why = f"{why}. The model said: {model_says or 'nothing'}, {model_reason}"
+            why = f"{why}. The model said {model_says or 'nothing'}: {model_reason}"
 
         if trigger is None:
             tick.say(f"  holding {symbol}, no rule has fired")
             tick.record(state, symbol, "hold",
-                        f"no stop, target, trailing stop or time stop has fired"
+                        "no stop, target, trailing stop or time stop has fired"
                         + (f". The model said: {model_reason}" if model_reason else ""),
-                        model=result.model if result else None,
-                        cost=None, prompt_hash=result.prompt_hash if result else "")
+                        model=result.model if result else None, cost=None,
+                        prompt_hash=result.prompt_hash if result else "")
             continue
-
-        verdict = day_trade_verdict(tick.book.book_id, symbol, position.opened_on,
-                                    today, counter)
-        if verdict.blocked:
-            tick.say(f"  NOT closing {symbol}: {verdict.reason}")
-            tick.rule("day_trade_limit", f"{symbol}: {verdict.reason}",
-                      "the closing order was not placed")
-            tick.record(state, symbol, "exit refused by the day trade rule", verdict.reason)
-            continue
-        if verdict.is_day_trade:
-            tick.note(f"{symbol}: {verdict.reason}")
 
         intent = gr.OrderIntent(
             symbol=symbol, side="BUY" if position.is_short else "SELL",
             qty=int(round(abs(position.qty))), limit_price=round(last_close, 2),
             purpose="exit", book_id=tick.book.book_id)
+
+        verdict = day_trade_check(guard, intent, today, counter, position.opened_on)
+        if verdict.blocked:
+            tick.say(f"  NOT closing {symbol}: {verdict.reason}")
+            tick.rule("pdt_limit", f"{symbol}: {verdict.reason}",
+                      "the closing order was not placed")
+            tick.record(state, symbol, "exit refused by the day trade rule",
+                        verdict.reason)
+            continue
+        if verdict.would_have_blocked or verdict.is_day_trade:
+            tick.note(f"{symbol}: {verdict.reason}")
+            if verdict.would_have_blocked:
+                tick.rule("pdt_limit", f"{symbol}: {verdict.reason}",
+                          "allowed here, and it would have been blocked in a live "
+                          "account under 25,000 dollars")
+
         consider(tick, state, guard, account_state, intent, broker, guards,
                  extra=f"[{trigger}] because {why}",
                  model=result.model if result else None,
@@ -1417,17 +1429,18 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
     """A pick whose entry has not been worked out yet gets another look.
 
     The momentum strategy enters on a break of the opening range, which may
-    happen at 09:40 or at 10:55 or never. A pick that was refused at 09:35 for
-    want of room can also come back once something else has been closed.
+    happen at 09:40, at 10:55, or never. A pick refused at 09:35 for want of
+    room can also come back once something else has been closed.
     """
     blocked = entries_blocked_reason(guards, state)
     if blocked:
-        tick.note(f"no new positions this tick: {blocked}")
+        if state.picks:
+            tick.note(f"no new positions this tick: {blocked}")
         return
     if not gr.entries_allowed_now(guard, tick.now):
         if state.picks:
-            tick.note(f"new entries closed at {plan.entries_until:%H:%M}, so a pick that "
-                      "has not fired by now is left alone")
+            tick.note(f"new entries closed at {plan.entries_until:%H:%M}, so a pick "
+                      "that has not fired by now is left alone")
         return
 
     positions = state.all_positions()
@@ -1438,19 +1451,22 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
         if not symbol or symbol in positions:
             continue
         already = state.triggered.get(symbol) or {}
-        if already.get("allowed") or already.get("sent"):
+        if already.get("allowed") or already.get("sent") or already.get("skipped"):
             continue
 
         entry = _number(pick.get("entry"))
         if entry <= 0:
             continue
         short = str(pick.get("side") or "long").lower() in ("short", "sell")
-        try:
-            bars = broker_mod.bars_5m_today(broker, contract_for({"symbol": symbol})) \
-                if plan.family == MOMENTUM else []
-        except Exception:                    # noqa: BLE001
-            bars = []
-        last_close = _number(bars[-1].get("close")) if bars else None
+
+        last_close = None
+        if plan.family == MOMENTUM:
+            try:
+                bars = broker_mod.bars_5m_today(broker, contract_for({"symbol": symbol}))
+            except Exception:                # noqa: BLE001
+                bars = []
+            if bars:
+                last_close = _number(bars[-1].get("close")) or None
         if last_close is None:
             quotes = snapshot_by_symbol(broker, [{"symbol": symbol}], [])
             last_close = snapshot_price(quotes.get(symbol))
@@ -1491,7 +1507,7 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
         intent = gr.OrderIntent(
             symbol=symbol, side="SELL" if short else "BUY", qty=int(quantity),
             limit_price=round(last_close, 2), purpose="entry",
-            book_id=tick.book.book_id, shortable=shortable if short else False)
+            book_id=tick.book.book_id, shortable=bool(shortable) if short else False)
         tick.say(f"  {symbol} broke its {entry:.2f} trigger, now {last_close:.2f}")
         decision = consider(tick, state, guard, account_state, intent, broker, guards,
                             extra=f"stop {_number(pick.get('stop')):.2f}"
@@ -1503,8 +1519,9 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
             state.halt("a guardrail asked for a halt for the rest of the day")
 
 
-def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guardrails,
-               broker: broker_mod.Broker, account_state, guards: Guards) -> None:
+def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
+               guard: gr.Guardrails, broker: broker_mod.Broker, account_state,
+               guards: Guards) -> None:
     """Close everything. The momentum books carry nothing overnight, ever."""
     positions = state.all_positions()
     if not positions:
@@ -1514,25 +1531,35 @@ def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gu
     tick.say(f"It is past {plan.flatten_at:%H:%M}. Closing all {len(positions)} "
              "open positions.")
     quotes = snapshot_by_symbol(broker, [{"symbol": s} for s in positions], [])
+    counter = make_day_trade_counter(guard)
+    today = tick.now.date()
     for symbol, position in positions.items():
         price = snapshot_price(quotes.get(symbol))
         intent = gr.OrderIntent(
             symbol=symbol, side="BUY" if position.is_short else "SELL",
             qty=int(round(abs(position.qty))), limit_price=None, purpose="flatten",
             book_id=tick.book.book_id)
+        verdict = day_trade_check(guard, intent, today, counter, position.opened_on)
+        if verdict.blocked:
+            tick.say(f"  NOT closing {symbol}: {verdict.reason}")
+            tick.rule("pdt_limit", f"{symbol}: {verdict.reason}",
+                      "the closing order was not placed")
+            tick.record(state, symbol, "flatten refused by the day trade rule",
+                        verdict.reason)
+            continue
         consider(tick, state, guard, account_state, intent, broker, guards,
                  extra=(f"end of day close out, last price {price:.2f}" if price
                         else "end of day close out"))
 
 
-def write_daily(tick: BookTick, state: bs.BookState, guard: gr.Guardrails) -> None:
-    """The book's own end of day line, written once, at or after the close.
+def write_daily(tick: BookTick, state: bs.BookState) -> None:
+    """This book's own end of day line, written once, at or after the close.
 
-    A note on the Daily tab: it has no book column, on purpose, because it
-    tracks the one paper account all five books share. So the per book figures
-    go to the Rules Log, which does have a book column and which the Books tab
-    slices on. The account level line is written once by whichever book is
-    handled last, in main().
+    A note on the Daily tab in the ledger: it has no book column, on purpose,
+    because it tracks the one paper account all five books share. So the per book
+    figures go to the Rules Log, which does have a book column and which the
+    Books tab slices on, and the one account level line is written in main() once
+    every book has had its turn.
     """
     facts = bs.facts_for(state)
     summary = (f"end of day: worth {facts['equity']:,.2f} against "
@@ -1550,7 +1577,7 @@ def write_daily(tick: BookTick, state: bs.BookState, guard: gr.Guardrails) -> No
     state.daily_written = True
 
 
-# ------------------------------------------------------------------ one book
+# ------------------------------------------------------------------- one book
 
 def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: Guards,
              broker: broker_mod.Broker, account_id: str, broker_positions: dict,
@@ -1578,10 +1605,10 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     tick.phase = phase
 
     if not quiet:
+        facts = bs.facts_for(state)
         print(f"\n[{book.order_ref}] {book.name}")
         print(f"  mode {book.mode} | model {book.model or 'none'} | "
               f"strategy {plan.family} | phase {phase} ({why})")
-        facts = bs.facts_for(state)
         print(f"  worth {facts['equity']:,.2f} of {facts['capital']:,.2f} capital | "
               f"{facts['open_positions']} open | {facts['entries_opened_today']} "
               f"entries today | rules {rules}")
@@ -1590,8 +1617,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
 
     try:
         if phase == SWEEP:
-            slot = sweep_due(now, plan, state.swept_at) or ""
-            do_sweep(tick, state, plan, slot)
+            do_sweep(tick, state, plan, sweep_due(now, plan, state.swept_at) or "")
         elif phase == SCAN:
             do_scan(tick, state, plan)
         elif phase == PICK:
@@ -1603,7 +1629,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         elif phase == CLOSED:
             if now.weekday() < 5 and now.time() >= plan.market_close \
                     and not state.daily_written:
-                write_daily(tick, state, guard)
+                write_daily(tick, state)
             else:
                 tick.say("Nothing to do. " + why)
         else:
@@ -1612,7 +1638,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         # One book falling over must not cost the other four their tick.
         tick.note(f"this book's {phase} raised {type(exc).__name__}: {exc}")
         tick.rule("book_failed", f"the {phase} phase of book {book.book_id} raised "
-                  f"{type(exc).__name__}: {exc}", "this book was skipped for this tick")
+                  f"{type(exc).__name__}: {exc}", "this book was skipped this tick")
 
     state.tick_count += 1
     state.last_tick = now.isoformat()
@@ -1624,7 +1650,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     return tick, state
 
 
-# ------------------------------------------------------------------ the driver
+# ----------------------------------------------------------------- the driver
 
 def tick_log_line(now: datetime, rules: str, book: gr.BookConfig, tick: BookTick,
                   state: bs.BookState) -> str:
@@ -1647,7 +1673,7 @@ def write_tick_log(lines: list[str]) -> Path:
 
 
 def read_broker_facts(broker: broker_mod.Broker, wanted_account: str | None,
-                      problems: list[str]) -> tuple[dict, dict, list, list]:
+                      problems: list[str]) -> tuple[dict, dict, list]:
     """One read of the shared account, used by all five books.
 
     Read once per tick rather than once per book, because five books asking IB
@@ -1672,16 +1698,16 @@ def read_broker_facts(broker: broker_mod.Broker, wanted_account: str | None,
 
     positions = {}
     for row in (holdings.get("positions") or []):
-        if isinstance(row, dict) and row.get("symbol"):
+        if isinstance(row, dict) and row.get("symbol") and _number(row.get("position")):
             positions[str(row["symbol"]).upper()] = row
-    return values, positions, orders, problems
+    return values, positions, orders
 
 
 def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="One tick of the trading loop, across all five books. Dry run "
                     "only today: the mode comes from config/books.yaml and every "
-                    "book in it is dry-run.")
+                    "book in it is dry_run.")
     parser.add_argument("--now", metavar="WHEN",
                         help='pretend it is this time, New York time, for example '
                              '"2026-09-08 09:36". Lets a phase be tested after hours.')
@@ -1693,7 +1719,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     parser.add_argument("--books-file", default=str(books_yaml_path()),
                         help="which register of books to read")
     parser.add_argument("--dry-run", action="store_true",
-                        help="accepted and ignored. Every book is already dry-run, "
+                        help="accepted and ignored. Every book is already dry_run, "
                              "because that is what its mode in books.yaml says.")
     args = parser.parse_args(argv)
 
@@ -1714,13 +1740,13 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     rules = rules_commit()
     account_wanted = registry.shared.account_id
 
-    books = [b for b in registry.enabled_books()]
+    books = list(registry.enabled_books())
     if args.book:
         wanted = str(args.book).strip().upper()
         books = [b for b in books if b.book_id == wanted]
         if not books:
-            print(f"loop: there is no enabled book {wanted} in {args.books_file}. "
-                  f"The enabled ones are "
+            print(f"loop: there is no enabled book {wanted} in {args.books_file}. The "
+                  "enabled ones are "
                   f"{', '.join(b.book_id for b in registry.enabled_books())}.",
                   file=sys.stderr)
             return 2
@@ -1744,17 +1770,15 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
         broker = broker_mod.McpBroker(account=account_wanted)
 
     problems: list[str] = []
-    values, broker_positions, broker_orders, problems = read_broker_facts(
+    values, broker_positions, broker_orders = read_broker_facts(
         broker, account_wanted, problems)
-    account_id = str((values.get("AccountOrGroup") or account_wanted or "")).strip() \
-        or str(account_wanted or "")
+    account_id = str(account_wanted or "").strip()
     equity = _number(values.get("NetLiquidation"))
 
     for problem in problems:
         print(f"  note: {problem}")
-    print(f"\nAccount {account_id}: worth {equity:,.2f}, "
-          f"{len(broker_positions)} positions and {len(broker_orders)} working orders "
-          "across all five books")
+    print(f"\nAccount {account_id}: worth {equity:,.2f}, {len(broker_positions)} "
+          f"positions and {len(broker_orders)} working orders across all five books")
 
     if account_id and not account_id.upper().startswith(PAPER_ACCOUNT_PREFIX):
         print(f"STOP: the account is {account_id}, which does not start with "
@@ -1767,21 +1791,22 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
         return 3
 
     # Reconciliation before anything else. If the books and the broker do not
-    # agree about who owns what, sizing the next order is guesswork.
-    books_state = {}
+    # agree about who owns what, sizing the next order would be guesswork.
+    books_state: dict[str, dict] = {}
     for book in books:
         state = bs.load_state(book.book_id, book.order_ref, now.date(),
                               capital=book.capital_usd)
         books_state[book.book_id] = {
-            "book_id": book.book_id, "order_ref": book.order_ref,
-            "positions": state.positions, "working_orders": state.working_orders}
+            "positions": {symbol: int(round(p.qty))
+                          for symbol, p in state.all_positions().items()},
+            "working_orders": dict(state.working_orders)}
 
-    outcome = run_reconciliation(list(broker_positions.values()), broker_orders,
+    outcome = run_reconciliation(broker_positions_for_reconcile(broker_positions),
+                                 broker_orders_for_reconcile(broker_orders),
                                  books_state, expected_orphans())
     print(f"\nReconciliation: {outcome.note}")
-    if outcome.orphans:
-        print(f"  {len(outcome.orphans)} position(s) or order(s) belong to no book: "
-              f"{outcome.orphans}")
+    for line in outcome.lines[:10]:
+        print(f"  {line}")
     halts: dict[str, str] = {}
     for book_id in outcome.books_to_halt:
         halts[str(book_id).upper()] = outcome.note
@@ -1804,7 +1829,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                   f"skipped this tick: {exc}")
             ledger_writer.log_rule(now, "book_settings_broken",
                                    f"book {book.book_id}: {exc} [rules {rules}]",
-                                   "this book was skipped for this tick",
+                                   "this book was skipped this tick",
                                    book_id=book.book_id, dry_run=not args.write_ledger)
             continue
 
@@ -1838,11 +1863,11 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
           f"{totals['cost']:.4f} dollars of model spend")
     print(f"Tick log {path}")
     if RECONCILE_ERROR:
-        print(f"agent/reconcile.py is not there yet ({RECONCILE_ERROR}), so every book "
-              "was halted this tick.")
+        print(f"agent/reconcile.py could not be imported ({RECONCILE_ERROR}), so every "
+              "book was halted this tick.")
     if PDT_ERROR:
-        print(f"agent/pdt.py is not there yet ({PDT_ERROR}), so day trades are counted "
-              "from the book files and the five day count is unknown.")
+        print(f"agent/pdt.py could not be imported ({PDT_ERROR}), so day trades were "
+              "read from the book files and the five day count is unknown.")
     return 0
 
 
