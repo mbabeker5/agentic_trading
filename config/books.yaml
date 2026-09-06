@@ -14,6 +14,42 @@
 # asks nobody and follows the rules alone. That is the comparison month one is
 # for, so their numbers have to stay identical and only the model may differ.
 #
+# ---------------------------------------------------------------------------
+# MODES, AND HOW A BOOK GETS PROMOTED
+# ---------------------------------------------------------------------------
+#
+# Every book has a mode, and it is one of three words:
+#
+#   dry_run   The book works out the order it would have sent, writes it down,
+#             and stops there. Nothing reaches the broker. Sizing still uses the
+#             book's full capital_usd, because a rehearsal that sizes its orders
+#             differently from the real thing is not a rehearsal.
+#   tiny      Real orders in the paper account, but the book is only allowed to
+#             risk money.tiny_capital_usd, which is 2,000 dollars in
+#             config/guardrails.yaml. Everything is sized against that pot
+#             instead of the book's capital, so a bug is cheap.
+#   full      Real orders in the paper account against the book's whole
+#             capital_usd.
+#
+# ALL FIVE BOOKS ARE ON dry_run TODAY (2026-09-06), and that is deliberate.
+#
+# PROMOTION IS NEVER AUTOMATIC. No code anywhere moves a book from dry_run to
+# tiny, or from tiny to full. Nothing watches a book's results and decides it
+# has earned it. A promotion is Mo editing this file by hand, one book at a
+# time, after the hub has approved that book.
+#
+# When the hub approves a book, two fields get stamped on it here at the same
+# time as the mode changes:
+#
+#   promoted_on    the date the hub approved it, written as 2026-10-13
+#   rules_commit   the git hash of the rules it was approved against, so there
+#                  is no argument later about which version of the numbers and
+#                  the guardrails was signed off
+#
+# Both are empty on every book right now, because nothing has been promoted.
+# A book set to tiny or full without both of them filled in refuses to load, so
+# a mode change on its own cannot quietly start sending orders.
+#
 # Paths here are written from the project folder, the one holding config/ and
 # strategies/, which is
 # /Users/mtalib/workspace_repos/personal_repo/agentic_trading
@@ -33,6 +69,12 @@ shared:
                                  # the settings all five books start from. A
                                  # book's own strategy.yaml wins wherever the
                                  # two disagree.
+  tiny_capital_usd: 2000         # what a book in tiny mode may risk. Written
+                                 # once here for all five, and it matches
+                                 # money.tiny_capital_usd in
+                                 # config/guardrails.yaml. This one wins, the
+                                 # same way account_id and gateway_port above
+                                 # do, so the two files cannot drift apart.
 
 books:
   - book_id: A
@@ -42,7 +84,10 @@ books:
     capital_usd: 100000
     model: openrouter/anthropic/claude-fable-5.1
     enabled: true
-    mode: dry-run
+    mode: dry_run                # dry_run, tiny or full. See the note at the
+                                 # top of this file. Promotion is a hand edit.
+    promoted_on:                 # empty until the hub approves this book
+    rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -59,7 +104,10 @@ books:
     capital_usd: 100000
     model: none
     enabled: true
-    mode: dry-run
+    mode: dry_run                # dry_run, tiny or full. See the note at the
+                                 # top of this file. Promotion is a hand edit.
+    promoted_on:                 # empty until the hub approves this book
+    rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -75,7 +123,10 @@ books:
     capital_usd: 100000
     model: openrouter/anthropic/claude-fable-5.1
     enabled: true
-    mode: dry-run
+    mode: dry_run                # dry_run, tiny or full. See the note at the
+                                 # top of this file. Promotion is a hand edit.
+    promoted_on:                 # empty until the hub approves this book
+    rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -91,7 +142,10 @@ books:
     capital_usd: 100000
     model: openrouter/anthropic/claude-fable-5.1
     enabled: true
-    mode: dry-run
+    mode: dry_run                # dry_run, tiny or full. See the note at the
+                                 # top of this file. Promotion is a hand edit.
+    promoted_on:                 # empty until the hub approves this book
+    rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -106,7 +160,10 @@ books:
     capital_usd: 100000
     model: openrouter/openai/gpt-6-astra
     enabled: true
-    mode: dry-run
+    mode: dry_run                # dry_run, tiny or full. See the note at the
+                                 # top of this file. Promotion is a hand edit.
+    promoted_on:                 # empty until the hub approves this book
+    rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-

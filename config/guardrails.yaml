@@ -30,6 +30,12 @@ money:
                               # and the agent stops opening new trades that day
   max_order_notional: 15000   # no single buy order may be worth more than this
                               # many dollars
+  tiny_capital_usd: 2000      # what a book in tiny mode is allowed to risk. A
+                              # book on tiny sends real paper orders but sizes
+                              # them against this pot instead of its full
+                              # capital, so a bug is cheap while someone is
+                              # watching. Ignored on dry_run and on full. See
+                              # the mode field in config/books.yaml.
 
 risk:
   stop_loss_pct: 1.5          # every position gets a stop this percent below
@@ -41,14 +47,36 @@ risk:
 
 universe:
   price_floor: 5              # ignore anything trading below this many dollars
-  min_avg_volume: 1000000     # ignore anything that normally trades fewer than
-                              # this many shares a day
+  min_avg_dollar_volume: 20000000
+                              # the liquidity floor (Mo, 2026-09-06). A name has
+                              # to trade at least this many dollars a day on
+                              # average before the scanner will look at it.
+                              # Dollars, not shares, because 20 million dollars
+                              # means the same thing at 6 dollars a share and at
+                              # 600. A census on 2026-09-04 found about 2,700 US
+                              # names above this line against about 1,950 above
+                              # the old million share line, so it is the wider
+                              # and better matched of the two. Working from
+                              # research/liquidity_census/.
+  dollar_volume_sessions: 30  # how many completed sessions that average covers
+  min_avg_volume: 1000000     # DEPRECATED, kept as an alias so an older file
+                              # still loads. The momentum scanner ignores it and
+                              # uses min_avg_dollar_volume instead. The insider
+                              # and Congress sweeps still quote this share
+                              # figure in the words they hand the model, which
+                              # is why it is not deleted outright.
   allow_options: false        # no options in month one
   allow_shorts: false         # no betting on falls. Mo changed the strategy spec
                               # on 2026-09-02 to propose shorting with mirrored
                               # stops, but this switch stays false until the
                               # mirrored stop and the gross exposure cap are
                               # actually built. See agent/README_guardrails.md.
+  max_borrow_fee_pct: 1.0     # a short is only worth it while the borrow costs
+                              # less than this percent a year (Mo, 2026-09-06)
+  borrow_availability_multiple: 10
+                              # and while the broker has at least this many
+                              # times our share count available to borrow, so a
+                              # thin borrow cannot be recalled out from under us
   allowed_sec_types: [STK]    # STK means ordinary shares and ETFs
   allowed_currencies: [USD]   # US dollars only
   whitelist: []               # leave empty to allow any symbol that passes the
@@ -72,6 +100,37 @@ schedule:
   market_close: "16:00"       # market shuts
   loop_minutes: 5             # the agent wakes up this often during the day
   trade_only_regular_hours: true  # no pre-market or after-hours trading
+  holidays: []                # days the US market is shut that are not weekends,
+                              # written as [2026-11-26, 2026-12-25]. Empty today.
+                              # Only the day trade counter in agent/pdt.py reads
+                              # this, to work out what a business day is. The
+                              # order checks in agent/guardrails.py still know
+                              # about weekends only, which is written down as a
+                              # known gap in agent/README_guardrails.md.
+
+pdt:
+  # The pattern day trader rule. US regulators call anyone who makes four or
+  # more round trip day trades in five business days, in a margin account, a
+  # pattern day trader, and require that account to hold at least 25,000
+  # dollars. The paper account is exempt because the money is simulated, so the
+  # code counts day trades itself and month one measures what the rule would
+  # cost rather than guessing. Mo's decision, 2026-09-06. The counting lives in
+  # agent/pdt.py.
+  hard_limit: false           # false here and in the momentum books, where day
+                              # trading is the whole strategy and a block would
+                              # be the wrong answer. The insider and Congress
+                              # strategy files set it true, because a day trade
+                              # in a book meant to hold for weeks is a mistake.
+                              # A book with it false is never blocked; the loop
+                              # is told what would have been blocked instead.
+  max_day_trades_per_5_days: 3
+                              # three are allowed, so the fourth is the one that
+                              # trips the rule
+  assumed_live_equity_min_usd: 25000
+                              # the balance a live account would have to keep to
+                              # be allowed to day trade at all. Nothing enforces
+                              # it on paper. It is written down so month one's
+                              # numbers can be read against the real rule.
 
 kill_switch:
   file: output/STOP           # create this file and the agent will only close

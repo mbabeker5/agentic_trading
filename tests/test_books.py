@@ -147,8 +147,17 @@ def short(
     qty: int = 100,
     limit_price: float | None = 50.0,
     shortable: bool = True,
+    borrow_fee_pct_annual: float | None = 0.25,
+    shares_available_to_borrow: int | None = 1_000_000,
     **kwargs,
 ) -> OrderIntent:
+    """A short that is easy to borrow unless a test says otherwise.
+
+    The three borrow facts default to a comfortable name: the broker says yes,
+    the borrow costs a quarter of a percent a year, and there are a million
+    shares to be had. A test that wants one of the three to fail passes just
+    that one, so it is obvious which leg of the rule is being tested.
+    """
     return OrderIntent(
         symbol=symbol,
         side="SELL",
@@ -157,6 +166,8 @@ def short(
         purpose="entry",
         book_id=book_id,
         shortable=shortable,
+        borrow_fee_pct_annual=borrow_fee_pct_annual,
+        shares_available_to_borrow=shares_available_to_borrow,
         **kwargs,
     )
 
@@ -206,7 +217,7 @@ def temp_project(
         "capital_usd": 100000,
         "model": "none",
         "enabled": True,
-        "mode": "dry-run",
+        "mode": "dry_run",
         "start_date": "2026-09-08",
         "end_date": "2026-10-06",
         "notes": "Built by a test, not by anyone who meant it.",
@@ -264,7 +275,7 @@ def test_books_yaml_holds_the_five_books_mo_decided_on():
         assert book.model == model
         assert book.capital_usd == 100000
         assert book.enabled is True
-        assert book.mode == "dry-run"
+        assert book.mode == "dry_run"
         assert book.start_date == date(2026, 9, 8)
         assert book.end_date == date(2026, 10, 6)
         assert book.notes.strip(), f"book {book.book_id} has no notes"
@@ -306,12 +317,105 @@ def test_a_book_id_is_read_the_same_however_it_is_typed():
     assert load_book(BOOKS_YAML, " c ").book_id == "C"
 
 
-def test_dry_run_is_the_only_mode_a_book_may_run_in(tmp_path: Path):
-    """Nothing may place an order until Mo approves the strategy numbers."""
-    assert BOOK_MODES_ALLOWED == ("dry-run",)
+def test_a_book_may_only_run_in_one_of_the_three_named_modes(tmp_path: Path):
+    """dry_run writes the order down, tiny risks a small pot, full risks it all."""
+    assert BOOK_MODES_ALLOWED == ("dry_run", "tiny", "full")
     books_path = temp_project(tmp_path, book_changes={"mode": "live"})
-    with pytest.raises(GuardrailConfigError, match="only mode allowed today"):
+    with pytest.raises(GuardrailConfigError, match="has to be one of"):
         load_books(books_path)
+
+
+def test_every_book_is_still_on_dry_run_today():
+    """Nothing sends an order until Mo promotes a book by hand."""
+    for book in load_books(BOOKS_YAML).books:
+        assert book.mode == "dry_run", f"book {book.book_id} is not on dry_run"
+        assert book.sends_orders is False
+        assert book.promoted_on is None, "nothing has been promoted yet"
+        assert book.rules_commit is None, "nothing has been promoted yet"
+
+
+def test_an_older_file_written_with_a_hyphen_still_reads_as_dry_run(tmp_path: Path):
+    """dry-run and dry_run are the same mode, so punctuation cannot break a load."""
+    books_path = temp_project(tmp_path, book_changes={"mode": "dry-run"})
+    assert load_books(books_path).get("A").mode == "dry_run"
+
+
+def test_a_dry_run_book_is_sized_against_its_whole_capital(tmp_path: Path):
+    """A rehearsal that sizes differently from the real thing is not a rehearsal."""
+    books_path = temp_project(tmp_path, book_changes={"mode": "dry_run"})
+    book = load_books(books_path).get("A")
+    assert book.effective_capital() == 100000.0
+    assert load_book_guardrails(books_path, "A").money.starting_equity == 100000.0
+
+
+def test_a_tiny_book_is_sized_against_the_two_thousand_dollar_pot(tmp_path: Path):
+    """tiny sends real paper orders, but only ever risks the small pot."""
+    books_path = temp_project(
+        tmp_path,
+        book_changes={
+            "mode": "tiny",
+            "promoted_on": "2026-10-13",
+            "rules_commit": "abc1234",
+        },
+    )
+    book = load_books(books_path).get("A")
+    assert book.mode == "tiny"
+    assert book.sends_orders is True
+    assert book.tiny_capital_usd == 2000.0
+    assert book.effective_capital() == 2000.0
+    assert load_book_guardrails(books_path, "A").money.starting_equity == 2000.0
+
+
+def test_a_full_book_is_sized_against_its_whole_capital(tmp_path: Path):
+    books_path = temp_project(
+        tmp_path,
+        book_changes={
+            "mode": "full",
+            "promoted_on": "2026-10-13",
+            "rules_commit": "abc1234",
+        },
+    )
+    book = load_books(books_path).get("A")
+    assert book.sends_orders is True
+    assert book.effective_capital() == 100000.0
+    assert load_book_guardrails(books_path, "A").money.starting_equity == 100000.0
+
+
+def test_a_tiny_book_is_actually_held_to_the_smaller_pot_on_an_order(tmp_path: Path):
+    """The 15 percent cap now means 300 dollars, not 15,000."""
+    books_path = temp_project(
+        tmp_path,
+        book_changes={
+            "mode": "tiny",
+            "promoted_on": "2026-10-13",
+            "rules_commit": "abc1234",
+        },
+    )
+    g = load_book_guardrails(books_path, "A")
+    state = book_state("A", equity=2000.0)
+
+    fine = check_order(g, state, buy("A", qty=6, limit_price=50.0))
+    assert fine.allowed is True, fine.reasons
+
+    too_big = check_order(g, state, buy("A", qty=7, limit_price=50.0))
+    assert too_big.allowed is False
+    assert "max_position_pct" in too_big.rule_ids
+
+
+@pytest.mark.parametrize("mode", ["tiny", "full"])
+def test_a_book_that_sends_orders_needs_its_promotion_written_down(
+    tmp_path: Path, mode: str
+):
+    """A mode change on its own can never start sending orders."""
+    books_path = temp_project(tmp_path, book_changes={"mode": mode})
+    with pytest.raises(GuardrailConfigError, match="promoted_on"):
+        load_books(books_path)
+
+    half = temp_project(
+        tmp_path, book_changes={"mode": mode, "promoted_on": "2026-10-13"}
+    )
+    with pytest.raises(GuardrailConfigError, match="rules_commit"):
+        load_books(half)
 
 
 def test_an_order_reference_that_does_not_match_its_book_is_refused(tmp_path: Path):
@@ -385,10 +489,17 @@ def test_the_momentum_books_match_their_spec(book_id: str):
     assert g.risk.stop_loss_pct == 1.5
     assert g.risk.use_opening_range_low_if_tighter is True
     assert g.universe.price_floor == 5
-    assert g.universe.min_avg_volume == 1000000
+    assert g.universe.min_avg_dollar_volume == 20_000_000
+    assert g.universe.dollar_volume_sessions == 30
+    assert g.universe.min_avg_volume == 1000000, "kept only as a deprecated alias"
     assert g.universe.allow_shorts is True
     assert g.universe.short_price_floor == 10
     assert g.universe.require_shortable is True
+    assert g.universe.max_borrow_fee_pct == 1.0
+    assert g.universe.borrow_availability_multiple == 10
+    assert g.pdt.hard_limit is False, "day trading is the whole strategy here"
+    assert g.pdt.max_day_trades_per_5_days == 3
+    assert g.pdt.assumed_live_equity_min_usd == 25000
     assert g.schedule.pick_time.strftime("%H:%M") == "09:35"
     assert g.schedule.entries_until.strftime("%H:%M") == "11:00"
     assert g.schedule.flatten_at.strftime("%H:%M") == "15:55"
@@ -432,6 +543,8 @@ def test_the_insider_book_matches_its_spec(insider: Guardrails):
     assert insider.universe.short_price_floor is None
     assert insider.schedule.entries_per_day_max == 3
     assert insider.schedule.loop_minutes == 30
+    assert insider.pdt.hard_limit is True, "a day trade here is a mistake"
+    assert insider.pdt.max_day_trades_per_5_days == 3
     assert insider.holds_overnight is True
     assert insider.flat_by_close is False
     assert insider.sweep is not None
@@ -453,6 +566,8 @@ def test_the_congress_book_matches_its_spec(congress: Guardrails):
     assert congress.universe.min_avg_volume == 1000000
     assert congress.universe.allow_shorts is False
     assert congress.schedule.entries_per_day_max == 2
+    assert congress.pdt.hard_limit is True, "a day trade here is a mistake"
+    assert congress.pdt.max_day_trades_per_5_days == 3
     assert congress.holds_overnight is True
     assert congress.flat_by_close is False
     assert congress.sweep is not None
@@ -470,6 +585,54 @@ def test_a_book_only_writes_down_what_it_changes(tmp_path: Path):
     assert g.money.max_position_pct == 15  # from config/guardrails.yaml
 
 
+def test_the_deprecated_share_volume_floor_is_still_accepted(tmp_path: Path):
+    """An older settings file that only knows about shares still loads."""
+    books_path = temp_project(
+        tmp_path,
+        strategy_changes={
+            "universe": {
+                "min_avg_dollar_volume": None,
+                "dollar_volume_sessions": None,
+                "min_avg_volume": 750000,
+            }
+        },
+    )
+    g = load_book_guardrails(books_path, "A")
+    assert g.universe.min_avg_volume == 750000
+    # And the dollar floor falls back to the shared file rather than vanishing.
+    assert g.universe.min_avg_dollar_volume == 20_000_000
+    assert g.universe.dollar_volume_sessions == 30
+
+
+def test_a_settings_file_with_no_share_volume_floor_at_all_still_loads(tmp_path: Path):
+    """min_avg_volume is optional now. Nothing breaks when it is deleted outright."""
+    from agent.guardrails import load_guardrails
+
+    data = yaml.safe_load(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+    data["universe"].pop("min_avg_volume")
+    path = tmp_path / "no_share_floor.yaml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    g = load_guardrails(path)
+    assert g.universe.min_avg_volume is None
+    assert g.universe.min_avg_dollar_volume == 20_000_000
+
+
+def test_a_book_may_set_its_own_dollar_volume_floor(tmp_path: Path):
+    books_path = temp_project(
+        tmp_path,
+        strategy_changes={
+            "universe": {
+                "min_avg_dollar_volume": 50_000_000,
+                "dollar_volume_sessions": 60,
+            }
+        },
+    )
+    g = load_book_guardrails(books_path, "A")
+    assert g.universe.min_avg_dollar_volume == 50_000_000
+    assert g.universe.dollar_volume_sessions == 60
+
+
 def test_the_shared_settings_still_load_on_their_own_with_no_book():
     """The original settings file has no book, and nothing about it changed."""
     from agent.guardrails import load_guardrails
@@ -484,7 +647,13 @@ def test_the_shared_settings_still_load_on_their_own_with_no_book():
     assert shared.universe.short_price_floor is None
     assert shared.universe.require_shortable is False
     assert shared.money.gross_exposure_pct_max == 100
+    assert shared.money.tiny_capital_usd == 2000
     assert shared.schedule.entries_per_day_max is None
+    assert shared.schedule.holidays == (), "no holiday calendar in month one"
+    assert shared.universe.min_avg_dollar_volume == 20_000_000
+    assert shared.universe.dollar_volume_sessions == 30
+    assert shared.pdt.hard_limit is False
+    assert shared.pdt.assumed_live_equity_min_usd == 25000
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +808,219 @@ def test_a_short_the_broker_has_not_confirmed_is_blocked(momentum: Guardrails):
     )
     assert decision.allowed is False
     assert "shortable_required" in decision.rule_ids
-    assert "borrowed" in " ".join(decision.reasons)
+    assert "borrow" in " ".join(decision.reasons)
+
+
+# ---------------------------------------------------------------------------
+# The easy to borrow rule: three tests, and any one of them can say no
+# ---------------------------------------------------------------------------
+
+
+def test_an_easy_to_borrow_short_with_all_three_facts_goes_through(
+    momentum: Guardrails,
+):
+    """IBKR rates it 3 of 3, the borrow is cheap, and there are shares to spare."""
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            borrow_fee_pct_annual=0.25,
+            shares_available_to_borrow=50_000,
+        ),
+    )
+    assert decision.allowed is True, decision.reasons
+
+
+def test_a_borrowing_level_below_the_easy_band_is_blocked_on_its_own(
+    momentum: Guardrails,
+):
+    """2.5 and below is not easy to borrow on IBKR's 0 to 3 scale."""
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short("A", qty=100, limit_price=50.0, shortable_level=2.5),
+    )
+    assert decision.allowed is False
+    assert decision.rule_ids == ["shortable_required"]
+    assert "0 to 3 borrowing scale" in " ".join(decision.reasons)
+
+
+def test_a_borrowing_level_just_inside_the_easy_band_is_allowed(momentum: Guardrails):
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short("A", qty=100, limit_price=50.0, shortable_level=2.6),
+    )
+    assert decision.allowed is True, decision.reasons
+
+
+def test_a_borrow_fee_over_one_percent_a_year_is_blocked_on_its_own(
+    momentum: Guardrails,
+):
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            borrow_fee_pct_annual=1.5,
+        ),
+    )
+    assert decision.allowed is False
+    assert decision.rule_ids == ["shortable_required"]
+    assert "1.5 percent a year" in " ".join(decision.reasons)
+
+
+def test_a_borrow_fee_of_exactly_the_limit_is_allowed(momentum: Guardrails):
+    """Landing on a limit is allowed here, the same as everywhere else."""
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            borrow_fee_pct_annual=1.0,
+        ),
+    )
+    assert decision.allowed is True, decision.reasons
+
+
+def test_too_few_shares_available_to_borrow_is_blocked_on_its_own(
+    momentum: Guardrails,
+):
+    """100 shares wanted needs 1,000 available, and 999 is not enough."""
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            shares_available_to_borrow=999,
+        ),
+    )
+    assert decision.allowed is False
+    assert decision.rule_ids == ["shortable_required"]
+    assert "999 shares are available to borrow" in " ".join(decision.reasons)
+
+
+def test_exactly_ten_times_the_shares_available_is_enough(momentum: Guardrails):
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            shares_available_to_borrow=1000,
+        ),
+    )
+    assert decision.allowed is True, decision.reasons
+
+
+def test_a_borrow_the_broker_priced_at_nothing_is_still_refused(momentum: Guardrails):
+    """An unknown borrow cost is refused rather than assumed cheap."""
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            borrow_fee_pct_annual=None,
+        ),
+    )
+    assert decision.allowed is False
+    assert "did not say what borrowing the shares costs" in " ".join(decision.reasons)
+
+
+def test_an_unknown_number_of_shares_to_borrow_is_refused_too(momentum: Guardrails):
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=3.0,
+            shares_available_to_borrow=None,
+        ),
+    )
+    assert decision.allowed is False
+    assert "how many shares are available to borrow" in " ".join(decision.reasons)
+
+
+def test_all_three_borrow_failures_are_reported_at_once(momentum: Guardrails):
+    """The ledger should show every reason, not just the first one found."""
+    decision = check_order(
+        momentum,
+        book_state("A"),
+        short(
+            "A",
+            qty=100,
+            limit_price=50.0,
+            shortable_level=1.0,
+            borrow_fee_pct_annual=8.0,
+            shares_available_to_borrow=10,
+        ),
+    )
+    assert decision.allowed is False
+    assert decision.rule_ids == ["shortable_required"] * 3
+    joined = " ".join(decision.reasons)
+    assert "borrowing scale" in joined
+    assert "percent a year" in joined
+    assert "available to borrow" in joined
+
+
+def test_the_shortable_flag_still_works_for_a_caller_with_no_level(
+    momentum: Guardrails,
+):
+    """An older caller that only knows yes or no keeps working."""
+    from agent.guardrails import easy_to_borrow
+
+    assert easy_to_borrow(None, shortable=True) is True
+    assert easy_to_borrow(None, shortable=False) is False
+    assert easy_to_borrow(3.0, shortable=False) is True
+    assert easy_to_borrow(1.0, shortable=True) is False
+
+
+def test_a_borrowing_level_off_ibkrs_scale_is_refused_at_the_door():
+    with pytest.raises(GuardrailUsageError, match="only runs from 0 to 3"):
+        OrderIntent(
+            symbol="AAPL", side="SELL", qty=10, limit_price=50.0, shortable_level=7.0
+        )
+
+
+def test_a_negative_borrow_fee_is_refused_at_the_door():
+    with pytest.raises(GuardrailUsageError, match="cannot be negative"):
+        OrderIntent(
+            symbol="AAPL",
+            side="SELL",
+            qty=10,
+            limit_price=50.0,
+            borrow_fee_pct_annual=-1.0,
+        )
+
+
+def test_the_long_only_books_never_look_at_the_borrow_facts(insider: Guardrails):
+    """require_shortable is off in book C, so none of the three tests run."""
+    assert insider.universe.require_shortable is False
+    decision = check_order(
+        insider, book_state("C"), buy("C", qty=10, limit_price=50.0)
+    )
+    assert "shortable_required" not in decision.rule_ids
+    assert decision.allowed is True, decision.reasons
 
 
 def test_the_borrow_check_only_looks_at_orders_that_open_a_short(
@@ -1086,6 +1467,6 @@ def test_a_book_config_is_a_plain_readable_record():
         book.capital_usd,
         book.enabled,
         book.mode,
-    ) == ("A", "BOOK_A", "strategies/momentum_hybrid", 100000.0, True, "dry-run")
+    ) == ("A", "BOOK_A", "strategies/momentum_hybrid", 100000.0, True, "dry_run")
     assert book.model == "openrouter/anthropic/claude-fable-5.1"
     assert copy.copy(book) == book

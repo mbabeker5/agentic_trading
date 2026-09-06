@@ -59,8 +59,19 @@ risk:
 
 universe:
   price_floor: 5              # ignore anything trading below this many dollars
-  min_avg_volume: 1000000     # ignore anything that normally trades fewer than
-                              # this many shares a day
+  min_avg_dollar_volume: 20000000
+                              # the liquidity floor (Mo, 2026-09-06). A name has
+                              # to trade at least this many dollars a day on
+                              # average before the scanner will look at it.
+                              # Dollars, not shares, because 20 million dollars
+                              # means the same thing at 6 dollars a share and at
+                              # 600. It replaced a million share floor, which a
+                              # census on 2026-09-04 found was the narrower of
+                              # the two: about 1,950 US names cleared it against
+                              # about 2,700 that clear this one.
+  dollar_volume_sessions: 30  # how many completed sessions that average covers
+  min_avg_volume: 1000000     # DEPRECATED, kept as an alias so an older file
+                              # still loads. The scanner ignores it.
   allow_options: false        # no options in month one
   allow_shorts: true          # shorting a gap down is the mirror of buying a
                               # gap up (Mo, 2026-09-02). Switched on here, and
@@ -71,8 +82,22 @@ universe:
                               # Cheap shares are the expensive ones to be short
                               # of: hard to borrow, and they can double in a
                               # morning.
-  require_shortable: true     # IBKR has to have said the shares can actually
-                              # be borrowed before a short goes out
+  require_shortable: true     # the easy to borrow rule (Mo, 2026-09-06). All
+                              # three of the tests below have to hold at the
+                              # moment of entry, and any miss skips the short
+                              # and writes down which test failed.
+  max_borrow_fee_pct: 1.0     # the borrow has to cost less than this percent a
+                              # year. An expensive borrow eats the trade before
+                              # it starts.
+  borrow_availability_multiple: 10
+                              # and the broker has to have at least this many
+                              # times our share count available to borrow, so a
+                              # thin borrow cannot be recalled out from under us.
+                              # The third test is IBKR's own shortable level,
+                              # which has to be in its easy to borrow band,
+                              # above 2.5 on a scale of 0 to 3. That number is
+                              # the broker's, not ours, so it is in the code
+                              # rather than here.
   allowed_sec_types: [STK]    # STK means ordinary shares and ETFs
   allowed_currencies: [USD]   # US dollars only
   whitelist: []               # empty means any symbol that passes the filters
@@ -95,6 +120,15 @@ schedule:
   trade_only_regular_hours: true  # no pre-market or after-hours trading
   entries_per_day_max: 5      # at most this many brand new names in one day.
                               # Adding to something already held does not count.
+
+pdt:
+  # The pattern day trader rule, as this book applies it. Day trading is this
+  # book's whole strategy, so it is never blocked. Every order the rule would
+  # have blocked is still written down, so the cost of the rule in a live
+  # account is measured rather than guessed (Mo, 2026-09-06).
+  hard_limit: false           # never block. The insider and Congress books set
+                              # this true, because a day trade in a book meant
+                              # to hold for weeks is a mistake.
 
 kill_switch:
   file: output/STOP           # create this file and every book only closes

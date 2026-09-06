@@ -112,6 +112,18 @@ schedule:
                               # The signal is thin; most days there is nothing
                               # worth buying.
 
+pdt:
+  # The pattern day trader rule, as this book applies it. This book holds the
+  # longest of the five, so a day trade here is a mistake rather than the
+  # strategy, and it is held to a hard limit (Mo, 2026-09-06).
+  hard_limit: true            # refuse a closing order that would be the fourth
+                              # day trade in five business days
+  max_day_trades_per_5_days: 3
+                              # three are allowed, so the fourth is the one that
+                              # trips the rule. The counting lives in
+                              # agent/pdt.py, and it counts business days, so a
+                              # weekend or a market holiday does not use one up.
+
 kill_switch:
   file: output/STOP           # create this file and every book only closes
                               # positions, never opens one. Delete it to resume.

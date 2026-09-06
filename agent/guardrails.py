@@ -25,6 +25,20 @@ in here already takes, so the rest of the agent never has to learn a second
 shape. A book's orders carry its book id, and an order tagged for the wrong book
 is refused like any other broken limit.
 
+Also on 2026-09-06, three of Mo's decisions landed here. The liquidity floor
+became 20 million dollars of average daily trading rather than a million shares,
+which is a scanner filter rather than an order check but lives in the same
+settings file. The easy to borrow rule grew from one yes or no flag into three
+tests a short has to pass: IBKR's own borrowing level, what the borrow costs and
+how many shares are available. And a book's mode became one of dry_run, tiny or
+full, so a book can be promoted from writing orders down to actually sending
+them, by hand, one book at a time.
+
+Two things live next door rather than here. The rolling day trade count is in
+agent/pdt.py, and the daily check that the books and the broker agree is in
+agent/reconcile.py. Both are the same shape as this file: pure logic, no
+network, plain English when they say no.
+
 Written 2026-09-02, extended for the five books on 2026-09-06. The numbers live
 in the yaml files, not here.
 """
@@ -53,6 +67,7 @@ __all__ = [
     "ScannerConfig",
     "ScheduleConfig",
     "KillSwitchConfig",
+    "PdtConfig",
     "StrategyConfig",
     "SharedConfig",
     "BookConfig",
@@ -68,6 +83,7 @@ __all__ = [
     "load_book_guardrails",
     "check_order",
     "daily_loss_hit",
+    "easy_to_borrow",
     "entries_allowed_now",
     "must_flatten_now",
     "is_regular_hours",
@@ -76,6 +92,16 @@ __all__ = [
     "time_stop_due",
     "trading_days_between",
     "max_shares_for",
+    "BOOK_MODES_ALLOWED",
+    "BOOK_MODES_THAT_SEND_ORDERS",
+    "DEFAULT_TINY_CAPITAL_USD",
+    "DEFAULT_MIN_AVG_DOLLAR_VOLUME",
+    "DEFAULT_DOLLAR_VOLUME_SESSIONS",
+    "EASY_TO_BORROW_LEVEL_MIN",
+    "DEFAULT_MAX_BORROW_FEE_PCT",
+    "DEFAULT_BORROW_AVAILABILITY_MULTIPLE",
+    "DEFAULT_MAX_DAY_TRADES_PER_5_DAYS",
+    "DEFAULT_ASSUMED_LIVE_EQUITY_MIN_USD",
 ]
 
 
@@ -94,10 +120,48 @@ KILL_SWITCH_ALLOWED_PURPOSES = ("exit", "flatten")
 VALID_PURPOSES = ("entry", "exit", "stop", "flatten")
 VALID_SIDES = ("BUY", "SELL")
 
-# How much rope a book has. Only dry-run loads today: the book writes down the
-# order it would have sent and stops there. Nothing else is allowed until Mo
-# signs the strategy numbers off, and that approval is a change to this line.
-BOOK_MODES_ALLOWED = ("dry-run",)
+# How much rope a book has. Three settings, in order of how much can go wrong:
+#
+#   dry_run  the book works out the order it would have sent, writes it down,
+#            and stops there. Nothing reaches the broker. Sizing still uses the
+#            book's full capital, so a dry run is a full size rehearsal.
+#   tiny     real orders in the paper account, but the book is only allowed to
+#            risk money.tiny_capital_usd (2,000 dollars), so a bug is cheap.
+#   full     real orders in the paper account against the book's full capital.
+#
+# Every book is on dry_run today (2026-09-06). Moving one up is a hand edit to
+# config/books.yaml by Mo, never something the code does for itself, and a book
+# above dry_run has to carry the date it was promoted and the git hash of the
+# rules it was promoted against.
+BOOK_MODES_ALLOWED = ("dry_run", "tiny", "full")
+
+# The modes in which a book actually sends orders to the broker.
+BOOK_MODES_THAT_SEND_ORDERS = ("tiny", "full")
+
+# What a book in tiny mode is allowed to put at risk, when nothing says otherwise.
+DEFAULT_TINY_CAPITAL_USD = 2000.0
+
+# The liquidity floor Mo settled on 2026-09-06: a name has to trade at least
+# 20 million dollars a day on average, over 30 completed sessions, before the
+# momentum scanner will look at it. It replaced a floor of a million shares a
+# day, which meant wildly different amounts of money at 6 dollars and at 600.
+DEFAULT_MIN_AVG_DOLLAR_VOLUME = 20_000_000.0
+DEFAULT_DOLLAR_VOLUME_SESSIONS = 30
+
+# The easy to borrow rule, also Mo's decision of 2026-09-06. IBKR reports how
+# borrowable a name is on a scale of 0 to 3, and anything above 2.5 is what the
+# broker calls easy to borrow. A short only goes out when the level says easy to
+# borrow, the borrow costs less than 1 percent a year, and there are at least 10
+# times as many shares available to borrow as we mean to sell.
+EASY_TO_BORROW_LEVEL_MIN = 2.5
+IBKR_SHORTABLE_LEVEL_MAX = 3.0
+DEFAULT_MAX_BORROW_FEE_PCT = 1.0
+DEFAULT_BORROW_AVAILABILITY_MULTIPLE = 10.0
+
+# How many day trades a book held to the pattern day trader rule may make in
+# five business days, and the live account balance that rule assumes.
+DEFAULT_MAX_DAY_TRADES_PER_5_DAYS = 3
+DEFAULT_ASSUMED_LIVE_EQUITY_MIN_USD = 25_000.0
 
 # Who makes the call inside a book. "hybrid" means a model picks the names
 # inside the rules; "rules_only" means no model is called at all.
@@ -179,6 +243,10 @@ class MoneyConfig:
     gross_exposure_pct_max is the backstop: longs and shorts added together,
     ignoring which way they point, may never be worth more than this percentage
     of the book. 100 means the book never borrows to buy.
+
+    tiny_capital_usd is what a book in tiny mode is allowed to put at risk. It
+    does nothing while a book is on dry_run or full; it is written down here so
+    the number lives with the other money numbers rather than in the code.
     """
 
     starting_equity: float
@@ -187,6 +255,7 @@ class MoneyConfig:
     max_daily_loss_pct: float
     max_order_notional: float
     gross_exposure_pct_max: float = 100.0
+    tiny_capital_usd: float = DEFAULT_TINY_CAPITAL_USD
 
 
 @dataclass(frozen=True)
@@ -214,25 +283,43 @@ class RiskConfig:
 class UniverseConfig:
     """What the agent is allowed to trade at all.
 
+    min_avg_dollar_volume is the liquidity floor Mo settled on 2026-09-06: a
+    name has to trade at least this many dollars a day on average, over
+    dollar_volume_sessions completed sessions, before the scanner will look at
+    it. Dollars rather than shares, because 20 million dollars means the same
+    thing whether the share price is 6 dollars or 600.
+
+    min_avg_volume is the old share count floor it replaced. It is kept because
+    the insider and Congress sweeps still quote a share figure in the words they
+    hand the model, and because an old settings file should still load. The
+    scanner no longer looks at it.
+
     short_price_floor is a second, higher price floor that applies to shorts
     only, because cheap stocks are the expensive ones to be short of. None means
     the book never shorts, so no separate floor is needed.
 
-    require_shortable says the broker has to have confirmed the name is
-    borrowable before a short goes out. The loop reads that flag from IBKR and
-    puts it on the order intent.
+    require_shortable switches on the easy to borrow rule: before a short goes
+    out, IBKR has to say the name is easy to borrow, the borrow has to cost less
+    than max_borrow_fee_pct a year, and there have to be at least
+    borrow_availability_multiple times as many shares available to borrow as we
+    intend to sell. The loop reads all three numbers from the broker and puts
+    them on the order intent.
     """
 
     price_floor: float
-    min_avg_volume: int
     allow_options: bool
     allow_shorts: bool
     allowed_sec_types: tuple[str, ...]
     allowed_currencies: tuple[str, ...]
     whitelist: tuple[str, ...]
     blacklist: tuple[str, ...]
+    min_avg_dollar_volume: float = DEFAULT_MIN_AVG_DOLLAR_VOLUME
+    dollar_volume_sessions: int = DEFAULT_DOLLAR_VOLUME_SESSIONS
+    min_avg_volume: int | None = None
     short_price_floor: float | None = None
     require_shortable: bool = False
+    max_borrow_fee_pct: float = DEFAULT_MAX_BORROW_FEE_PCT
+    borrow_availability_multiple: float = DEFAULT_BORROW_AVAILABILITY_MULTIPLE
 
 
 @dataclass(frozen=True)
@@ -250,6 +337,11 @@ class ScheduleConfig:
 
     entries_per_day_max is how many brand new names the book may open in one
     day. None means the only limit is max_open_positions.
+
+    holidays is the list of days the US market is shut that are not weekends.
+    It is empty in the shipped settings, and it is used by the day trade counter
+    in agent/pdt.py to work out what a business day is. Nothing else in this
+    file has ever known about holidays, and that has not changed.
     """
 
     timezone: str
@@ -261,6 +353,7 @@ class ScheduleConfig:
     loop_minutes: int
     trade_only_regular_hours: bool
     entries_per_day_max: int | None = None
+    holidays: tuple[date, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -268,6 +361,36 @@ class KillSwitchConfig:
     """The file that stops the agent opening anything new."""
 
     file: str
+
+
+@dataclass(frozen=True)
+class PdtConfig:
+    """The pattern day trader rule, as this project chooses to apply it.
+
+    US regulators call anyone who makes four or more round trip day trades in
+    five business days, in a margin account, a pattern day trader, and require
+    that account to hold at least 25,000 dollars. The IBKR paper account is
+    exempt because the money is simulated, so the code counts day trades itself
+    and month one measures the cost of the rule rather than guessing at it.
+
+    hard_limit                 true in the insider and Congress books, where a
+                               day trade is a mistake, and false in the momentum
+                               books, where day trading is the whole strategy.
+                               A book with it false is never blocked; the loop
+                               is told what would have been blocked instead.
+    max_day_trades_per_5_days  three, so the fourth is the one that trips.
+    assumed_live_equity_min_usd
+                               25,000 dollars, the balance the rule assumes a
+                               live account would have to keep. Nothing enforces
+                               it on paper; it is written down so month one's
+                               numbers can be read against it.
+
+    The counting itself lives in agent/pdt.py, not here.
+    """
+
+    hard_limit: bool = False
+    max_day_trades_per_5_days: int = DEFAULT_MAX_DAY_TRADES_PER_5_DAYS
+    assumed_live_equity_min_usd: float = DEFAULT_ASSUMED_LIVE_EQUITY_MIN_USD
 
 
 @dataclass(frozen=True)
@@ -299,6 +422,7 @@ class SharedConfig:
     ledger_config_path: str
     timezone: str
     guardrails_path: str
+    tiny_capital_usd: float = DEFAULT_TINY_CAPITAL_USD
 
 
 @dataclass(frozen=True)
@@ -306,6 +430,15 @@ class BookConfig:
     """One virtual book: a strategy, a pot of money and a tag on its orders.
 
     model is None for a book that calls no model at all.
+
+    mode is one of dry_run, tiny or full. See BOOK_MODES_ALLOWED at the top of
+    this file for what each one means.
+
+    promoted_on and rules_commit are the paper trail behind a promotion. They
+    are empty while a book is on dry_run, and they are filled in by hand on the
+    day the hub approves the book: the date it was promoted, and the git hash of
+    the rules it was promoted against. A book above dry_run without both of them
+    refuses to load, so a book can never quietly start sending orders.
     """
 
     book_id: str
@@ -319,10 +452,33 @@ class BookConfig:
     start_date: date
     end_date: date
     notes: str
+    tiny_capital_usd: float = DEFAULT_TINY_CAPITAL_USD
+    promoted_on: date | None = None
+    rules_commit: str | None = None
 
     @property
     def uses_a_model(self) -> bool:
         return self.model is not None
+
+    @property
+    def sends_orders(self) -> bool:
+        """True when this book's orders actually reach the broker.
+
+        False on dry_run, which is where all five books sit today.
+        """
+        return self.mode in BOOK_MODES_THAT_SEND_ORDERS
+
+    def effective_capital(self) -> float:
+        """How much money this book is actually working with today.
+
+        On tiny that is the small pot, 2,000 dollars, so a bug is cheap while
+        the machinery is being watched. On dry_run and on full it is the book's
+        whole capital. dry_run uses the full number on purpose: a rehearsal that
+        sizes its orders differently from the real thing is not a rehearsal.
+        """
+        if self.mode == "tiny":
+            return float(self.tiny_capital_usd)
+        return float(self.capital_usd)
 
 
 @dataclass(frozen=True)
@@ -368,6 +524,7 @@ class Guardrails:
     scanner: ScannerConfig
     schedule: ScheduleConfig
     kill_switch: KillSwitchConfig
+    pdt: PdtConfig = field(default_factory=PdtConfig)
     source_path: Path | None = None
     strategy: StrategyConfig | None = None
     book: BookConfig | None = None
@@ -552,10 +709,29 @@ class OrderIntent:
 
     book_id  which virtual book is sending it. None means the shared settings,
              the way the agent worked before there were books.
+
+    The last four are what the broker says about borrowing this name, and they
+    only matter to a short. The loop reads them from IBKR just before the order
+    goes out and puts them here:
+
     shortable
-             true when IBKR has said this name can actually be borrowed. The
-             loop sets it from the broker's own flag; it is false until then,
-             so a book that insists on it cannot short by accident.
+             true when IBKR has said this name can be borrowed at all. It is
+             false until the loop sets it, so a book that insists on a borrow
+             cannot short by accident. It is the fallback when the newer
+             shortable_level is not there.
+    shortable_level
+             IBKR's shortable indicator, on its own scale of 0 to 3. Anything
+             above 2.5 is what the broker calls easy to borrow. None means the
+             broker did not report one, and then the shortable flag above
+             decides instead.
+    borrow_fee_pct_annual
+             what the borrow costs, as a percentage a year. 0.3 means three
+             tenths of a percent. None means the broker did not report it, and
+             an unknown borrow cost is treated as a refusal, because the shorts
+             that cost 300 percent a year are exactly the ones nobody quoted.
+    shares_available_to_borrow
+             how many shares the broker says are available to borrow right now.
+             None is treated the same way, as a refusal.
     """
 
     symbol: str
@@ -567,6 +743,9 @@ class OrderIntent:
     purpose: str = "entry"
     book_id: str | None = None
     shortable: bool = False
+    shortable_level: float | None = None
+    borrow_fee_pct_annual: float | None = None
+    shares_available_to_borrow: int | None = None
 
     def __post_init__(self) -> None:
         self.symbol = _clean_symbol(self.symbol, "OrderIntent.symbol")
@@ -577,6 +756,41 @@ class OrderIntent:
                 "OrderIntent.shortable has to be true or false, but it is "
                 f"{self.shortable!r}."
             )
+        if self.shortable_level is not None:
+            self.shortable_level = _finite_number(
+                self.shortable_level, "OrderIntent.shortable_level"
+            )
+            if not 0.0 <= self.shortable_level <= IBKR_SHORTABLE_LEVEL_MAX:
+                raise GuardrailUsageError(
+                    "OrderIntent.shortable_level is "
+                    f"{_plain_number(self.shortable_level)}, and IBKR's shortable "
+                    f"indicator only runs from 0 to "
+                    f"{_plain_number(IBKR_SHORTABLE_LEVEL_MAX)}."
+                )
+        if self.borrow_fee_pct_annual is not None:
+            self.borrow_fee_pct_annual = _finite_number(
+                self.borrow_fee_pct_annual, "OrderIntent.borrow_fee_pct_annual"
+            )
+            if self.borrow_fee_pct_annual < 0:
+                raise GuardrailUsageError(
+                    "OrderIntent.borrow_fee_pct_annual cannot be negative, but it is "
+                    f"{_plain_number(self.borrow_fee_pct_annual)}. Write 0.3 for three "
+                    "tenths of a percent a year."
+                )
+        if self.shares_available_to_borrow is not None:
+            if isinstance(self.shares_available_to_borrow, bool) or not isinstance(
+                self.shares_available_to_borrow, (int, float)
+            ):
+                raise GuardrailUsageError(
+                    "OrderIntent.shares_available_to_borrow has to be a number of "
+                    f"shares, but it is {self.shares_available_to_borrow!r}."
+                )
+            self.shares_available_to_borrow = int(self.shares_available_to_borrow)
+            if self.shares_available_to_borrow < 0:
+                raise GuardrailUsageError(
+                    "OrderIntent.shares_available_to_borrow cannot be negative, but "
+                    f"it is {self.shares_available_to_borrow}."
+                )
         self.side = str(self.side).strip().upper()
         if self.side not in VALID_SIDES:
             raise GuardrailUsageError(
@@ -741,6 +955,7 @@ def _guardrails_from_mapping(
     strategy_raw = _optional_section(data, "strategy", where)
     strategy = _build_strategy(strategy_raw, where) if strategy_raw else None
     sweep = _optional_section(data, "sweep", where)
+    pdt = _build_pdt(_optional_section(data, "pdt", where), where)
 
     if account.mode == "live" and os.environ.get(LIVE_MODE_ENV_VAR) != "yes":
         raise GuardrailConfigError(
@@ -758,6 +973,7 @@ def _guardrails_from_mapping(
         scanner=scanner,
         schedule=schedule,
         kill_switch=kill_switch,
+        pdt=pdt,
         source_path=source_path,
         strategy=strategy,
         book=book,
@@ -798,6 +1014,9 @@ def _build_money(raw: dict, where: str) -> MoneyConfig:
         max_order_notional=_need_positive_number(raw, "money.max_order_notional", where),
         gross_exposure_pct_max=_optional_percent(
             raw, "money.gross_exposure_pct_max", where, default=100.0
+        ),
+        tiny_capital_usd=_optional_positive_number(
+            raw, "money.tiny_capital_usd", where, default=DEFAULT_TINY_CAPITAL_USD
         ),
     )
 
@@ -851,6 +1070,31 @@ def _build_strategy(raw: dict, where: str) -> StrategyConfig:
     )
 
 
+def _build_pdt(raw: dict | None, where: str) -> PdtConfig:
+    """The pattern day trader settings. A file with no pdt section gets the defaults.
+
+    The defaults are the safe reading: no hard limit, three day trades in five
+    business days, and 25,000 dollars assumed as the live account minimum.
+    """
+    if not raw:
+        return PdtConfig()
+    return PdtConfig(
+        hard_limit=_optional_bool(raw, "pdt.hard_limit", where, default=False),
+        max_day_trades_per_5_days=_optional_positive_int(
+            raw,
+            "pdt.max_day_trades_per_5_days",
+            where,
+            default=DEFAULT_MAX_DAY_TRADES_PER_5_DAYS,
+        ),
+        assumed_live_equity_min_usd=_optional_positive_number(
+            raw,
+            "pdt.assumed_live_equity_min_usd",
+            where,
+            default=DEFAULT_ASSUMED_LIVE_EQUITY_MIN_USD,
+        ),
+    )
+
+
 def _build_universe(raw: dict, where: str) -> UniverseConfig:
     allowed_sec_types = _need_symbol_list(raw, "universe.allowed_sec_types", where)
     if not allowed_sec_types:
@@ -878,16 +1122,43 @@ def _build_universe(raw: dict, where: str) -> UniverseConfig:
         )
     return UniverseConfig(
         price_floor=price_floor,
-        min_avg_volume=_need_positive_int(raw, "universe.min_avg_volume", where),
         allow_options=_need_bool(raw, "universe.allow_options", where),
         allow_shorts=_need_bool(raw, "universe.allow_shorts", where),
         allowed_sec_types=allowed_sec_types,
         allowed_currencies=allowed_currencies,
         whitelist=_need_symbol_list(raw, "universe.whitelist", where),
         blacklist=_need_symbol_list(raw, "universe.blacklist", where),
+        min_avg_dollar_volume=_optional_positive_number(
+            raw,
+            "universe.min_avg_dollar_volume",
+            where,
+            default=DEFAULT_MIN_AVG_DOLLAR_VOLUME,
+        ),
+        dollar_volume_sessions=_optional_positive_int(
+            raw,
+            "universe.dollar_volume_sessions",
+            where,
+            default=DEFAULT_DOLLAR_VOLUME_SESSIONS,
+        ),
+        # Deprecated, and optional for that reason. Kept so an older settings
+        # file still loads and so the insider and Congress sweeps can go on
+        # quoting a share figure. The momentum scanner ignores it.
+        min_avg_volume=_optional_positive_int(raw, "universe.min_avg_volume", where),
         short_price_floor=short_price_floor,
         require_shortable=_optional_bool(
             raw, "universe.require_shortable", where, default=False
+        ),
+        max_borrow_fee_pct=_optional_percent(
+            raw,
+            "universe.max_borrow_fee_pct",
+            where,
+            default=DEFAULT_MAX_BORROW_FEE_PCT,
+        ),
+        borrow_availability_multiple=_optional_positive_number(
+            raw,
+            "universe.borrow_availability_multiple",
+            where,
+            default=DEFAULT_BORROW_AVAILABILITY_MULTIPLE,
         ),
     )
 
@@ -926,6 +1197,7 @@ def _build_schedule(raw: dict, where: str) -> ScheduleConfig:
         entries_per_day_max=_optional_positive_int(
             raw, "schedule.entries_per_day_max", where
         ),
+        holidays=_optional_date_list(raw, "schedule.holidays", where),
     )
 
     _check_times_in_order(
@@ -997,6 +1269,12 @@ def load_books(path: str | Path) -> BookRegistry:
         ledger_config_path=_need_text(shared_raw, "shared.ledger_config", where),
         timezone=_need_text(shared_raw, "shared.timezone", where),
         guardrails_path=_need_text(shared_raw, "shared.guardrails", where),
+        tiny_capital_usd=_optional_positive_number(
+            shared_raw,
+            "shared.tiny_capital_usd",
+            where,
+            default=DEFAULT_TINY_CAPITAL_USD,
+        ),
     )
     try:
         ZoneInfo(shared.timezone)
@@ -1022,7 +1300,7 @@ def load_books(path: str | Path) -> BookRegistry:
                 f"Book number {number} in {where} should be a list of settings such "
                 f"as book_id and capital_usd, but it is a {type(raw_book).__name__}."
             )
-        book = _build_book(raw_book, where, number)
+        book = _build_book(raw_book, where, number, shared)
         if book.book_id in seen_ids:
             raise GuardrailConfigError(
                 f"Two books in {where} both call themselves {book.book_id!r}. Every "
@@ -1043,7 +1321,9 @@ def load_books(path: str | Path) -> BookRegistry:
     )
 
 
-def _build_book(raw: dict, where: str, number: int) -> BookConfig:
+def _build_book(
+    raw: dict, where: str, number: int, shared: SharedConfig | None = None
+) -> BookConfig:
     label = f"books[{number}]"
     raw_id = _need_text(raw, f"{label}.book_id", where)
     try:
@@ -1061,14 +1341,29 @@ def _build_book(raw: dict, where: str, number: int) -> BookConfig:
             "always be traced back to one book."
         )
 
-    mode = _need_text(raw, f"{label}.mode", where).lower()
+    # A hyphen and an underscore mean the same mode, so an older file that says
+    # dry-run still reads as dry_run rather than failing over punctuation.
+    mode = _need_text(raw, f"{label}.mode", where).lower().replace("-", "_")
     if mode not in BOOK_MODES_ALLOWED:
         raise GuardrailConfigError(
-            f"The setting {label}.mode in {where} says {mode!r}, and the only mode "
-            f"allowed today is {', '.join(BOOK_MODES_ALLOWED)}. Every strategy number "
-            "in this project is still provisional, so a book may write down the order "
-            "it would have sent and nothing more. Changing that is a decision for Mo, "
-            "not an edit to this file."
+            f"The setting {label}.mode in {where} says {mode!r}, and it has to be one "
+            f"of {', '.join(BOOK_MODES_ALLOWED)}. dry_run works the order out and "
+            "writes it down without sending it, tiny sends real paper orders against a "
+            "small pot, and full sends them against the book's whole capital."
+        )
+
+    promoted_on = _optional_date(raw, f"{label}.promoted_on", where)
+    rules_commit = _optional_text(raw, f"{label}.rules_commit", where)
+    if mode in BOOK_MODES_THAT_SEND_ORDERS and (
+        promoted_on is None or not rules_commit
+    ):
+        raise GuardrailConfigError(
+            f"Book {book_id} in {where} is set to {mode!r}, which sends real orders, "
+            f"but {label}.promoted_on and {label}.rules_commit are not both filled in. "
+            "A book only leaves dry_run when the hub approves it, and the approval is "
+            "recorded here as the date it was promoted and the git hash of the rules it "
+            "was promoted against. Fill both in by hand, or put the book back on "
+            "dry_run."
         )
 
     start_date = _need_date(raw, f"{label}.start_date", where)
@@ -1079,6 +1374,9 @@ def _build_book(raw: dict, where: str, number: int) -> BookConfig:
             f"before it starts on {start_date.isoformat()}."
         )
 
+    default_tiny = (
+        shared.tiny_capital_usd if shared is not None else DEFAULT_TINY_CAPITAL_USD
+    )
     return BookConfig(
         book_id=book_id,
         name=_need_text(raw, f"{label}.name", where),
@@ -1091,6 +1389,11 @@ def _build_book(raw: dict, where: str, number: int) -> BookConfig:
         start_date=start_date,
         end_date=end_date,
         notes=_need_text(raw, f"{label}.notes", where),
+        tiny_capital_usd=_optional_positive_number(
+            raw, f"{label}.tiny_capital_usd", where, default=default_tiny
+        ),
+        promoted_on=promoted_on,
+        rules_commit=rules_commit,
     )
 
 
@@ -1169,10 +1472,13 @@ def load_book_guardrails(books_yaml_path: str | Path, book_id: str) -> Guardrail
 
     # The register has the last word on the things all five books share, so one
     # book cannot quietly point itself at a different account or a different port.
+    # The money a book actually works with follows its mode: a book on tiny is
+    # sized against the small pot, everything else against its whole capital.
     merged["account"]["account_id"] = registry.shared.account_id
     merged["account"]["gateway_port_paper"] = registry.shared.gateway_port
     merged["schedule"]["timezone"] = registry.shared.timezone
-    merged["money"]["starting_equity"] = book.capital_usd
+    merged["money"]["starting_equity"] = book.effective_capital()
+    merged["money"]["tiny_capital_usd"] = book.tiny_capital_usd
 
     where = f"{shared_path} merged with {strategy_path}"
     return _guardrails_from_mapping(
@@ -1375,6 +1681,72 @@ def _optional_bool(
     if _is_unset(raw, dotted_name):
         return default
     return _need_bool(raw, dotted_name, where)
+
+
+def _optional_positive_number(
+    raw: dict, dotted_name: str, where: str, default: float | None = None
+) -> float | None:
+    if _is_unset(raw, dotted_name):
+        return default
+    return _need_positive_number(raw, dotted_name, where)
+
+
+def _optional_text(
+    raw: dict, dotted_name: str, where: str, default: str | None = None
+) -> str | None:
+    """A piece of text a file is allowed to write out and leave empty."""
+    if _is_unset(raw, dotted_name):
+        return default
+    value = _need(raw, dotted_name, where)
+    if isinstance(value, str) and not value.strip():
+        return default
+    return _need_text(raw, dotted_name, where)
+
+
+def _optional_date(
+    raw: dict, dotted_name: str, where: str, default: date | None = None
+) -> date | None:
+    """A date a file is allowed to write out and leave empty, such as promoted_on."""
+    if _is_unset(raw, dotted_name):
+        return default
+    value = _need(raw, dotted_name, where)
+    if isinstance(value, str) and not value.strip():
+        return default
+    return _need_date(raw, dotted_name, where)
+
+
+def _optional_date_list(
+    raw: dict, dotted_name: str, where: str
+) -> tuple[date, ...]:
+    """A list of dates, for example the market holidays. Empty is normal."""
+    if _is_unset(raw, dotted_name):
+        return ()
+    value = _need(raw, dotted_name, where)
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise GuardrailConfigError(
+            f"The setting {dotted_name} in {where} should be a list of dates, written "
+            f"like [2026-11-26, 2026-12-25] or left empty as [], but it is {value!r}."
+        )
+    dates: list[date] = []
+    for item in value:
+        if isinstance(item, datetime):
+            dates.append(item.date())
+        elif isinstance(item, date):
+            dates.append(item)
+        elif isinstance(item, str):
+            try:
+                dates.append(date.fromisoformat(item.strip()))
+            except ValueError as exc:
+                raise GuardrailConfigError(
+                    f"The list {dotted_name} in {where} contains {item!r}, which is "
+                    "not a date this code can read. Write each one as 2026-11-26."
+                ) from exc
+        else:
+            raise GuardrailConfigError(
+                f"The list {dotted_name} in {where} contains {item!r}, which is not a "
+                "date. Write each one as 2026-11-26."
+            )
+    return tuple(sorted(set(dates)))
 
 
 def _need_symbol_list(raw: dict, dotted_name: str, where: str) -> tuple[str, ...]:
@@ -1989,13 +2361,88 @@ def _check_short_discipline(
             "borrow and they can double in a morning.",
         )
 
-    if g.universe.require_shortable and not intent.shortable:
-        decision.add(
-            "shortable_required",
-            f"This order would short {intent.symbol}, and the broker has not "
-            "confirmed the shares can be borrowed. This book only shorts names IBKR "
-            "reports as shortable, so nothing was sent.",
+    if g.universe.require_shortable:
+        for reason in _borrow_failures(g, intent):
+            decision.add("shortable_required", reason)
+
+
+def easy_to_borrow(shortable_level: float | None, shortable: bool = False) -> bool:
+    """Does IBKR call this name easy to borrow?
+
+    IBKR reports a shortable indicator on a scale of 0 to 3, and anything above
+    2.5 is the easy to borrow band. When no level was reported at all, fall back
+    to the plain yes or no flag the loop used to set on its own, so an older
+    caller keeps working.
+    """
+    if shortable_level is None:
+        return bool(shortable)
+    return float(shortable_level) > EASY_TO_BORROW_LEVEL_MIN
+
+
+def _borrow_failures(g: Guardrails, intent: OrderIntent) -> list[str]:
+    """The easy to borrow rule, in three parts, each with its own sentence.
+
+    All three have to hold at the moment of entry (Mo, 2026-09-06): IBKR has to
+    call the name easy to borrow, the borrow has to cost less than the book's
+    fee limit, and there have to be enough shares available to borrow. Whichever
+    part fails says so by name, because "could not short it" is not a useful
+    thing to read in a ledger three weeks later.
+    """
+    failures: list[str] = []
+    max_fee = g.universe.max_borrow_fee_pct
+    multiple = g.universe.borrow_availability_multiple
+    needed_shares = multiple * intent.qty
+
+    if not easy_to_borrow(intent.shortable_level, intent.shortable):
+        if intent.shortable_level is None:
+            failures.append(
+                f"This order would short {intent.symbol}, and the broker has not "
+                "confirmed the shares can be borrowed. This book only shorts names "
+                "IBKR reports as easy to borrow, so nothing was sent."
+            )
+        else:
+            failures.append(
+                f"This order would short {intent.symbol}, and IBKR rates it "
+                f"{_plain_number(intent.shortable_level)} on its 0 to 3 borrowing "
+                f"scale. Easy to borrow starts above "
+                f"{_plain_number(EASY_TO_BORROW_LEVEL_MIN)}, so this one is harder to "
+                "borrow than this book will accept."
+            )
+
+    fee = intent.borrow_fee_pct_annual
+    if fee is None:
+        failures.append(
+            f"This order would short {intent.symbol}, and the broker did not say what "
+            "borrowing the shares costs. An unknown borrow cost is refused rather than "
+            f"assumed cheap, because the limit is {_plain_number(max_fee)} percent a "
+            "year and the expensive borrows are the ones nobody quotes."
         )
+    elif fee > max_fee + 1e-9:
+        failures.append(
+            f"This order would short {intent.symbol}, and borrowing the shares costs "
+            f"{_plain_number(fee)} percent a year, which is above this book's limit of "
+            f"{_plain_number(max_fee)} percent. An expensive borrow eats the trade "
+            "before it starts."
+        )
+
+    available = intent.shares_available_to_borrow
+    if available is None:
+        failures.append(
+            f"This order would short {intent.qty} shares of {intent.symbol}, and the "
+            "broker did not say how many shares are available to borrow. Without that "
+            "number there is no way to know the borrow would not be recalled, so "
+            "nothing was sent."
+        )
+    elif available < needed_shares:
+        failures.append(
+            f"This order would short {intent.qty} shares of {intent.symbol}, and only "
+            f"{available:,} shares are available to borrow. This book wants at least "
+            f"{_plain_number(multiple)} times what it is selling, which is "
+            f"{int(needed_shares):,} shares, so a thin borrow cannot be recalled out "
+            "from under it."
+        )
+
+    return failures
 
 
 def _check_clock(
