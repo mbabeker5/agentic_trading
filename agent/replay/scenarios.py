@@ -1558,9 +1558,11 @@ def competing_session_and_delayed_data(day: date_type) -> Scenario:
             evidence.append(f"book A held {holdings['09:55']} going into the outage, "
                             "so every tick of it asked the broker for a quote")
         else:
-            failures.append("book A held nothing when the competing session began, so "
-                            "no snapshot was asked for and this scenario tested "
-                            "nothing. Fix the scenario, not the loop.")
+            failures.append(
+                "book A held nothing when the competing session began, so no "
+                "snapshot was asked for and nothing here was tested: "
+                + _why_no_entry(context, "A")
+                + ". The reason is upstream of this scenario.")
 
         during = _book_lines(context, "10:00")
         if "10197" in during:
