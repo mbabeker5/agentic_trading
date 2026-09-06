@@ -322,6 +322,76 @@ class DayRecorder:
         self.started_at = datetime.now(common.EASTERN)
         self.ending = "still running"
 
+    # -- picking up a day that is already part recorded ---------------------
+
+    def resume_from_disk(self) -> int:
+        """Read back the ticks already recorded into this folder today.
+
+        This is what makes the manifest true when launchd is the clock. The
+        launchd job wakes this script with --once every five minutes, so each
+        tick is its own process starting with empty counters, and a manifest
+        built from those counters alone would describe the last tick and claim
+        the other eighty never happened. Anyone reading it at the end of the day
+        would conclude the recording was worthless.
+
+        ticks.jsonl is the durable record, appended to and never rewritten, so
+        replaying it back into the counters gives a fresh process the whole
+        day's picture. It also means the looping mode survives being killed and
+        restarted at noon without losing the morning.
+
+        Returns how many earlier ticks it found.
+        """
+        earlier = [row for row in common.read_jsonl(self.ticks_path)
+                   if isinstance(row, dict) and row.get("slot")]
+        if not earlier:
+            return 0
+
+        started = []
+        for row in earlier:
+            slot = str(row["slot"])
+            if row.get("status") == "missed":
+                self.slots_missed.append(slot)
+            else:
+                self.slots_run.append(slot)
+                self.counts["ticks"] += 1
+                if row.get("status") == "ok":
+                    self.counts["ticks_ok"] += 1
+                else:
+                    self.counts["ticks_failed"] += 1
+            for name in ("snapshots_written", "snapshots_with_prices", "bars_written"):
+                key = {"snapshots_written": "snapshots",
+                       "snapshots_with_prices": "snapshots_with_prices",
+                       "bars_written": "bars"}[name]
+                self.counts[key] += int(row.get(name) or 0)
+            if row.get("reconnected"):
+                self.counts["reconnects"] += 1
+            if row.get("scanner_ran"):
+                self.counts["scanner_runs"] += 1
+                scanner = row.get("scanner") or {}
+                if isinstance(scanner, dict) and not scanner.get("ok", True):
+                    self.counts["scanner_failures"] += 1
+            for symbol in row.get("symbol_list") or []:
+                if symbol not in self.symbols_seen:
+                    self.symbols_seen.append(symbol)
+            if row.get("ran_at"):
+                started.append(str(row["ran_at"]))
+
+        # Which data types Gateway actually served has to come from the
+        # snapshots themselves, because a tick record does not carry it.
+        for row in common.read_jsonl(self.snapshots_path):
+            label = row.get("market_data_type_label")
+            if label:
+                self.market_data_types[label] = self.market_data_types.get(label, 0) + 1
+
+        if started:
+            try:
+                self.started_at = datetime.fromisoformat(min(started))
+            except ValueError:
+                pass
+        log.info("picking up a day already in progress: %d earlier tick(s) read "
+                 "back from %s", len(earlier), self.ticks_path)
+        return len(earlier)
+
     # -- plumbing ----------------------------------------------------------
 
     def on_error(self, req_id: int, code: int, message: str, contract: Any) -> None:
@@ -906,8 +976,21 @@ async def run_once(recorder: DayRecorder) -> None:
     you happened to start it.
     """
     moment = datetime.now(common.EASTERN).replace(microsecond=0)
-    recorder.grid = [moment]
-    log.info("one tick only, standing in for the %s slot", slot_label(moment))
+
+    # Which grid the manifest should describe depends on why we are here. Under
+    # launchd every tick of the real day arrives as its own --once process, and
+    # the manifest has to know there are eighty one slots so it can say which
+    # ones are still to come. Someone testing at twenty past one is not
+    # recording a day at all, and telling them they missed eighty slots would be
+    # nonsense. So: land on the configured grid and we are the real thing, land
+    # anywhere else and this tick is the whole grid.
+    full_grid = tick_grid(recorder.day, recorder.args.start, recorder.args.end,
+                          recorder.args.interval_minutes)
+    on_the_grid = slot_label(moment) in {slot_label(m) for m in full_grid}
+    recorder.grid = full_grid if on_the_grid else [moment]
+    log.info("one tick only, standing in for the %s slot%s", slot_label(moment),
+             f", slot {slot_label(moment)} of the {len(full_grid)} slot day"
+             if on_the_grid else ", outside the recording window, so a test tick")
     record = await recorder.one_tick(moment, run_scanner=bool(recorder.args.run_scanner))
     recorder.write_tick(record)
     recorder.ending = "finished, single tick"
@@ -1021,6 +1104,9 @@ async def main_async(args: argparse.Namespace) -> int:
         folder = common.day_dir(day, create=True)
 
     recorder = DayRecorder(args, day, folder)
+    # Read back anything already recorded into this folder, so a manifest
+    # written by a --once tick describes the whole day and not just itself.
+    recorder.resume_from_disk()
     recorder.ib.errorEvent += recorder.on_error
     log.info("writing into %s", folder)
 
