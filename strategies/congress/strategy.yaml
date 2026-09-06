@@ -1,0 +1,117 @@
+# ============================================================================
+# PROVISIONAL. Every number in this file is a proposal waiting on Mo's
+# approval, taken from the parameter table in docs/STRATEGY_CONGRESS.md.
+# Nothing here has been signed off. status: provisional below says the same
+# thing in a way the code can read.
+# ============================================================================
+#
+# Book D runs this strategy. It buys what members of the US House and Senate
+# disclosed buying under the STOCK Act, and holds for weeks.
+#
+# The filings arrive up to 45 days after the trade, so this book is never fast.
+# The judgment it is asking for is whether the reason behind a buy still stands
+# weeks later, which is also why the trailing stop is wide.
+#
+# The scanner block is inherited from config/guardrails.yaml and does nothing
+# here. This book has no scanner. Its shortlist comes from the sweep block
+# further down, which is read by agent/sweep_congress.py.
+#
+# Spec: /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY_CONGRESS.md
+
+strategy:
+  status: provisional         # provisional or approved. Mo decides.
+  name: Congress trades
+  spec: docs/STRATEGY_CONGRESS.md
+  discretion: hybrid          # a model picks the names inside the rules
+  holds_overnight: true       # positions live for weeks
+  flat_by_close: false        # exempt from the 15:55 sell everything rule
+
+money:
+  starting_equity: 100000     # the book's own pot, not the whole account.
+                              # config/books.yaml sets this from capital_usd.
+  max_position_pct: 5         # about 5,000 dollars a name
+  max_open_positions: 10      # half the book invested at full load
+  max_daily_loss_pct: 2       # this book's own daily loss cap, measured
+                              # against this book, not the whole account
+  max_order_notional: 5000    # no single order may be worth more than this
+  gross_exposure_pct_max: 100 # 10 positions at 5 percent is 50 percent, so
+                              # this is a backstop rather than a working limit
+
+risk:
+  stop_loss_pct: 10           # the widest of the five books, because these
+                              # positions are held the longest
+  use_opening_range_low_if_tighter: false
+                              # there is no opening range here
+  trailing_stop_pct: 12       # once switched on, the stop follows 12 percent
+                              # below the highest close since entry
+  trailing_activation_pct: 10 # and it only switches on once the position is
+                              # up 10 percent
+  time_stop_trading_days: 60  # about three months. If there is an edge here it
+                              # is slow, and after this the trade is stale.
+
+universe:
+  price_floor: 10             # higher than the insider book. Members mostly
+                              # buy large companies, and it keeps paper fills
+                              # honest.
+  min_avg_volume: 1000000     # ignore anything that normally trades fewer than
+                              # this many shares a day
+  allow_options: false        # no options in month one
+  allow_shorts: false         # long only. Sales are excluded for the same
+                              # reason as in the insider book.
+  short_price_floor:          # empty, because this book never shorts
+  require_shortable: false    # nothing to borrow
+  allowed_sec_types: [STK]    # STK means ordinary shares and ETFs
+  allowed_currencies: [USD]   # US dollars only
+  whitelist: []               # empty means any symbol that passes the filters
+  blacklist: []               # symbols this book may never trade
+
+sweep:
+  # Read by agent/sweep_congress.py. None of these are order limits, so the
+  # guardrails do not enforce them; they shape the shortlist instead, the same
+  # way the scanner block does for the momentum books.
+  sources: [house_stock_watcher, senate_stock_watcher]
+                              # free community mirrors that parse the official
+                              # filings into clean JSON
+  fallback_source: capital_trades
+                              # a website, read only as a cross-check, never
+                              # depended on
+  disclosure_sweep_at: "07:30"  # pull new filings once a morning
+  max_candidates: 15          # the shortlist handed to the model is capped here
+  purchases_only: true        # sales are not a usable signal
+  source_staleness_flag_days: 3
+                              # if a mirror has not updated in this many days,
+                              # say so loudly rather than trusting it
+  max_trade_age_days: 60      # skip a trade this old on arrival. Late filers
+                              # are past being worth following.
+  crowding_window_days: 30    # two or more members buying the same name inside
+  crowding_min_members: 2     # this window scores higher
+  min_band_usd_single: 15001  # one member alone has to be in the 15,001 to
+                              # 50,000 band or above
+  min_band_usd_crowded: 1001  # in a crowd the 1,001 to 15,000 band counts
+  runup_skip_pct: 15          # a stock already up this much since the member
+                              # bought is a skip by default. The model may
+                              # override it with a written reason.
+  limit_over_last_close_pct: 1
+                              # entries go in at or below last close plus this
+
+schedule:
+  timezone: America/New_York  # every time below is New York time
+  scan_start: "09:30"         # the market opens. The sweep runs earlier, at
+                              # the time in the sweep block, but no order may
+                              # go out before the market is actually open.
+  pick_time: "09:45"          # the model reviews the shortlist and picks
+  entries_until: "15:50"      # unfilled day limit orders are cancelled here
+  flatten_at: "15:55"         # nothing is flattened, because flat_by_close is
+                              # false. The time still has to be set, and it
+                              # marks the point after which only a closing
+                              # order goes out.
+  market_close: "16:00"       # market shuts
+  loop_minutes: 30            # positions are checked this often through the day
+  trade_only_regular_hours: true  # no after-hours orders
+  entries_per_day_max: 2      # at most this many brand new names in one day.
+                              # The signal is thin; most days there is nothing
+                              # worth buying.
+
+kill_switch:
+  file: output/STOP           # create this file and every book only closes
+                              # positions, never opens one. Delete it to resume.

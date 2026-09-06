@@ -1,0 +1,99 @@
+# ============================================================================
+# PROVISIONAL. Every number in this file is a proposal waiting on Mo's
+# approval, taken from the parameter table in docs/STRATEGY.md. Nothing here
+# has been signed off. status: provisional below says the same thing in a way
+# the code can read.
+# ============================================================================
+#
+# Books A and E both run this strategy. A asks Claude Fable which names to
+# take, E asks GPT-6 Astra. The model is named in config/books.yaml, not here,
+# so the two books can never drift apart on anything except the model.
+#
+# This file only has to write down what differs from the shared settings in
+# config/guardrails.yaml. Anything it leaves out is inherited from there. The
+# whole set is written out anyway, because a book's numbers should be readable
+# in one place without holding a second file in your head.
+#
+# Spec: /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md
+
+strategy:
+  status: provisional         # provisional or approved. Mo decides.
+  name: Opening momentum, hybrid
+  spec: docs/STRATEGY.md
+  discretion: hybrid          # a model picks the names inside the rules
+  holds_overnight: false      # nothing survives the close
+  flat_by_close: true         # everything still open is sold at flatten_at
+
+money:
+  starting_equity: 100000     # the book's own pot, not the whole account.
+                              # config/books.yaml sets this from capital_usd.
+  max_position_pct: 15        # no single stock may be more than this percent
+                              # of the book. 15 percent of 100k is 15k.
+  max_open_positions: 5       # at most this many stocks held at the same time
+  max_daily_loss_pct: 2       # lose this percent of the day's opening balance
+                              # and the book stops opening new trades that day
+  max_order_notional: 15000   # no single order may be worth more than this
+  gross_exposure_pct_max: 100 # longs and shorts added together may never be
+                              # worth more than the book itself. With 5
+                              # positions at 15 percent the natural ceiling is
+                              # 75 percent, so this is a backstop.
+
+risk:
+  stop_loss_pct: 1.5          # a long stops 1.5 percent below entry, a short
+                              # 1.5 percent above it
+  use_opening_range_low_if_tighter: true
+                              # if the low of the first five minutes is nearer
+                              # to entry than the percentage stop, use it
+                              # instead. For a short the range high does the
+                              # same job.
+  trailing_stop_pct:          # left empty on purpose. docs/STRATEGY.md offers
+  trailing_activation_pct:    # "a target or a trailing rule" and sets no
+                              # numbers, and the book is flat by 15:55 anyway.
+                              # Put a pair of numbers here and the trailing
+                              # stop switches itself on.
+  time_stop_trading_days: 1   # a position never lives past the close, so one
+                              # trading day is the honest number. The 15:55
+                              # flatten does the actual work.
+
+universe:
+  price_floor: 5              # ignore anything trading below this many dollars
+  min_avg_volume: 1000000     # ignore anything that normally trades fewer than
+                              # this many shares a day
+  allow_options: false        # no options in month one
+  allow_shorts: true          # shorting a gap down is the mirror of buying a
+                              # gap up (Mo, 2026-09-02). Switched on here, and
+                              # only here, now that the mirrored stop, the
+                              # gross exposure cap and the borrow check exist.
+                              # config/guardrails.yaml stays false.
+  short_price_floor: 10       # shorts only on shares at 10 dollars or more.
+                              # Cheap shares are the expensive ones to be short
+                              # of: hard to borrow, and they can double in a
+                              # morning.
+  require_shortable: true     # IBKR has to have said the shares can actually
+                              # be borrowed before a short goes out
+  allowed_sec_types: [STK]    # STK means ordinary shares and ETFs
+  allowed_currencies: [USD]   # US dollars only
+  whitelist: []               # empty means any symbol that passes the filters
+  blacklist: []               # symbols this book may never trade
+
+scanner:
+  rel_volume_min: 2.0         # a candidate must be trading at least this many
+                              # times its normal pace for the time of day
+  max_candidates: 20          # the shortlist handed to the model is capped here
+  exclude_leveraged_etfs: true  # no 2x or 3x or inverse products
+
+schedule:
+  timezone: America/New_York  # every time below is New York time
+  scan_start: "09:30"         # market opens, scanner runs
+  pick_time: "09:35"          # the model picks its names, entries may begin
+  entries_until: "11:00"      # no new positions opened after this
+  flatten_at: "15:55"         # sell everything still open
+  market_close: "16:00"       # market shuts
+  loop_minutes: 5             # the book wakes up this often during the day
+  trade_only_regular_hours: true  # no pre-market or after-hours trading
+  entries_per_day_max: 5      # at most this many brand new names in one day.
+                              # Adding to something already held does not count.
+
+kill_switch:
+  file: output/STOP           # create this file and every book only closes
+                              # positions, never opens one. Delete it to resume.

@@ -270,10 +270,29 @@ def test_shipped_and_example_configs_hold_the_same_values():
 
 
 def test_base_config_in_this_test_file_matches_the_shipped_one(tmp_path: Path):
-    """If someone edits the yaml, this test says the test fixtures went stale."""
+    """If someone edits the yaml, this test says the test fixtures went stale.
+
+    Two numbers are deliberately different, and both are pinned by name below so
+    a further change to either one still fails here. Mo raised the position cap
+    to 15 percent on 2026-09-06 and the single order cap with it, while the
+    fixture in this file stays on the older 10 percent and 10,000 dollars. That
+    is on purpose: the size arithmetic in the tests further down is written
+    against those rounder numbers, and rewriting a dozen tests to chase a
+    setting would make them harder to read rather than more correct. The 15
+    percent cap that actually ships is tested in tests/test_books.py.
+    """
     shipped = load_guardrails(SHIPPED_CONFIG)
     from_tests = load_with(tmp_path)
-    assert from_tests.money == shipped.money
+
+    assert shipped.money.max_position_pct == 15
+    assert shipped.money.max_order_notional == 15000
+    assert from_tests.money.max_position_pct == 10
+    assert from_tests.money.max_order_notional == 10000
+
+    assert from_tests.money.starting_equity == shipped.money.starting_equity
+    assert from_tests.money.max_open_positions == shipped.money.max_open_positions
+    assert from_tests.money.max_daily_loss_pct == shipped.money.max_daily_loss_pct
+    assert from_tests.money.gross_exposure_pct_max == shipped.money.gross_exposure_pct_max
     assert from_tests.schedule == shipped.schedule
     assert from_tests.universe == shipped.universe
 

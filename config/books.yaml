@@ -1,0 +1,115 @@
+# ============================================================================
+# PROVISIONAL, written 2026-09-06, waiting on Mo's approval.
+# The five books below are decided (Mo, 2026-09-06). Every number inside the
+# strategy folders they point at is still a proposal, and every strategy.yaml
+# says so at the top with status: provisional.
+# ============================================================================
+#
+# What this file is: the register of the five virtual books that share one IBKR
+# paper account. A book is a strategy, a pot of money, and a tag that goes on
+# every order it sends so a fill can always be traced back to it.
+#
+# Books A, B and E all run the opening momentum strategy. What changes between
+# them is who makes the call: A asks Claude Fable, E asks GPT-6 Astra, and B
+# asks nobody and follows the rules alone. That is the comparison month one is
+# for, so their numbers have to stay identical and only the model may differ.
+#
+# Paths here are written from the project folder, the one holding config/ and
+# strategies/, which is
+# /Users/mtalib/workspace_repos/personal_repo/agentic_trading
+#
+# The code that reads this file is load_books() and load_book_guardrails() in
+# /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py
+
+shared:
+  account_id: DUT077572          # the one IBKR paper account all five books
+                                 # share. Paper account ids start with DU.
+  gateway_port: 4002             # IB Gateway listens here for the paper account
+  ledger_config: config/ledger.json
+                                 # holds the id of the Google Sheet every book
+                                 # writes its fills and decisions into
+  timezone: America/New_York     # every time in every strategy file is this
+  guardrails: config/guardrails.yaml
+                                 # the settings all five books start from. A
+                                 # book's own strategy.yaml wins wherever the
+                                 # two disagree.
+
+books:
+  - book_id: A
+    name: Opening momentum, hybrid, Claude Fable
+    strategy_dir: strategies/momentum_hybrid
+    order_ref: BOOK_A
+    capital_usd: 100000
+    model: openrouter/anthropic/claude-fable-5.1
+    enabled: true
+    mode: dry-run
+    start_date: 2026-09-08
+    end_date: 2026-10-06
+    notes: >-
+      The reference book. Claude Fable picks the names inside the rules and
+      writes a reason for every pick and every skip. Book E is the same
+      strategy on a different model and book B is the same strategy with no
+      model at all, so the three of them together say how much the model is
+      actually worth.
+
+  - book_id: B
+    name: Opening momentum, rules only, no model
+    strategy_dir: strategies/momentum_rules
+    order_ref: BOOK_B
+    capital_usd: 100000
+    model: none
+    enabled: true
+    mode: dry-run
+    start_date: 2026-09-08
+    end_date: 2026-10-06
+    notes: >-
+      The control. Same scanner, same caps, same stops as book A, and no model
+      is called at all: the code takes the top names off the shortlist in order
+      and follows the rules. If A and E cannot beat this, the model is not
+      earning its cost.
+
+  - book_id: C
+    name: Insider buying, Claude Fable
+    strategy_dir: strategies/insider
+    order_ref: BOOK_C
+    capital_usd: 100000
+    model: openrouter/anthropic/claude-fable-5.1
+    enabled: true
+    mode: dry-run
+    start_date: 2026-09-08
+    end_date: 2026-10-06
+    notes: >-
+      Buys company insiders buying their own shares on the open market, from
+      SEC Form 4 filings. Holds for days to weeks, so it is not sold off at the
+      close like the momentum books. Most of its positions will still be open
+      when the month ends, which is expected and is not a failure.
+
+  - book_id: D
+    name: Congress trades, Claude Fable
+    strategy_dir: strategies/congress
+    order_ref: BOOK_D
+    capital_usd: 100000
+    model: openrouter/anthropic/claude-fable-5.1
+    enabled: true
+    mode: dry-run
+    start_date: 2026-09-08
+    end_date: 2026-10-06
+    notes: >-
+      Buys what members of Congress disclosed buying, under the STOCK Act. The
+      filings arrive weeks after the trade, so the judgment is whether the
+      reason behind the buy still stands. Expect few trades and a noisy month.
+
+  - book_id: E
+    name: Opening momentum, hybrid, GPT-6 Astra
+    strategy_dir: strategies/momentum_hybrid
+    order_ref: BOOK_E
+    capital_usd: 100000
+    model: openrouter/openai/gpt-6-astra
+    enabled: true
+    mode: dry-run
+    start_date: 2026-09-08
+    end_date: 2026-10-06
+    notes: >-
+      Book A's strategy on a different brain. It points at the same folder as A
+      on purpose: the strategy folder holds the numbers, and the model is named
+      here, so the two books cannot drift apart on anything except the model.

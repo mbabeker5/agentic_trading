@@ -1,0 +1,115 @@
+# ============================================================================
+# PROVISIONAL. Every number in this file is a proposal waiting on Mo's
+# approval, taken from the parameter table in docs/STRATEGY_INSIDER.md.
+# Nothing here has been signed off. status: provisional below says the same
+# thing in a way the code can read.
+# ============================================================================
+#
+# Book C runs this strategy. It buys company insiders buying their own shares
+# on the open market, out of SEC Form 4 filings, and holds for days to weeks.
+#
+# Two things make it different from the momentum books, and both are written
+# down below rather than left to be remembered: it holds overnight, and it is
+# never sold off at the close.
+#
+# The scanner block is inherited from config/guardrails.yaml and does nothing
+# here. This book has no scanner. Its shortlist comes from the sweep block
+# further down, which is read by agent/sweep_insider.py.
+#
+# Spec: /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY_INSIDER.md
+
+strategy:
+  status: provisional         # provisional or approved. Mo decides.
+  name: Insider buying
+  spec: docs/STRATEGY_INSIDER.md
+  discretion: hybrid          # a model picks the names inside the rules
+  holds_overnight: true       # positions live for weeks
+  flat_by_close: false        # exempt from the 15:55 sell everything rule
+
+money:
+  starting_equity: 100000     # the book's own pot, not the whole account.
+                              # config/books.yaml sets this from capital_usd.
+  max_position_pct: 5         # about 5,000 dollars a name. Smaller than the
+                              # momentum books because these are held through
+                              # news and overnight gaps.
+  max_open_positions: 10      # half the book invested at full load
+  max_daily_loss_pct: 2       # this book's own daily loss cap, measured
+                              # against this book, not the whole account
+  max_order_notional: 5000    # no single order may be worth more than this
+  gross_exposure_pct_max: 100 # 10 positions at 5 percent is 50 percent, so
+                              # this is a backstop rather than a working limit
+
+risk:
+  stop_loss_pct: 8            # wider than the momentum books because the
+                              # position is held overnight and gaps happen
+  use_opening_range_low_if_tighter: false
+                              # there is no opening range here. The book does
+                              # not trade the first five minutes.
+  trailing_stop_pct: 10       # once switched on, the stop follows 10 percent
+                              # below the highest close since entry
+  trailing_activation_pct: 8  # and it only switches on once the position is
+                              # up 8 percent
+  time_stop_trading_days: 30  # out regardless of price after this many trading
+                              # days. The edge decays, so the clock matters.
+
+universe:
+  price_floor: 5              # ignore anything trading below this many dollars
+  min_avg_volume: 500000      # lower than the momentum books because insider
+                              # buying skews towards smaller companies
+  allow_options: false        # no options in month one
+  allow_shorts: false         # long only. Insider selling is not a usable
+                              # signal: people sell for houses and taxes.
+  short_price_floor:          # empty, because this book never shorts
+  require_shortable: false    # nothing to borrow
+  allowed_sec_types: [STK]    # STK means ordinary shares and ETFs
+  allowed_currencies: [USD]   # US dollars only
+  whitelist: []               # empty means any symbol that passes the filters
+  blacklist: []               # symbols this book may never trade
+
+sweep:
+  # Read by agent/sweep_insider.py. None of these are order limits, so the
+  # guardrails do not enforce them; they shape the shortlist instead, the same
+  # way the scanner block does for the momentum books.
+  source: sec_edgar_form_4    # free, no account, publishes within minutes
+  morning_sweep_at: "07:00"   # parse everything accepted since last night
+  afternoon_sweep_at: "16:30" # parse the day's filings for tomorrow morning
+  poll_minutes: 15            # during EDGAR's acceptance hours, 06:00 to 22:00
+  max_candidates: 15          # the shortlist handed to the model is capped here
+  transaction_code: P         # open market purchases for cash, nothing else.
+                              # Not M (option exercise), A (award), G (gift) or
+                              # F (tax withholding).
+  exclude_10b5_1_plans: true  # trades set months ahead carry no fresh opinion
+  cluster_window_trading_days: 10
+                              # two or more insiders buying inside this window
+                              # counts as a cluster and scores higher
+  cluster_min_insiders: 2     # how many distinct insiders make a cluster
+  min_buy_usd: 25000          # a single filing has to be at least this big
+  min_buy_usd_in_cluster: 10000
+                              # inside a cluster each buy may be smaller
+  officer_score_multiplier: 2.0
+                              # a CEO or CFO buy counts about double a
+                              # director's
+  limit_over_last_close_pct: 1
+                              # entries go in at or below last close plus this
+
+schedule:
+  timezone: America/New_York  # every time below is New York time
+  scan_start: "09:30"         # the market opens. The sweep runs earlier, at
+                              # the times in the sweep block, but no order may
+                              # go out before the market is actually open.
+  pick_time: "09:45"          # the model reviews the shortlist and picks
+  entries_until: "15:50"      # unfilled day limit orders are cancelled here
+  flatten_at: "15:55"         # nothing is flattened, because flat_by_close is
+                              # false. The time still has to be set, and it
+                              # marks the point after which only a closing
+                              # order goes out.
+  market_close: "16:00"       # market shuts
+  loop_minutes: 30            # positions are checked this often through the day
+  trade_only_regular_hours: true  # no after-hours orders
+  entries_per_day_max: 3      # at most this many brand new names in one day,
+                              # which keeps the model choosing rather than
+                              # collecting
+
+kill_switch:
+  file: output/STOP           # create this file and every book only closes
+                              # positions, never opens one. Delete it to resume.
