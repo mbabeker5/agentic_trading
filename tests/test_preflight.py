@@ -549,3 +549,192 @@ def test_the_probe_tries_the_filter_a_gap_scan_would_actually_want():
     assert "stVolume5MinAbove" in tags, (
         "the five minute volume filter is the one a 9:35 gap scan needs, so it "
         "has to be measured too")
+
+
+# --------------------------------------------- the day trading regime check
+#
+# FINRA retired the pattern day trader rule with effect from 2026-06-04
+# (Regulatory Notice 26-10) and replaced it with the intraday margin deficit
+# rules. IBKR says which of the two an account is under through five account
+# summary tags. This check reads them, writes the answer down, and never stops
+# the morning on its own.
+#
+# Nothing here connects to Gateway: ib_async.IB is replaced with a stand in that
+# hands back whatever tags the test wants, the same way the scanner filter probe
+# tests above do it.
+
+from margin_regime import DAY_TRADE_TAGS, Regime  # noqa: E402
+
+REAL_GUARDRAILS = (
+    Path(__file__).resolve().parent.parent / "config" / "guardrails.yaml"
+)
+
+
+class SummaryRow:
+    """One account summary tag, shaped the way ib_async hands it back."""
+
+    def __init__(self, tag, value, account="DUT077572"):
+        self.account = account
+        self.tag = tag
+        self.value = str(value)
+        self.currency = "USD"
+
+
+def fake_gateway(monkeypatch, rows, refuse_connection=False):
+    """Replace ib_async.IB with something that answers with these tags."""
+    import ib_async
+
+    class FakeIB:
+        def connect(self, *a, **k):
+            if refuse_connection:
+                raise ConnectionRefusedError("nothing is listening on 4002")
+
+        def accountSummary(self, *a, **k):
+            return rows
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(ib_async, "IB", lambda *a, **k: FakeIB())
+
+
+def counting_rows(remaining=3):
+    """The five tags holding counts, which is the old rule still running."""
+    return [SummaryRow(tag, remaining, account="U28440091")
+            for tag in DAY_TRADE_TAGS]
+
+
+def rows_without_day_trade_tags():
+    """What the paper account DUT077572 actually sent on 2026-09-06."""
+    return [SummaryRow("NetLiquidation", "1000175.35"),
+            SummaryRow("TotalCashValue", "999233.85"),
+            SummaryRow("BuyingPower", "3999243.66")]
+
+
+def temp_guardrails(monkeypatch, tmp_path: Path) -> Path:
+    """A throwaway copy of the real settings file for the writing tests."""
+    copy = tmp_path / "guardrails.yaml"
+    copy.write_text(REAL_GUARDRAILS.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(preflight, "guardrails_config_path", lambda: copy)
+    return copy
+
+
+def test_the_regime_check_is_in_the_list_and_can_never_stop_the_day():
+    assert preflight.CHECK_DAY_TRADE_REGIME in preflight.CHECK_ORDER
+    assert preflight.CHECK_DAY_TRADE_REGIME in preflight.INFORMATIONAL_CHECKS
+
+
+def test_counting_tags_are_read_as_the_old_pattern_day_trader_rule(monkeypatch):
+    fake_gateway(monkeypatch, counting_rows(3))
+
+    result = preflight.check_day_trade_regime()
+
+    assert result.passed is True
+    assert result.facts["regime"] == Regime.OLD_PDT.value
+    assert result.facts["tags_as_numbers"]["DayTradesRemaining"] == 3.0
+    assert result.facts.get("warning") is not True
+
+
+def test_no_day_trade_tags_are_read_as_the_new_rules(monkeypatch):
+    fake_gateway(monkeypatch, rows_without_day_trade_tags())
+
+    result = preflight.check_day_trade_regime()
+
+    assert result.passed is True
+    assert result.facts["regime"] == Regime.NEW_IMD.value
+    assert result.facts["tags_missing"] == list(DAY_TRADE_TAGS)
+
+
+def test_minus_one_is_read_as_the_new_rules(monkeypatch):
+    fake_gateway(monkeypatch, counting_rows(-1))
+
+    result = preflight.check_day_trade_regime()
+
+    assert result.facts["regime"] == Regime.NEW_IMD.value
+
+
+def test_an_answer_that_makes_no_sense_is_unknown_and_warns(monkeypatch):
+    fake_gateway(monkeypatch, [SummaryRow(tag, "sometimes")
+                               for tag in DAY_TRADE_TAGS])
+
+    result = preflight.check_day_trade_regime()
+
+    assert result.passed is True, "an unknown regime is never a reason to stop"
+    assert result.facts["regime"] == Regime.UNKNOWN.value
+    assert result.facts["warning"] is True
+    assert "treat_unknown_as" in result.detail
+    assert "old_pdt" in result.detail
+
+
+def test_a_gateway_that_will_not_answer_warns_and_still_passes(monkeypatch):
+    fake_gateway(monkeypatch, [], refuse_connection=True)
+
+    result = preflight.check_day_trade_regime()
+
+    assert result.passed is True
+    assert result.facts["warning"] is True
+    assert result.facts["regime"] == Regime.UNKNOWN.value
+
+
+def test_the_report_says_the_paper_account_may_not_mirror_the_live_one(monkeypatch):
+    fake_gateway(monkeypatch, rows_without_day_trade_tags())
+
+    result = preflight.check_day_trade_regime()
+    note = result.facts["paper_may_not_mirror_live"]
+
+    assert preflight.LIVE_ACCOUNT in note
+    assert "simulated money" in note
+
+
+def test_nothing_on_disk_moves_without_the_write_regime_flag(monkeypatch, tmp_path):
+    config = temp_guardrails(monkeypatch, tmp_path)
+    before = config.read_text(encoding="utf-8")
+    fake_gateway(monkeypatch, counting_rows(3))
+
+    result = preflight.check_day_trade_regime()
+
+    assert result.facts["config_written"] is False
+    assert config.read_text(encoding="utf-8") == before
+
+
+def test_the_write_regime_flag_writes_one_line_and_keeps_the_comments(
+    monkeypatch, tmp_path
+):
+    config = temp_guardrails(monkeypatch, tmp_path)
+    before = config.read_text(encoding="utf-8")
+    fake_gateway(monkeypatch, counting_rows(3))
+
+    result = preflight.check_day_trade_regime(write_regime=True)
+
+    after = config.read_text(encoding="utf-8")
+    assert result.facts["config_written"] is True
+    assert "regime: old_pdt" in after
+    assert after.count("\n") == before.count("\n"), "no line was added or lost"
+    assert "pattern day trader rule" in after, "the comments survived"
+    assert str(config) in result.detail
+
+
+def test_an_unknown_regime_is_never_written_over_a_real_answer(
+    monkeypatch, tmp_path
+):
+    config = temp_guardrails(monkeypatch, tmp_path)
+    before = config.read_text(encoding="utf-8")
+    fake_gateway(monkeypatch, [SummaryRow(tag, "sometimes")
+                               for tag in DAY_TRADE_TAGS])
+
+    result = preflight.check_day_trade_regime(write_regime=True)
+
+    assert result.facts["config_written"] is False
+    assert config.read_text(encoding="utf-8") == before
+    assert "shrug" in result.facts["config_note"]
+
+
+def test_the_regime_check_runs_last_so_a_slow_answer_holds_nothing_up(monkeypatch):
+    assert preflight.CHECK_ORDER[-1] == preflight.CHECK_DAY_TRADE_REGIME
+
+
+def test_the_regime_probe_has_its_own_client_id():
+    """Every program talking to Gateway needs one of its own, or they collide."""
+    others = {preflight.CLIENT_ID, preflight.FILTER_PROBE_CLIENT_ID}
+    assert preflight.REGIME_CLIENT_ID == 282
+    assert preflight.REGIME_CLIENT_ID not in others

@@ -27,6 +27,38 @@ Mo's decision, 2026-09-06:
 A day trade is a buy and a sell (or a short and a cover) of the same symbol, in
 the same book, on the same trading day.
 
+Which rulebook applies, added 2026-09-06
+----------------------------------------
+
+Everything above describes the old rulebook, and FINRA retired it with effect
+from 2026-06-04 (Regulatory Notice 26-10, phase-in to 2027-10-20). A migrated
+account has no 25,000 dollar floor and nothing counts to four. In its place come
+the intraday margin deficit rules, where the thing that gets an account in
+trouble is an order it cannot pay for, not an order it counted wrong.
+
+Which of the two an account is under is a fact about that account, and IBKR will
+say if asked. agent/margin_regime.py does the asking and the reading, the 9 AM
+pre-flight writes the answer into pdt.regime in config/guardrails.yaml, and this
+file behaves differently depending on what it says:
+
+    old_pdt   everything above. The hard limit refuses the fourth day trade on
+              the books that have one, and the momentum books get a note.
+    new_imd   the counter still records every fill, because the ledger still
+              wants the month's count, but it never blocks and never sets
+              would_have_blocked, because there is no longer a rule to block
+              for. Instead every entry goes through the intraday margin deficit
+              check in agent/margin_regime.py: gross exposure at or under 100
+              percent of book equity and cash never below zero.
+    unknown   nobody has asked the account yet. pdt.treat_unknown_as decides,
+              and it ships as old_pdt, so an unasked account behaves as though
+              the strict old rule still binds. That is the safe direction: the
+              cost of counting an account that need not count is a note in a
+              log, and the cost of not counting one that must is a 90 day ban.
+
+A counter built without a regime is unknown, which means old_pdt, which means
+every piece of behaviour described above this section is exactly what happens.
+Nothing changed for anyone who does not pass one.
+
 How the counting works
 ----------------------
 
@@ -95,20 +127,31 @@ from zoneinfo import ZoneInfo
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from paths import output_dir  # noqa: E402
+from margin_regime import (  # noqa: E402
+    RULE_ID_IMD,
+    Regime,
+    as_regime,
+    imd_check,
+    read_regime_setting,
+)
+from paths import config_dir, output_dir  # noqa: E402
 
 __all__ = [
     "RULE_ID_PDT_LIMIT",
+    "RULE_ID_IMD",
     "PDT_EQUITY_MINIMUM_USD",
     "DEFAULT_MAX_DAY_TRADES_PER_5_DAYS",
+    "DEFAULT_TREAT_UNKNOWN_AS",
     "WINDOW_BUSINESS_DAYS",
     "KEEP_FILL_DAYS",
     "STORE_VERSION",
     "NEW_YORK",
+    "Regime",
     "PdtDecision",
     "DayTradeCounter",
     "business_days_back",
     "counter_for",
+    "settings_regime",
     "store_path_for",
 ]
 
@@ -123,6 +166,11 @@ PDT_EQUITY_MINIMUM_USD = 25000.0
 # How many day trades a book gets in five business days when its settings say
 # nothing. Three, so that the fourth one is the one that would trip the rule.
 DEFAULT_MAX_DAY_TRADES_PER_5_DAYS = 3
+
+# What an unknown regime is treated as when nothing says otherwise. The strict
+# old rule, because being counted when you need not be costs a line in a log and
+# not being counted when you must costs 90 days of not trading.
+DEFAULT_TREAT_UNKNOWN_AS = Regime.OLD_PDT
 
 # How many business days the rolling window covers, today included.
 WINDOW_BUSINESS_DAYS = 5
@@ -168,6 +216,16 @@ class PdtDecision:
     business days ending today, limit is how many it is allowed, hard_limit says
     whether going over is refused or merely noted, and symbol is the name the
     order was for.
+
+    regime is which rulebook this answer was worked out under, and it is written
+    into the ledger so a month of decisions can be read back knowing which rules
+    were in force. Under new_imd, would_have_blocked is always false and the day
+    trade count is kept for the record only.
+
+    note is for anything worth writing down that is not a refusal: why the
+    deficit check could not run, or that it ran and found room. It is kept out
+    of reasons on purpose, because the loop reads a non-empty reasons list as
+    "this order is a day trade" when it writes the tick log.
     """
 
     allowed: bool = True
@@ -178,6 +236,8 @@ class PdtDecision:
     limit: int = DEFAULT_MAX_DAY_TRADES_PER_5_DAYS
     hard_limit: bool = False
     symbol: str | None = None
+    regime: Regime = DEFAULT_TREAT_UNKNOWN_AS
+    note: str = ""
 
     @property
     def summary(self) -> str:
@@ -246,6 +306,25 @@ def store_path_for(book_id: str, store_dir: str | Path | None = None) -> Path:
     return folder / f"pdt_BOOK_{clean}.json"
 
 
+def settings_regime(config_path: str | Path | None = None) -> tuple[Regime, Regime]:
+    """The regime and its unknown fallback, out of the shared settings file.
+
+    Comes back as (regime, treat_unknown_as), read from the pdt block of
+    config/guardrails.yaml. That file is the right place for it because the
+    regime is a fact about the account rather than about one strategy, and
+    because the 9 AM pre-flight writes it there once a day.
+
+    A missing or broken file gives (unknown, old_pdt), which is the reading that
+    keeps the strict old behaviour.
+    """
+    path = (
+        Path(config_path)
+        if config_path is not None
+        else config_dir() / "guardrails.yaml"
+    )
+    return read_regime_setting(path)
+
+
 def counter_for(book_config, store_dir: str | Path | None = None) -> DayTradeCounter:
     """Build the day trade counter for the book these settings belong to.
 
@@ -254,6 +333,12 @@ def counter_for(book_config, store_dir: str | Path | None = None) -> DayTradeCou
     the same shape works just as well. Two things are read: book_id, which says
     which book and so which file, and schedule.holidays when the settings have
     one, which is the list of days the market is shut.
+
+    The regime comes off pdt.regime when the settings carry one, and out of the
+    pdt block of config/guardrails.yaml when they do not. Both roads lead to the
+    same place; the second one exists because the settings loader in
+    agent/guardrails.py does not carry the field yet, and the pre-flight writes
+    its answer into that yaml file either way.
 
     store_dir is only for tests and one off runs. Left alone, the counter writes
     into the project's output folder.
@@ -269,7 +354,23 @@ def counter_for(book_config, store_dir: str | Path | None = None) -> DayTradeCou
     schedule = getattr(book_config, "schedule", None)
     holidays = getattr(schedule, "holidays", None)
     store_path = store_path_for(book_id, store_dir) if store_dir is not None else None
-    return DayTradeCounter(book_id=book_id, store_path=store_path, holidays=holidays)
+
+    regime, treat_unknown_as = settings_regime()
+    section = getattr(book_config, "pdt", None)
+    declared = getattr(section, "regime", None)
+    if declared is not None:
+        regime = as_regime(declared, "pdt.regime")
+    declared_fallback = getattr(section, "treat_unknown_as", None)
+    if declared_fallback is not None:
+        treat_unknown_as = as_regime(declared_fallback, "pdt.treat_unknown_as")
+
+    return DayTradeCounter(
+        book_id=book_id,
+        store_path=store_path,
+        holidays=holidays,
+        regime=regime,
+        treat_unknown_as=treat_unknown_as,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +392,8 @@ class DayTradeCounter:
         book_id: str,
         store_path: str | Path | None = None,
         holidays: Iterable[date] | None = None,
+        regime=None,
+        treat_unknown_as=None,
     ) -> None:
         """Start counting for one book, reading anything already on disk.
 
@@ -298,6 +401,13 @@ class DayTradeCounter:
         output/pdt_BOOK_<book id>.json, and a path handed in is used exactly as
         given. holidays is the list of days the market is shut, which the five
         business day window skips over.
+
+        regime is which day trading rulebook the account is under, and it is
+        only a default: settings handed to check() win over it. Left alone it is
+        unknown, which treat_unknown_as turns into old_pdt, so a counter built
+        the way every counter was built before 2026-09-06 behaves exactly as it
+        did. Nothing here reads a file or asks a broker to find out; use
+        counter_for() for that, or settings_regime().
 
         A missing file is not a problem: the count simply starts from nothing. A
         file that cannot be read, or that does not hold what this code expects,
@@ -310,6 +420,14 @@ class DayTradeCounter:
             else store_path_for(self.book_id)
         )
         self.holidays = _clean_holidays(holidays)
+        self.regime = as_regime(regime, "regime")
+        self.treat_unknown_as = (
+            DEFAULT_TREAT_UNKNOWN_AS
+            if treat_unknown_as is None
+            else as_regime(treat_unknown_as, "treat_unknown_as")
+        )
+        if self.treat_unknown_as is Regime.UNKNOWN:
+            self.treat_unknown_as = DEFAULT_TREAT_UNKNOWN_AS
         self._fills: list[_Fill] = []
         self._fill_ids: set[str] = set()
         self._load()
@@ -393,7 +511,33 @@ class DayTradeCounter:
 
     # -- the check the loop calls -----------------------------------------
 
-    def check(self, book_config, intent, today: date) -> PdtDecision:
+    def effective_regime(self, book_config=None) -> Regime:
+        """Which rulebook this counter is answering under, with unknown resolved.
+
+        pdt.regime on the settings wins when they carry one, the counter's own
+        regime is next, and unknown becomes pdt.treat_unknown_as, which ships as
+        old_pdt. So a counter and settings that say nothing at all give old_pdt,
+        which is how this file behaved before the two regimes existed.
+        """
+        section = getattr(book_config, "pdt", None)
+        declared = getattr(section, "regime", None)
+        regime = (
+            as_regime(declared, "pdt.regime")
+            if declared is not None
+            else self.regime
+        )
+
+        if regime is not Regime.UNKNOWN:
+            return regime
+
+        fallback = getattr(section, "treat_unknown_as", None)
+        if fallback is not None:
+            resolved = as_regime(fallback, "pdt.treat_unknown_as")
+        else:
+            resolved = self.treat_unknown_as
+        return DEFAULT_TREAT_UNKNOWN_AS if resolved is Regime.UNKNOWN else resolved
+
+    def check(self, book_config, intent, today: date, state=None) -> PdtDecision:
         """Decide whether one order may go, as far as the day trader rule cares.
 
         book_config is what agent.guardrails.load_book_guardrails() hands back
@@ -416,12 +560,26 @@ class DayTradeCounter:
         the insider and Congress books the closing order is the day trade, and
         those two books are not meant to be closing anything the same day they
         opened it.
+
+        All of that is the old rulebook, and it only runs when the regime is
+        old_pdt. Under new_imd the count is still worked out and still put on
+        the answer, because the ledger wants it, but nothing is refused for it
+        and would_have_blocked stays false: FINRA retired the rule those
+        refusals were protecting against. What runs in its place is
+        imd_check() from agent/margin_regime.py, which refuses an entry that
+        could leave the account short of margin during the day.
+
+        state is the account snapshot, the same agent.guardrails.AccountState
+        the other checks get, and it is only needed under new_imd. Left out, the
+        deficit check says so in note and refuses nothing, because the gross
+        exposure cap in agent/guardrails.py runs on every order anyway.
         """
         hard_limit, limit = _pdt_settings(book_config)
         book_id = getattr(book_config, "book_id", None) or self.book_id
         symbol = _clean_symbol(getattr(intent, "symbol", None), "intent.symbol")
         side = _clean_side(getattr(intent, "side", None), "intent.side")
         day = _as_plain_date(today, "today")
+        regime = self.effective_regime(book_config)
 
         decision = PdtDecision(
             allowed=True,
@@ -429,7 +587,11 @@ class DayTradeCounter:
             limit=limit,
             hard_limit=hard_limit,
             symbol=symbol,
+            regime=regime,
         )
+
+        if regime is Regime.NEW_IMD:
+            return self._check_new_imd(decision, book_config, intent, state)
 
         if not self.would_be_day_trade(symbol, side, day):
             return decision
@@ -444,6 +606,24 @@ class DayTradeCounter:
         else:
             decision.would_have_blocked = True
             decision.reasons.append(_note_sentence(book_id, symbol, side, used))
+        return decision
+
+    def _check_new_imd(
+        self, decision: PdtDecision, book_config, intent, state
+    ) -> PdtDecision:
+        """The new rulebook: count for the record, refuse only a margin deficit.
+
+        The count already on the decision stays there and goes to the ledger, so
+        the month can still be read against what the old rule would have cost.
+        It just does not decide anything any more.
+        """
+        verdict = imd_check(book_config, state, intent)
+        decision.note = verdict.note
+        if verdict.allowed:
+            return decision
+        decision.allowed = False
+        decision.rule_ids.extend(verdict.rule_ids)
+        decision.reasons.extend(verdict.reasons)
         return decision
 
     # -- the working out ---------------------------------------------------

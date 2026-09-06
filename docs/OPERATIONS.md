@@ -421,6 +421,77 @@ To pause without stopping the launchd job at all, one line does it:
 touch /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/STOP
 ```
 
+## Day-trading regime
+
+Two rulebooks exist in 2026, and the code follows whichever one the account is
+actually under.
+
+The old one is the pattern day trader rule. Four or more round-trip day trades
+inside five business days, in a margin account, makes that account a pattern day
+trader, and from then on it has to hold at least 25,000 dollars. Drop below and
+the broker stops it day trading for 90 days. Counting is the whole defence, and
+the trade to avoid is the fourth one.
+
+The new one is the intraday margin deficit framework. FINRA retired the pattern
+day trader rule with effect from 2026-06-04 (Regulatory Notice 26-10, phase-in
+running to 2027-10-20). A migrated account has no 25,000 dollar floor and no
+four-in-five count, and the minimum for trading with leverage or shorting is
+2,000 dollars. What it has instead is a condition on each order: the order must
+not leave the account short of margin during the day. A deficit has to be cured
+in about three business days, and four uncured ones in twelve months can still
+bring a 90-day restriction.
+
+Under `old_pdt`,
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/pdt.py`
+behaves as it always has. The insider book (C) and the Congress book (D) are
+refused a fourth day trade in five business days. The three momentum books are
+never blocked, but every order the rule would have blocked is written down, so
+the cost of the rule gets measured rather than guessed at.
+
+Under `new_imd` the counter still records every fill, because the ledger still
+wants the month's count, but it blocks nothing and flags nothing. Every entry
+order goes through `imd_check()` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/margin_regime.py`
+instead, which asks two things: gross exposure after the order stays at or below
+100 percent of book equity, and cash after the order stays at or above zero. A
+book that never borrows cannot run a deficit. The 100 percent is written into
+the code rather than read from the settings, and `assert_structurally_impossible()`
+raises if a settings change ever lets the book borrow, so the promise breaks
+loudly rather than quietly.
+
+The setting is `regime` in the `pdt` block of
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml`,
+with `treat_unknown_as` next to it. It ships as `unknown` and `old_pdt`, because
+nobody has asked the account yet. Being counted when you need not be costs a
+line in a log; not being counted when you must costs 90 days.
+
+The 09:00 pre-flight asks. Its `day_trade_regime` check opens its own read only
+connection on client id 282 and reads five account summary tags:
+`DayTradesRemaining` and `DayTradesRemainingT+1` through `T+4`. Small
+non-negative numbers mean the old rule is still counting the account down. A -1,
+which is IBKR writing "unlimited", or no tags at all, means the new rulebook.
+The answer goes into the day's report and the check never fails the morning; an
+unknown answer prints a `warn` line. It opens its own connection because the MCP
+server asks IBKR for 24 tags and none of the five is among them, so an answer
+through
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/mcp_client.py`
+could never tell "no limit" apart from "nobody asked". Only with the flag does
+it write the answer back into the settings, changing that one line and leaving
+every comment in the file alone:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preflight.py \
+  --write-regime
+```
+
+Read read only against the paper Gateway on 2026-09-06, with the market shut,
+the paper account DUT077572 sent 74 account summary tags and not one of the five
+was among them. A second read of the longer account values list, 184 rows, had
+none either. By the rule above that is `new_imd`. It is also not evidence: IBKR
+applies neither rulebook to simulated money, and the live account is U28440091.
+The setting stays at `unknown` until a live account has been read.
+
 ## The six scheduled jobs
 
 The five guards above are what watches the money. These are the six things

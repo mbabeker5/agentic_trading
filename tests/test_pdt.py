@@ -539,3 +539,337 @@ def test_a_quantity_that_is_not_a_whole_number_above_zero_is_refused(
 
     with pytest.raises(ValueError):
         counter.record_fill("AAPL", "BUY", qty, et(4, 10, 0))
+
+
+# ---------------------------------------------------------------------------
+# The two regimes, added 2026-09-06
+#
+# FINRA retired the pattern day trader rule with effect from 2026-06-04
+# (Regulatory Notice 26-10) and put the intraday margin deficit rules in its
+# place. Everything above this line is the old rulebook, and it still runs, but
+# only when the account is actually under it. These tests are about which of the
+# two the counter follows, and what it does under each.
+#
+# Three answers exist: old_pdt, new_imd and unknown. Unknown is what the
+# settings ship as, because nobody has asked Mo's account yet, and it resolves
+# to old_pdt, so an unasked account is held to the strict old rule.
+# ---------------------------------------------------------------------------
+
+# Both of these come from agent/margin_regime.py, and they are imported through
+# agent/pdt.py on purpose: agent/pdt.py adds its own folder to sys.path and
+# imports the module as margin_regime, so asking for agent.margin_regime here
+# would load a second copy and the same regime from the two copies would not be
+# the same object.
+from agent import pdt as pdt_mod  # noqa: E402
+from agent.pdt import RULE_ID_IMD, Regime  # noqa: E402
+
+
+@dataclass(frozen=True)
+class RegimePdtSettings:
+    """The pdt section once it carries a regime, which the shipped yaml does."""
+
+    hard_limit: bool = True
+    max_day_trades_per_5_days: int = 3
+    regime: str | None = None
+    treat_unknown_as: str | None = None
+
+
+@dataclass(frozen=True)
+class FakeMoney:
+    """Stands in for the money section, for the margin deficit check."""
+
+    gross_exposure_pct_max: float = 100.0
+
+
+@dataclass(frozen=True)
+class RegimeBook:
+    """A book whose settings carry a regime, and enough money to be checked."""
+
+    book_id: str
+    pdt: RegimePdtSettings
+    money: FakeMoney = FakeMoney()
+    schedule: FakeSchedule | None = None
+
+
+@dataclass(frozen=True)
+class FakeEntry:
+    """An entry order, which is the only kind the deficit check looks at."""
+
+    symbol: str = "AAPL"
+    side: str = "BUY"
+    qty: int = 100
+    limit_price: float | None = 50.0
+    purpose: str = "entry"
+
+    @property
+    def notional(self) -> float | None:
+        if self.limit_price is None:
+            return None
+        return self.qty * self.limit_price
+
+    @property
+    def is_closing(self) -> bool:
+        return False
+
+
+@dataclass
+class FakeState:
+    """Stands in for agent.guardrails.AccountState."""
+
+    equity: float = 100_000.0
+    gross_exposure: float = 0.0
+    pending_order_notional: float = 0.0
+
+    def gross_exposure_now(self) -> float:
+        return abs(self.gross_exposure)
+
+
+def book_under(regime, hard_limit: bool = True, book_id: str = "C") -> RegimeBook:
+    """A book whose settings name the regime outright."""
+    return RegimeBook(
+        book_id=book_id,
+        pdt=RegimePdtSettings(hard_limit=hard_limit, regime=regime),
+    )
+
+
+def counter_over_the_limit(tmp_path: Path, book_id: str = "C") -> DayTradeCounter:
+    """A counter that has used up its three day trades and holds one more name."""
+    counter = make_counter(tmp_path, book_id=book_id)
+    use_up_the_allowance(counter, day=4, how_many=3)
+    counter.record_fill("TSLA", "BUY", 100, et(4, 11, 0))
+    return counter
+
+
+# -------------------------------------------------- old_pdt, said out loud
+
+def test_under_the_old_rule_the_hard_limit_still_blocks_the_fourth_day_trade(
+    tmp_path: Path,
+):
+    counter = counter_over_the_limit(tmp_path)
+
+    decision = counter.check(
+        book_under("old_pdt"), FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is False
+    assert decision.rule_ids == [RULE_ID_PDT_LIMIT]
+    assert decision.regime is Regime.OLD_PDT
+    assert decision.day_trades_used == 3
+
+
+def test_under_the_old_rule_a_momentum_book_still_gets_its_note(tmp_path: Path):
+    counter = counter_over_the_limit(tmp_path, book_id="A")
+
+    decision = counter.check(
+        book_under("old_pdt", hard_limit=False, book_id="A"),
+        FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is True
+    assert decision.would_have_blocked is True
+    assert decision.regime is Regime.OLD_PDT
+
+
+# -------------------------------------------------------------- new_imd
+
+def test_under_the_new_rules_the_fourth_day_trade_is_not_blocked(tmp_path: Path):
+    """The rule those refusals protected against does not exist any more."""
+    counter = counter_over_the_limit(tmp_path)
+
+    decision = counter.check(
+        book_under("new_imd"), FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is True
+    assert decision.rule_ids == []
+    assert decision.regime is Regime.NEW_IMD
+
+
+def test_under_the_new_rules_nothing_is_flagged_as_would_have_been_blocked(
+    tmp_path: Path,
+):
+    counter = counter_over_the_limit(tmp_path, book_id="A")
+
+    decision = counter.check(
+        book_under("new_imd", hard_limit=False, book_id="A"),
+        FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.would_have_blocked is False, (
+        "there is no live account this would have been blocked in any more")
+    assert decision.reasons == []
+
+
+def test_under_the_new_rules_the_count_is_still_kept_for_the_ledger(tmp_path: Path):
+    counter = counter_over_the_limit(tmp_path)
+
+    decision = counter.check(
+        book_under("new_imd"), FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.day_trades_used == 3
+    assert decision.limit == 3
+
+
+def test_under_the_new_rules_an_order_that_would_borrow_is_refused(tmp_path: Path):
+    counter = make_counter(tmp_path, book_id="A")
+
+    decision = counter.check(
+        book_under("new_imd", hard_limit=False, book_id="A"),
+        FakeEntry(qty=400, limit_price=50.0),
+        FRIDAY_4,
+        state=FakeState(equity=100_000.0, gross_exposure=90_000.0),
+    )
+
+    assert decision.allowed is False
+    assert decision.rule_ids == [RULE_ID_IMD]
+    assert "intraday margin deficit" in decision.reasons[0]
+
+
+def test_under_the_new_rules_an_order_that_fits_goes_out(tmp_path: Path):
+    counter = make_counter(tmp_path, book_id="A")
+
+    decision = counter.check(
+        book_under("new_imd", hard_limit=False, book_id="A"),
+        FakeEntry(qty=100, limit_price=50.0),
+        FRIDAY_4,
+        state=FakeState(equity=100_000.0, gross_exposure=10_000.0),
+    )
+
+    assert decision.allowed is True
+    assert "cannot create an intraday margin deficit" in decision.note
+
+
+def test_under_the_new_rules_with_no_snapshot_nothing_is_refused_but_it_says_so(
+    tmp_path: Path,
+):
+    counter = make_counter(tmp_path, book_id="A")
+
+    decision = counter.check(
+        book_under("new_imd", hard_limit=False, book_id="A"),
+        FakeEntry(), FRIDAY_4)
+
+    assert decision.allowed is True
+    assert "No account snapshot" in decision.note
+    assert decision.reasons == [], (
+        "a note is not a reason, or the loop would log this as a day trade")
+
+
+# -------------------------------------------------------------- unknown
+
+def test_unknown_behaves_as_the_old_rule_because_that_is_the_safe_direction(
+    tmp_path: Path,
+):
+    counter = counter_over_the_limit(tmp_path)
+
+    decision = counter.check(
+        book_under("unknown"), FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is False
+    assert decision.regime is Regime.OLD_PDT
+
+
+def test_unknown_can_be_told_to_mean_the_new_rules_instead(tmp_path: Path):
+    counter = counter_over_the_limit(tmp_path)
+    book = RegimeBook(
+        book_id="C",
+        pdt=RegimePdtSettings(regime="unknown", treat_unknown_as="new_imd"),
+    )
+
+    decision = counter.check(book, FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is True
+    assert decision.regime is Regime.NEW_IMD
+
+
+def test_settings_that_say_nothing_at_all_still_behave_as_they_did_before(
+    tmp_path: Path,
+):
+    """Nothing changed for a caller who never heard of the two regimes."""
+    counter = counter_over_the_limit(tmp_path)
+
+    decision = counter.check(INSIDER_BOOK, FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is False
+    assert decision.regime is Regime.OLD_PDT
+
+
+def test_the_counters_own_regime_is_used_when_the_settings_have_none(
+    tmp_path: Path,
+):
+    counter = DayTradeCounter(
+        book_id="C",
+        store_path=tmp_path / "pdt_BOOK_C.json",
+        regime="new_imd",
+    )
+    use_up_the_allowance(counter, day=4, how_many=3)
+    counter.record_fill("TSLA", "BUY", 100, et(4, 11, 0))
+
+    decision = counter.check(INSIDER_BOOK, FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is True
+    assert decision.regime is Regime.NEW_IMD
+
+
+def test_the_settings_beat_the_counter_when_the_two_disagree(tmp_path: Path):
+    counter = DayTradeCounter(
+        book_id="C",
+        store_path=tmp_path / "pdt_BOOK_C.json",
+        regime="new_imd",
+    )
+    use_up_the_allowance(counter, day=4, how_many=3)
+    counter.record_fill("TSLA", "BUY", 100, et(4, 11, 0))
+
+    decision = counter.check(
+        book_under("old_pdt"), FakeIntent("TSLA", "SELL"), FRIDAY_4)
+
+    assert decision.allowed is False, "the settings are the newer answer"
+
+
+def test_a_word_that_is_not_a_regime_is_refused_rather_than_ignored(tmp_path: Path):
+    with pytest.raises(ValueError) as caught:
+        DayTradeCounter(
+            book_id="A",
+            store_path=tmp_path / "pdt_BOOK_A.json",
+            regime="pattern_day_trader",
+        )
+
+    assert "old_pdt" in str(caught.value)
+
+
+# ------------------------------------------- where the regime comes from
+
+def test_counter_for_reads_the_regime_out_of_the_shared_settings_file(
+    monkeypatch, tmp_path: Path
+):
+    """The settings loader does not carry the field yet, so counter_for reads the
+    yaml the pre-flight writes into."""
+    config = tmp_path / "guardrails.yaml"
+    config.write_text(
+        "pdt:\n  regime: new_imd\n  treat_unknown_as: old_pdt\n", encoding="utf-8")
+    monkeypatch.setattr(pdt_mod, "config_dir", lambda: tmp_path)
+
+    counter = counter_for(
+        FakeBook(book_id="C", pdt=FakePdtSettings(hard_limit=True)),
+        store_dir=tmp_path,
+    )
+
+    assert counter.regime is Regime.NEW_IMD
+    assert counter.effective_regime() is Regime.NEW_IMD
+
+
+def test_counter_for_falls_back_to_unknown_and_the_old_rule_with_no_settings_file(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(pdt_mod, "config_dir", lambda: tmp_path / "nothing")
+
+    counter = counter_for(
+        FakeBook(book_id="C", pdt=FakePdtSettings(hard_limit=True)),
+        store_dir=tmp_path,
+    )
+
+    assert counter.regime is Regime.UNKNOWN
+    assert counter.effective_regime() is Regime.OLD_PDT
+
+
+def test_the_shipped_settings_still_say_unknown_so_nothing_changed_today():
+    """Until Tuesday's pre-flight asks the account, the old behaviour stands."""
+    regime, treat_unknown_as = pdt_mod.settings_regime()
+
+    assert regime is Regime.UNKNOWN
+    assert treat_unknown_as is Regime.OLD_PDT

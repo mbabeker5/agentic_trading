@@ -146,21 +146,48 @@ pdt:
   # code counts day trades itself and month one measures what the rule would
   # cost rather than guessing. Mo's decision, 2026-09-06. The counting lives in
   # agent/pdt.py.
-  hard_limit: false           # false here and in the momentum books, where day
-                              # trading is the whole strategy and a block would
-                              # be the wrong answer. The insider and Congress
-                              # strategy files set it true, because a day trade
-                              # in a book meant to hold for weeks is a mistake.
-                              # A book with it false is never blocked; the loop
-                              # is told what would have been blocked instead.
+  #
+  # FINRA retired that rule with effect from 2026-06-04 (Regulatory Notice
+  # 26-10, phase-in to 2027-10-20) and replaced it with the intraday margin
+  # deficit rules, under which an account gets into trouble for an order it
+  # cannot pay for rather than for one it counted wrong. Which of the two
+  # applies is a fact about the account, and IBKR will say if asked. The asking,
+  # the reading and the deficit check all live in agent/margin_regime.py.
+  regime: unknown             # old_pdt, new_imd, or unknown until the account
+                              # has been asked. Tuesday's pre-flight sets it:
+                              #   venv312/bin/python agent/preflight.py --write-regime
+                              # which reads IBKR's day trades remaining tags and
+                              # writes the answer back into this one line. Every
+                              # comment in this file survives that edit.
+  treat_unknown_as: old_pdt   # what unknown means in the meantime. old_pdt, so
+                              # an account nobody has asked is held to the strict
+                              # old rule. Counting an account that need not count
+                              # costs a line in a log; not counting one that must
+                              # costs 90 days of not being allowed to day trade.
+  hard_limit: false           # only bites under old_pdt. false here and in the
+                              # momentum books, where day trading is the whole
+                              # strategy and a block would be the wrong answer.
+                              # The insider and Congress strategy files set it
+                              # true, because a day trade in a book meant to
+                              # hold for weeks is a mistake. A book with it
+                              # false is never blocked; the loop is told what
+                              # would have been blocked instead. Under new_imd
+                              # nothing is blocked and nothing is flagged: the
+                              # count is kept for the ledger and the intraday
+                              # margin deficit check runs in its place.
   max_day_trades_per_5_days: 3
                               # three are allowed, so the fourth is the one that
-                              # trips the rule
+                              # trips the rule. Only counted against under
+                              # old_pdt.
   assumed_live_equity_min_usd: 25000
                               # the balance a live account would have to keep to
                               # be allowed to day trade at all. Nothing enforces
                               # it on paper. It is written down so month one's
-                              # numbers can be read against the real rule.
+                              # numbers can be read against the real rule. Under
+                              # new_imd this floor is gone and the minimum for
+                              # trading with leverage or shorting is 2,000
+                              # dollars, so read this number as the old rule's
+                              # price rather than as today's requirement.
 
 kill_switch:
   file: output/STOP           # create this file and the agent will only close

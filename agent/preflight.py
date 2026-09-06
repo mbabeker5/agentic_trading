@@ -2,9 +2,10 @@
 
 Runs half an hour before the market opens, once, on weekdays. It asks five
 questions, writes the answers down, and if any of them is a no it creates the
-file output/NO_TRADE_TODAY and tells Mo which check failed. It asks a sixth
-question too, about whether IBKR's scanner filters work on this account, but
-that one only ever records an answer and can never stop the day.
+file output/NO_TRADE_TODAY and tells Mo which check failed. It asks two more
+questions after those, about whether IBKR's scanner filters work on this account
+and which day trading rulebook the account is under. Neither of those two can
+ever stop the day; they only ever record an answer.
 
     /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
       /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preflight.py
@@ -47,8 +48,8 @@ The five checks that can stop the day
                    agent/pdt.py writes one per book as output/pdt_BOOK_A.json.
                    Missing files pass; a corrupt one fails.
 
-The sixth question, which never fails the day
----------------------------------------------
+The two questions that never fail the day
+-----------------------------------------
 
 6. scanner_filters_enabled
 
@@ -65,6 +66,24 @@ The sixth question, which never fails the day
    built for, and a true would be good news, not an emergency. Read the answer
    in facts.filters_enabled in the day's report.
 
+7. day_trade_regime
+
+   Which day trading rulebook this account is under. FINRA retired the pattern
+   day trader rule with effect from 2026-06-04 (Regulatory Notice 26-10) and
+   replaced it with the intraday margin deficit rules, and IBKR says which one
+   applies to an account through five account summary tags: DayTradesRemaining
+   and DayTradesRemainingT+1 through T+4. Counts mean the old rule is still
+   running, -1 or no tags at all means the new one, anything else is unknown.
+
+   agent/margin_regime.py does the reading. This check opens its own read only
+   connection to ask, records the answer, and never fails the morning. An
+   unknown answer prints a warning line, because unknown makes agent/pdt.py
+   fall back to the strict old behaviour and somebody should find out why.
+
+   Worth knowing: these tags come from the paper account, and IBKR applies
+   neither rulebook to simulated money, so the paper answer need not be the
+   live account's answer. The report says as much in day_trade_regime_note.
+
 What it writes
 --------------
 
@@ -74,6 +93,15 @@ What it writes
 
 With --dry-run it writes output/preflight_dryrun.json instead, creates no
 NO_TRADE_TODAY, and sends no alert. That is the safe way to try it.
+
+With --write-regime the day trading regime it detected is written into
+pdt.regime in config/guardrails.yaml. That is the one setting this script ever
+changes, only that one line changes, and every comment in the file survives.
+Without the flag nothing on disk moves. The Tuesday 2026-09-08 run passes it:
+
+    /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+      /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/preflight.py \
+      --write-regime
 
 This script places no orders. The only broker connection it opens is read only,
 and the only MCP tools it calls are the ones that read.
@@ -94,7 +122,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alerts as alerts_module  # noqa: E402
 import mcp_client as mcp  # noqa: E402
 import watchdog as wd  # noqa: E402
-from paths import agent_dir, no_trade_today_file, output_dir, venv_python  # noqa: E402
+from margin_regime import (  # noqa: E402
+    DAY_TRADE_TAGS,
+    MarginRegimeConfigError,
+    Regime,
+    detect_regime,
+    write_regime_setting,
+)
+from paths import (  # noqa: E402
+    agent_dir,
+    config_dir,
+    no_trade_today_file,
+    output_dir,
+    venv_python,
+)
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -105,6 +146,15 @@ CLIENT_ID = 251
 #: A second id for the scanner filter probe, which opens its own short lived
 #: read only connection so it cannot disturb the one above.
 FILTER_PROBE_CLIENT_ID = 252
+
+#: A third id, for the day trading regime probe. Same reason: its own short
+#: lived read only connection, so a slow answer cannot hold up anything else.
+REGIME_CLIENT_ID = 282
+
+#: The live account this paper account stands in for. IBKR applies neither day
+#: trading rulebook to simulated money, so the regime read off DUT077572 is a
+#: rehearsal of the plumbing and not an answer about U28440091.
+LIVE_ACCOUNT = "U28440091"
 
 #: The scanner can take a few minutes when IBKR is slow. Past this it is broken.
 SCANNER_TIMEOUT_SECONDS = 300
@@ -136,12 +186,14 @@ CHECK_SCANNER = "scanner"
 CHECK_SCANNER_FILTERS = "scanner_filters_enabled"
 CHECK_RECONCILE = "reconcile"
 CHECK_DAY_TRADES = "day_trades"
+CHECK_DAY_TRADE_REGIME = "day_trade_regime"
 
 CHECK_ORDER = (CHECK_GATEWAY, CHECK_MARKET_DATA, CHECK_SCANNER,
-               CHECK_SCANNER_FILTERS, CHECK_RECONCILE, CHECK_DAY_TRADES)
+               CHECK_SCANNER_FILTERS, CHECK_RECONCILE, CHECK_DAY_TRADES,
+               CHECK_DAY_TRADE_REGIME)
 
 #: Checks that record an answer and never stop the day, whatever they find.
-INFORMATIONAL_CHECKS = frozenset({CHECK_SCANNER_FILTERS})
+INFORMATIONAL_CHECKS = frozenset({CHECK_SCANNER_FILTERS, CHECK_DAY_TRADE_REGIME})
 
 
 @dataclass
@@ -634,12 +686,136 @@ def check_day_trade_counters() -> Result:
                   facts={"files": [p.name for p in found]})
 
 
+def guardrails_config_path() -> Path:
+    """The shared settings file the detected regime is written into."""
+    return config_dir() / "guardrails.yaml"
+
+
+def check_day_trade_regime(write_regime: bool = False) -> Result:
+    """Which day trading rulebook is this account under? Record, never block.
+
+    FINRA retired the pattern day trader rule with effect from 2026-06-04
+    (Regulatory Notice 26-10, phase-in to 2027-10-20) and replaced it with the
+    intraday margin deficit rules. Which of the two an account is under is a
+    fact about that account, and IBKR answers it in the account summary: five
+    tags called DayTradesRemaining and DayTradesRemainingT+1 through T+4. Small
+    non-negative numbers mean the old rule is still counting this account down.
+    -1, which is IBKR writing "unlimited", or no tags at all, means it is not.
+
+    The reading itself is agent/margin_regime.py's job. This opens a read only
+    connection on its own client id, hands the tags over, writes down what came
+    back and what it means, and never stops the morning whatever it finds. An
+    unknown answer prints a warning line, because unknown means the code falls
+    back to the strict old behaviour and somebody should look at why.
+
+    With --write-regime the answer is written into pdt.regime in
+    config/guardrails.yaml, which is where agent/pdt.py reads it. Without the
+    flag nothing on disk changes, so this can be run any morning without moving
+    the ground under the trading loop. An unknown answer is never written: it
+    would overwrite a good reading from a previous day with a shrug.
+
+    The connection here is its own rather than the MCP server's on purpose. The
+    MCP server asks IBKR for 24 account summary tags and none of the five is
+    among them, so an answer through it could never tell "this account has no
+    day trade limit" apart from "nobody asked".
+    """
+    facts: dict = {
+        "regime": Regime.UNKNOWN.value,
+        "tags_requested": list(DAY_TRADE_TAGS),
+        "paper_account": wd.PAPER_ACCOUNT,
+        "live_account": LIVE_ACCOUNT,
+        "paper_may_not_mirror_live": (
+            f"These tags were read from the paper account {wd.PAPER_ACCOUNT}, "
+            f"not from the live account {LIVE_ACCOUNT}. IBKR applies neither day "
+            "trading rulebook to simulated money, so a paper account can report "
+            "no day trade limit while the live account is still counted the old "
+            "way. Only a reading taken on the live account settles it."
+        ),
+        "config_written": False,
+        "config_path": str(guardrails_config_path()),
+    }
+
+    try:
+        from ib_async import IB
+    except Exception as exc:                                      # noqa: BLE001
+        facts["note"] = f"could not load ib_async: {exc}"
+        facts["warning"] = True
+        return Result(CHECK_DAY_TRADE_REGIME, True,
+                      "Could not load the IBKR library, so today's log has no "
+                      f"answer about the day trading regime: {exc}.", facts=facts)
+
+    ib = IB()
+    try:
+        ib.connect(wd.GATEWAY_HOST, wd.GATEWAY_PORT, clientId=REGIME_CLIENT_ID,
+                   readonly=True, timeout=20)
+    except Exception as exc:                                      # noqa: BLE001
+        facts["note"] = f"could not connect: {exc}"
+        facts["warning"] = True
+        return Result(CHECK_DAY_TRADE_REGIME, True,
+                      "Could not reach Gateway to ask which day trading regime "
+                      f"this account is under, so today's log has no answer: {exc}.",
+                      facts=facts)
+
+    try:
+        items = [{"account": row.account, "tag": row.tag, "value": row.value}
+                 for row in (ib.accountSummary() or [])]
+    except Exception as exc:                                      # noqa: BLE001
+        facts["note"] = f"the account summary would not come back: {exc}"
+        facts["warning"] = True
+        return Result(CHECK_DAY_TRADE_REGIME, True,
+                      f"Could not read the account summary: {exc}. No answer "
+                      "about the day trading regime today.", facts=facts)
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+    reading = detect_regime(items)
+    facts.update(reading.as_dict())
+    facts["tags_requested"] = list(DAY_TRADE_TAGS)
+
+    if write_regime and reading.regime is not Regime.UNKNOWN:
+        try:
+            changed = write_regime_setting(guardrails_config_path(), reading.regime)
+        except (MarginRegimeConfigError, OSError) as exc:
+            facts["config_error"] = str(exc)
+            facts["warning"] = True
+        else:
+            facts["config_written"] = True
+            facts["config_changed"] = changed
+    elif write_regime:
+        facts["config_note"] = (
+            "The regime came back unknown, so nothing was written. Writing "
+            "unknown would replace a good answer from an earlier day with a "
+            "shrug, and unknown already means the strict old behaviour."
+        )
+
+    detail = reading.note
+    if reading.regime is Regime.UNKNOWN:
+        facts["warning"] = True
+        detail = (
+            f"The day trading regime is unknown. {reading.note} Until it is "
+            "settled, pdt.treat_unknown_as in config/guardrails.yaml applies, "
+            "which is old_pdt, so the day trade counter keeps behaving as though "
+            "the pattern day trader rule still binds."
+        )
+    if facts.get("config_written"):
+        detail += (
+            f" Written into pdt.regime in {guardrails_config_path()}."
+            if facts.get("config_changed")
+            else f" pdt.regime in {guardrails_config_path()} already said that."
+        )
+    return Result(CHECK_DAY_TRADE_REGIME, True, detail, facts=facts)
+
+
 # ------------------------------------------------------------------- the run
 
-def run_checks(scan_out: Path) -> list[Result]:
+def run_checks(scan_out: Path, write_regime: bool = False) -> list[Result]:
     login, market = check_gateway_and_data()
     return [login, market, check_scanner(scan_out), check_scanner_filters(),
-            check_reconcile(), check_day_trade_counters()]
+            check_reconcile(), check_day_trade_counters(),
+            check_day_trade_regime(write_regime=write_regime)]
 
 
 def report_path(now: datetime, dry_run: bool) -> Path:
@@ -668,6 +844,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="Write output/preflight_dryrun.json, create no "
                              "NO_TRADE_TODAY, and send no alert.")
+    parser.add_argument("--write-regime", action="store_true",
+                        help="Write the day trading regime this account is "
+                             "under into pdt.regime in config/guardrails.yaml. "
+                             "Without it the regime is only recorded in the "
+                             "report and nothing on disk changes.")
     args = parser.parse_args(argv)
 
     now = datetime.now(EASTERN)
@@ -676,20 +857,24 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"{now:%Y-%m-%d %H:%M:%S %Z} pre-flight"
           f"{' (dry run)' if args.dry_run else ''}")
-    results = run_checks(scan_out)
+    results = run_checks(scan_out, write_regime=args.write_regime)
 
     failed = [r.name for r in results if not r.passed]
     verdict = "fail" if failed else "pass"
 
     for result in results:
         if result.name in INFORMATIONAL_CHECKS:
-            label = "note"
+            # A note that carries a warning still prints differently, so an
+            # unknown day trading regime is not lost among the passing lines.
+            label = "warn" if (result.facts or {}).get("warning") else "note"
         else:
             label = "pass" if result.passed else "FAIL"
         print(f"  [{label}] {result.name}: {result.detail}")
 
     by_name = {r.name: r for r in results}
     filters = by_name.get(CHECK_SCANNER_FILTERS)
+    regime = by_name.get(CHECK_DAY_TRADE_REGIME)
+    regime_facts = (regime.facts or {}) if regime else {}
     report = {
         "run_at": now.isoformat(),
         "verdict": verdict,
@@ -700,6 +885,12 @@ def main(argv: list[str] | None = None) -> int:
         # probe could not run at all.
         "scanner_filters_enabled": (
             (filters.facts or {}).get("filters_enabled") if filters else None),
+        # The other Tuesday question: old_pdt, new_imd, or unknown. Read with
+        # day_trade_regime_note, which says why this account may not be the one
+        # that matters.
+        "day_trade_regime": regime_facts.get("regime"),
+        "day_trade_regime_note": regime_facts.get("paper_may_not_mirror_live"),
+        "day_trade_regime_written": regime_facts.get("config_written", False),
         "checks": {r.name: asdict(r) for r in results},
         "scan_file": str(scan_out),
     }
