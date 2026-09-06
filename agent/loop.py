@@ -1212,6 +1212,11 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
     packet = {
         "generated_at": tick.now.isoformat(),
         "date": f"{tick.now.date():%Y-%m-%d}",
+        # The shape of this file, not the version of the code that wrote it. It
+        # goes into the prompt hash, so a month of decisions made against one
+        # packet shape is never silently compared with a month made against
+        # another. See PACKET_SCHEMA_VERSION in agent/decide.py.
+        "schema_version": decide_mod.PACKET_SCHEMA_VERSION,
         "book": tick.book.book_id,
         "book_id": tick.book.book_id,
         "order_ref": tick.book.order_ref,
@@ -1239,6 +1244,48 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
     return packet
 
 
+def record_decision_problems(tick: BookTick, state: bs.BookState, result) -> None:
+    """Write down every way one decision went wrong, by name, in the ledger.
+
+    Three different things, and they are kept apart on purpose because they mean
+    different things at the end of the month:
+
+        decision_rejected   a row the model wrote that could not be used, or a
+                            whole reply that could not be read. Named, with the
+                            reason. Nothing stands in for it: a tick that
+                            rejects its reply opens nothing.
+        model_unavailable   no usable reply arrived at all, so the book's own
+                            rules answered instead. Written down so a rules
+                            answer is never counted as a model answer.
+        decision_failed     something else went wrong before a model was even
+                            reached, such as a prompt that would not render.
+    """
+    for bad in getattr(result, "rejections", None) or []:
+        symbol = str(bad.get("symbol") or "")
+        reason = str(bad.get("reason") or "no reason given")
+        detail = f"{symbol}: {reason}" if symbol else reason
+        tick.say(f"  rejected: {detail}")
+        tick.rule("decision_rejected", detail, "the row was thrown away")
+        tick.record(state, symbol, "decision_rejected", reason,
+                    model=result.model, cost=None, prompt_hash=result.prompt_hash)
+
+    if getattr(result, "fallback", None) == "model_unavailable":
+        why = next((n for n in result.notes if n.startswith("model_unavailable")),
+                   "the model could not be reached")
+        tick.rule("model_unavailable", why,
+                  "this book's own rules answered instead of its model")
+        tick.record(state, "", "model_unavailable", why, model=result.model,
+                    cost=result.cost_usd, prompt_hash=result.prompt_hash)
+        return
+
+    if not result.ok:
+        tick.note(f"the decision step could not answer: {result.error}")
+        rule_id = "decision_rejected" if result.rejections else "decision_failed"
+        tick.rule(rule_id,
+                  f"the {tick.book.model or 'rules only'} answer failed: {result.error}",
+                  "nothing was opened this tick and no rules answer stood in for it")
+
+
 def do_pick(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guardrails,
             broker: broker_mod.Broker, account_state, guards: Guards) -> None:
     """Choose today's names and work out what buying them would look like."""
@@ -1261,11 +1308,7 @@ def do_pick(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guard
 
     for message in result.notes:
         tick.note(message)
-    if not result.ok:
-        tick.note(f"the decision step could not answer: {result.error}")
-        tick.rule("decision_failed",
-                  f"the {tick.book.model or 'rules only'} pick failed: {result.error}",
-                  "no picks were made this tick")
+    record_decision_problems(tick, state, result)
 
     if not result.picks:
         tick.say(f"No picks. The shortlist held {len(rows)} names and none of them "
@@ -1774,6 +1817,7 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
 
     packet = {
         "generated_at": tick.now.isoformat(), "date": f"{today:%Y-%m-%d}",
+        "schema_version": decide_mod.PACKET_SCHEMA_VERSION,
         "book": tick.book.book_id, "book_id": tick.book.book_id,
         "mode": tick.book.mode, "rules_commit": tick.rules,
         "strategy_key": Path(str(tick.book.strategy_dir)).name,
@@ -1791,8 +1835,9 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
         cost = _number(result.cost_usd)
         state.model_cost_today = round(state.model_cost_today + cost, 6)
         tick.model_cost += cost
-        if not result.ok:
-            tick.note(f"the manage decision could not answer: {result.error}")
+        for message in result.notes:
+            tick.note(message)
+        record_decision_problems(tick, state, result)
         model_view = {str(e.get("symbol") or "").upper(): e for e in result.exits}
 
     counter = make_day_trade_counter(guard)

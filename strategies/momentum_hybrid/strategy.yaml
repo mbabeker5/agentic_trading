@@ -64,6 +64,15 @@ risk:
                               # applies and the sentence the model reads cannot
                               # drift apart. Set it to 0 to switch the rule off.
 
+  max_picks: 5                # at most this many names may come back from one
+                              # decision call. decide() in agent/decide.py trims
+                              # to it on both paths, the model's and the
+                              # rules-only one, so book B cannot quietly pick
+                              # more names than book A. It is a ceiling on the
+                              # answer, not on the day: schedule.entries_per_day_max
+                              # is the separate limit on how many positions
+                              # actually get opened.
+
 universe:
   price_floor: 5              # ignore anything trading below this many dollars
   min_avg_dollar_volume: 20000000

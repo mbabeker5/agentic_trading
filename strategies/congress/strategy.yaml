@@ -49,6 +49,15 @@ risk:
   time_stop_trading_days: 60  # about three months. If there is an edge here it
                               # is slow, and after this the trade is stale.
 
+  max_picks: 5                # at most this many names may come back from one
+                              # decision call. decide() in agent/decide.py trims
+                              # to it on both paths, the model's and the
+                              # rules-only one, so book B cannot quietly pick
+                              # more names than book A. It is a ceiling on the
+                              # answer, not on the day: schedule.entries_per_day_max
+                              # is the separate limit on how many positions
+                              # actually get opened.
+
 universe:
   price_floor: 10             # higher than the insider book. Members mostly
                               # buy large companies, and it keeps paper fills

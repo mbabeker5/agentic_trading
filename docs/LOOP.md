@@ -282,6 +282,17 @@ DRY RUN BOOK_A would place BUY 1000 ABC limit 9.38 (purpose: entry)
     leg: target SELL 1000 ABC limit 9.66 tagged BOOK_A
 ```
 
+### When the model does not give a usable answer
+
+Two rows to know in the Rules Log, because they mean opposite things:
+
+| Row | What happened | What the book did |
+|---|---|---|
+| `model_unavailable` | No usable reply arrived: the provider was down, refused the connection, or took longer than the 60 second budget. Each call gets a 45 second timeout and no retries. | The book's own rules answered instead. Written down so a rules answer is never counted later as a model answer. |
+| `decision_rejected` | A reply did arrive and could not be trusted: not JSON, the wrong shape, a pick with an unknown side, a missing confidence, or a confidence outside 0 to 1. | Nothing. That row, or that whole reply, is thrown away and no rules answer stands in for it, because standing in would quietly turn a broken model into a working book. |
+
+A single bad row inside a reply that otherwise parsed only costs that row. A reply that cannot be read at all costs the whole tick, and the book opens nothing until the next one.
+
 ---
 
 ## The pluggable broker

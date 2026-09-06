@@ -57,6 +57,7 @@ import json
 import math
 import re
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,98 @@ DEFAULT_MAX_TOKENS = {"pick": 1500, "manage": 800}
 # this does nothing. Later in the day it stops the packet from growing all day.
 BARS_KEPT = 6
 
+# The shape of the packet the loop builds. It goes into the prompt hash, so a
+# month of decisions made against one packet shape cannot be silently compared
+# with a month made against another. Bump it when a field is added or removed
+# from what build_pick_packet in agent/loop.py writes.
+PACKET_SCHEMA_VERSION = "2026-09-06"
+
+# How long one model call may take, and how long the whole thing may take.
+# 45 seconds is handed to the adapter as its socket timeout with no retries
+# behind it. 60 is the wall clock this file measures for itself, so a provider
+# that somehow gets past its own timeout still cannot hold up a five minute
+# tick. Past either, the book falls back to its rules and says so.
+ADAPTER_TIMEOUT_S = 45.0
+MODEL_BUDGET_S = 60.0
+
+# How many names one call may pick when a strategy.yaml does not say. Every
+# strategy.yaml does say, as risk.max_picks, and this is only the floor under a
+# missing file.
+DEFAULT_MAX_PICKS = 5
+
+# --------------------------------------------------- the shape of a reply
+#
+# These go to the provider as a json_schema, strict where the provider supports
+# it, which makes the reply structurally valid before this file even reads it.
+# They are deliberately plain: types, enums, required and additionalProperties,
+# and nothing else. OpenAI shaped strict mode accepts only a subset of JSON
+# Schema and quietly rejects a schema using more, so the range on `confidence`
+# is not written here. It is enforced in _clean_pick below, which runs on every
+# reply from every provider and is therefore the real guarantee. The schema
+# makes a valid answer likely; the validation makes an invalid one harmless.
+
+_PICK_ITEM = {
+    "type": "object",
+    "properties": {
+        "symbol": {"type": "string"},
+        "side": {"type": "string", "enum": ["long", "short"]},
+        "entry": {"type": "number"},
+        "stop": {"type": "number"},
+        # Null is a real answer for both of these. The insider and Congress
+        # books run on a trailing stop and a time stop rather than a target, and
+        # a model with no view on size says so rather than inventing a number.
+        "target": {"type": ["number", "null"]},
+        "qty_hint": {"type": ["integer", "null"]},
+        "confidence": {"type": "number"},
+        "rationale": {"type": "string"},
+    },
+    "required": ["symbol", "side", "entry", "stop", "target", "qty_hint",
+                 "confidence", "rationale"],
+    "additionalProperties": False,
+}
+
+_SKIP_ITEM = {
+    "type": "object",
+    "properties": {"symbol": {"type": "string"}, "rationale": {"type": "string"}},
+    "required": ["symbol", "rationale"],
+    "additionalProperties": False,
+}
+
+_EXIT_ITEM = {
+    "type": "object",
+    "properties": {
+        "symbol": {"type": "string"},
+        "action": {"type": "string", "enum": ["hold", "fade", "exit"]},
+        "confidence": {"type": "number"},
+        "rationale": {"type": "string"},
+    },
+    "required": ["symbol", "action", "confidence", "rationale"],
+    "additionalProperties": False,
+}
+
+PICK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "no_action": {"type": "boolean"},
+        "picks": {"type": "array", "items": _PICK_ITEM},
+        "skips": {"type": "array", "items": _SKIP_ITEM},
+    },
+    "required": ["no_action", "picks", "skips"],
+    "additionalProperties": False,
+}
+
+MANAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "no_action": {"type": "boolean"},
+        "exits": {"type": "array", "items": _EXIT_ITEM},
+    },
+    "required": ["no_action", "exits"],
+    "additionalProperties": False,
+}
+
+SCHEMAS = {"pick": PICK_SCHEMA, "manage": MANAGE_SCHEMA}
+
 
 class PromptError(Exception):
     """A prompt could not be rendered. Raised by render_prompt, caught by decide."""
@@ -115,6 +208,8 @@ class DecisionResult:
     book_id: str | None = None
     shape: str = ""
     notes: list[str] = field(default_factory=list)
+    rejections: list[dict] = field(default_factory=list)
+    fallback: str | None = None
 
     def as_log_dict(self) -> dict:
         out = asdict(self)
@@ -123,11 +218,19 @@ class DecisionResult:
 
 
 def _empty(book_id: str | None, model: str, shape: str, prompt_hash: str,
-           error: str, notes: list[str] | None = None) -> DecisionResult:
-    """The answer when something went wrong: do nothing, and say why."""
+           error: str, notes: list[str] | None = None,
+           rejections: list[dict] | None = None) -> DecisionResult:
+    """The answer when something went wrong: do nothing, and say why.
+
+    Nothing means nothing. There is no rules-only stand in on this path, on
+    purpose. A reply that arrived and could not be trusted is not the same as no
+    reply at all: falling back to the rules there would quietly turn a broken
+    model into a working book, and the eval would be measuring the wrong thing.
+    """
     return DecisionResult(book_id=book_id, model=model, shape=shape,
                           prompt_hash=prompt_hash, ok=False, error=error,
-                          notes=list(notes or []))
+                          notes=list(notes or []),
+                          rejections=list(rejections or []))
 
 
 # ------------------------------------------------------- rendering the prompt
@@ -186,13 +289,32 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
-def prompt_hash(system_prompt: str) -> str:
-    """sha256 of the exact bytes sent as the system prompt.
+def prompt_hash(system_prompt: str, packet_schema_version: str = "",
+                output_schema: Any = None, model_id: str = "") -> str:
+    """sha256 over everything that decides what an answer will be.
 
-    Goes in the ledger. Two rows with the same hash were decided under exactly the
-    same instructions, which is what makes a month of decisions comparable.
+    Goes in the ledger. Two rows with the same hash were decided under exactly
+    the same conditions, which is what makes a month of decisions comparable,
+    and "the same conditions" is four things, not one:
+
+        the rendered prompt      the instructions, with the yaml's numbers in
+        the packet schema        the shape of the facts handed over. Change what
+                                 the packet holds and the same prompt is a
+                                 different question.
+        the output schema        what a valid answer is allowed to look like.
+                                 Loosening it changes what comes back.
+        the resolved model id    a different model is a different decider, and
+                                 comparing the two under one hash would be the
+                                 whole point of the eval thrown away.
+
+    Any of the last three left empty is simply hashed as empty, so a caller with
+    only a prompt still gets a stable number out.
     """
-    return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+    payload = json.dumps(
+        {"prompt": system_prompt, "packet_schema_version": packet_schema_version,
+         "output_schema": output_schema, "model_id": model_id},
+        sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ------------------------------------------------ where the numbers come from
@@ -499,16 +621,53 @@ def _extract_json(text: str) -> dict:
     return loaded
 
 
-def _clean_pick(row: Any) -> dict | None:
+def _confidence(row: dict) -> tuple[float | None, str | None]:
+    """The row's confidence, or why it is not usable.
+
+    Required, and between 0 and 1. A pick with no confidence on it cannot be
+    weighed against another at the end of the month, and a confidence of 3, or
+    of "high", is a model that did not read the instruction, which is worth
+    knowing about rather than rounding off.
+    """
+    if "confidence" not in row:
+        return None, "it carries no confidence, and every pick has to carry one"
+    raw = row.get("confidence")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None, f"its confidence is {raw!r}, which is not a number between 0 and 1"
+    value = float(raw)
+    if not 0.0 <= value <= 1.0:
+        return None, (f"its confidence is {value:g}, and confidence has to be between "
+                      "0 and 1")
+    return round(value, 3), None
+
+
+def _clean_pick(row: Any) -> tuple[dict | None, str | None]:
+    """One pick, checked. Returns the clean row, or None and the reason it went.
+
+    An unknown side is refused outright and never quietly read as a long. That
+    was the old behaviour and it was the dangerous kind of forgiving: a model
+    that wrote "buy", or "SHORT " with a space, or nothing at all, produced a
+    long order that nobody asked for.
+    """
     if not isinstance(row, dict):
-        return None
+        return None, f"it is a {type(row).__name__} rather than an object"
     symbol = str(row.get("symbol") or "").strip().upper()
+    if not symbol:
+        return None, "it names no symbol"
     rationale = str(row.get("rationale") or row.get("reason") or "").strip()
-    if not symbol or not rationale:
-        return None
-    side = str(row.get("side") or "long").strip().lower()
+    if not rationale:
+        return None, "it carries no rationale, and a decision with no reason cannot "\
+                     "be reviewed"
+
+    side = str(row.get("side") or "").strip().lower()
     if side not in ("long", "short"):
-        side = "long"
+        return None, (f"its side is {row.get('side')!r}, and side has to be exactly "
+                      "'long' or 'short'")
+
+    confidence, why = _confidence(row)
+    if why:
+        return None, why
+
     qty = row.get("qty_hint", row.get("qty"))
     try:
         qty_hint = int(float(qty)) if qty is not None else None
@@ -516,7 +675,8 @@ def _clean_pick(row: Any) -> dict | None:
         qty_hint = None
     return {"symbol": symbol, "side": side, "entry": _num(row.get("entry")),
             "stop": _num(row.get("stop")), "target": _num(row.get("target")),
-            "qty_hint": qty_hint, "rationale": rationale}
+            "qty_hint": qty_hint, "confidence": confidence,
+            "rationale": rationale}, None
 
 
 def _clean_skip(row: Any) -> dict | None:
@@ -529,59 +689,106 @@ def _clean_skip(row: Any) -> dict | None:
     return {"symbol": symbol, "rationale": rationale}
 
 
-def _clean_exit(row: Any) -> dict | None:
+def _clean_exit(row: Any) -> tuple[dict | None, str | None]:
     if not isinstance(row, dict):
-        return None
+        return None, f"it is a {type(row).__name__} rather than an object"
     symbol = str(row.get("symbol") or "").strip().upper()
+    if not symbol:
+        return None, "it names no symbol"
     action = str(row.get("action") or "").strip().lower()
+    if action not in ("hold", "fade", "exit"):
+        return None, (f"its action is {row.get('action')!r}, and action has to be "
+                      "exactly 'hold', 'fade' or 'exit'")
     rationale = str(row.get("rationale") or row.get("reason") or "").strip()
-    if not symbol or action not in ("hold", "fade", "exit") or not rationale:
-        return None
-    return {"symbol": symbol, "action": action, "rationale": rationale}
+    if not rationale:
+        return None, "it carries no rationale"
+    confidence, why = _confidence(row)
+    if why:
+        return None, why
+    return {"symbol": symbol, "action": action, "confidence": confidence,
+            "rationale": rationale}, None
 
 
-def parse_decision(text: str, shape: str) -> tuple[list, list, list, list[str]]:
-    """Turn the model's reply into picks, skips and exits, plus notes on anything dropped.
+def parse_decision(text: str,
+                   shape: str) -> tuple[list, list, list, list[str], list[dict]]:
+    """Turn the model's reply into picks, skips and exits, plus notes and rejections.
 
-    Strict about the container: the reply has to be one JSON object with the key
-    the shape asked for. Forgiving about one row inside it, because losing a whole
-    day's decision to one malformed entry would be worse than losing that entry.
-    A dropped row is always written into the notes, never swallowed.
+    Strict about the container: the reply has to be one JSON object with the
+    keys the shape asked for, and anything else raises. A raise means the whole
+    tick opens nothing and writes a decision_rejected row, with no rules-only
+    stand in, because a reply that cannot be read is not the same as no reply.
+
+    Still forgiving about one row inside a container that did parse, because
+    losing a whole day's decision to one bad entry would be worse than losing
+    that entry. A dropped row is never swallowed: it comes back in `rejections`
+    with the reason, and the loop writes each one to the ledger by name.
+
+    `no_action` is an explicit answer and not an empty one. A model that has
+    looked and decided to do nothing says so, and this returns nothing with a
+    note, rather than leaving "it picked nothing" and "it failed" looking alike.
     """
     notes: list[str] = []
+    rejections: list[dict] = []
     loaded = _extract_json(text)
 
+    def reject(row: Any, why: str) -> None:
+        symbol = ""
+        if isinstance(row, dict):
+            symbol = str(row.get("symbol") or "").strip().upper()
+        rejections.append({"symbol": symbol, "reason": why})
+
+    no_action = loaded.get("no_action")
+    if not isinstance(no_action, (bool, type(None))):
+        raise ValueError(f"'no_action' has to be true or false, not {no_action!r}")
+
     if shape == "pick":
-        if "picks" not in loaded and "skips" not in loaded:
-            raise ValueError("the reply has neither a 'picks' nor a 'skips' key")
+        if no_action is None and "picks" not in loaded and "skips" not in loaded:
+            raise ValueError("the reply has no 'no_action', no 'picks' and no 'skips'")
         raw_picks = loaded.get("picks") or []
         raw_skips = loaded.get("skips") or []
         if not isinstance(raw_picks, list) or not isinstance(raw_skips, list):
             raise ValueError("'picks' and 'skips' must both be lists")
-        picks = [p for p in (_clean_pick(r) for r in raw_picks) if p]
+        if no_action:
+            if raw_picks:
+                raise ValueError("the reply says no_action and also carries picks, so "
+                                 "it is not clear what was meant")
+            notes.append("the model answered no_action: it looked and chose to open "
+                         "nothing")
+        picks = []
+        for raw in raw_picks:
+            row, why = _clean_pick(raw)
+            if row is None:
+                reject(raw, why or "no reason given")
+            else:
+                picks.append(row)
         skips = [s for s in (_clean_skip(r) for r in raw_skips) if s]
-        if len(picks) != len(raw_picks):
-            notes.append(f"dropped {len(raw_picks) - len(picks)} pick(s) with no symbol "
-                         "or no rationale")
         if len(skips) != len(raw_skips):
             notes.append(f"dropped {len(raw_skips) - len(skips)} skip(s) with no symbol "
                          "or no rationale")
-        return picks, skips, [], notes
+        return picks, skips, [], notes, rejections
 
+    if no_action:
+        notes.append("the model answered no_action: it looked and chose to close "
+                     "nothing")
     raw = loaded.get("exits")
     if raw is None:
         raw = loaded.get("positions") or loaded.get("decisions")
         if raw is not None:
             notes.append("the reply used a key other than 'exits'; read it anyway")
+    if raw is None and no_action:
+        raw = []
     if raw is None:
         raise ValueError("the reply has no 'exits' key")
     if not isinstance(raw, list):
         raise ValueError("'exits' must be a list")
-    exits = [e for e in (_clean_exit(r) for r in raw) if e]
-    if len(exits) != len(raw):
-        notes.append(f"dropped {len(raw) - len(exits)} position(s) with no symbol, no "
-                     "rationale, or an action that was not hold, fade or exit")
-    return [], [], exits, notes
+    exits = []
+    for row in raw:
+        cleaned, why = _clean_exit(row)
+        if cleaned is None:
+            reject(row, why or "no reason given")
+        else:
+            exits.append(cleaned)
+    return [], [], exits, notes, rejections
 
 
 # ------------------------------------------------------- the rules only book
@@ -592,6 +799,20 @@ def _short_candidate(row: dict) -> bool:
         return True
     gain = _num(row.get("gain_pct"))
     return gain is not None and gain < 0
+
+
+def max_picks_for(params: dict) -> int:
+    """How many names one call may pick, from risk.max_picks in the strategy.yaml.
+
+    The same ceiling for the rules-only path and the model path, because book B
+    is the control books A and E are measured against and a control allowed a
+    different number of picks is not a control.
+    """
+    try:
+        wanted = int(params.get("max_picks") or DEFAULT_MAX_PICKS)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_PICKS
+    return max(0, wanted)
 
 
 def rules_only_decision(packet: dict, params: dict, shape: str,
@@ -616,10 +837,11 @@ def rules_only_decision(packet: dict, params: dict, shape: str,
         for position in packet.get("positions") or []:
             if isinstance(position, dict) and position.get("symbol"):
                 result.exits.append({"symbol": str(position["symbol"]).upper(),
-                                     "action": "hold", "rationale": "rules only"})
+                                     "action": "hold", "confidence": None,
+                                     "rationale": "rules only"})
         return result
 
-    max_picks = int(params.get("max_picks") or 3)
+    max_picks = max_picks_for(params)
     stop_pct = float(params.get("stop_loss_pct") or 1.5)
     r_multiple = float(params.get("target_r_multiple") or 2.0)
     equity = _num((packet.get("account") or {}).get("equity")) or \
@@ -686,6 +908,21 @@ def decide(book: dict, strategy_dir: str | Path, shape: str, packet: dict,
     `dry_run=True` renders and hashes the prompt but makes no call, and hands back
     the rules-only answer so the loop still has something to write down. That is
     what lets the whole day be rehearsed for nothing.
+
+    Two different ways this can go wrong, and they are deliberately not the same:
+
+        model_unavailable   no usable reply arrived at all. The provider was
+                            down, refused the connection, or took longer than
+                            the budget. The book falls back to its own rules,
+                            `fallback` says so, and the loop writes that word
+                            into the ledger so a rules answer is never mistaken
+                            for a model answer.
+        decision_rejected   a reply did arrive and could not be trusted: not
+                            JSON, the wrong shape, or every row invalid. There
+                            is NO rules fallback here and the tick opens
+                            nothing. Standing in for a model that answered badly
+                            would quietly turn a broken model into a working
+                            book.
     """
     book = book or {}
     book_id = book.get("id") or book.get("book") or book.get("book_id")
@@ -700,17 +937,25 @@ def decide(book: dict, strategy_dir: str | Path, shape: str, packet: dict,
     for source in ("params", "prompt_params"):
         if isinstance(book.get(source), dict):
             params.update({k: v for k, v in book[source].items() if v is not None})
+    limit = max_picks_for(params)
 
     if model_field.lower() in ("", "none", "null"):
         result = rules_only_decision(packet or {}, params, shape, book_id)
         result.notes = notes + result.notes
-        return result
+        return _trim_picks(result, limit)
 
     try:
         system = render_prompt(strategy_dir, shape, params)
     except PromptError as exc:
         return _empty(book_id, model_field, shape, "", f"prompt: {exc}", notes)
-    digest = prompt_hash(system)
+
+    schema = SCHEMAS.get(shape)
+    digest = prompt_hash(
+        system,
+        packet_schema_version=str((packet or {}).get("schema_version")
+                                  or PACKET_SCHEMA_VERSION),
+        output_schema=schema,
+        model_id=models_mod.resolve_model_id(model_field))
 
     if dry_run:
         result = rules_only_decision(packet or {}, params, shape, book_id)
@@ -720,7 +965,7 @@ def decide(book: dict, strategy_dir: str | Path, shape: str, packet: dict,
         result.notes = notes + [
             f"dry run: the {shape} prompt was rendered and hashed but no model was called, "
             "so these are the rules only answers"]
-        return result
+        return _trim_picks(result, limit)
 
     try:
         user = build_user_message(shape, packet or {})
@@ -731,7 +976,7 @@ def decide(book: dict, strategy_dir: str | Path, shape: str, packet: dict,
     # Both month one models think before they answer, and thinking tokens are billed
     # at the output price. A book may set `reasoning_effort: low` in its yaml to keep
     # a routine manage tick from spending more on deliberation than on the answer.
-    adapter_kwargs: dict = {}
+    adapter_kwargs: dict = {"timeout_s": ADAPTER_TIMEOUT_S}
     effort = book.get("reasoning_effort")
     if effort:
         adapter_kwargs["effort" if model_field.startswith("anthropic/")
@@ -746,16 +991,38 @@ def decide(book: dict, strategy_dir: str | Path, shape: str, packet: dict,
                       notes)
 
     cap = max_tokens or DEFAULT_MAX_TOKENS.get(shape, 1200)
-    response = adapter.complete(system, user, max_tokens=cap, json_only=True)
+    started = time.monotonic()
+    try:
+        response = adapter.complete(system, user, max_tokens=cap, json_only=True,
+                                    schema=schema)
+    except Exception as exc:                    # noqa: BLE001
+        # An adapter is meant to return its failures rather than raise them, so
+        # anything that lands here is a socket timeout or a provider library
+        # doing something new. Either way there is no answer.
+        return _unavailable(book_id, model_field, shape, digest, params, packet,
+                            notes, limit, f"the call raised {type(exc).__name__}: {exc}")
+    elapsed = time.monotonic() - started
     log = response.as_log_dict()
+    log["elapsed_s"] = round(elapsed, 2)
 
-    if not response.ok:
-        out = _empty(book_id, response.model or model_field, shape, digest,
-                     response.error or "the model returned nothing usable", notes)
-        out.raw_text = response.text or ""
+    if elapsed > MODEL_BUDGET_S:
+        out = _unavailable(
+            book_id, response.model or model_field, shape, digest, params, packet,
+            notes, limit,
+            f"the call took {elapsed:.1f} seconds and this book's budget is "
+            f"{MODEL_BUDGET_S:.0f}")
         out.model_response = log
-        out.tokens_in = response.input_tokens
-        out.tokens_out = response.output_tokens
+        out.tokens_in, out.tokens_out = response.input_tokens, response.output_tokens
+        out.cost_usd = response.cost_usd
+        return out
+
+    if not response.ok and not (response.text or "").strip():
+        out = _unavailable(
+            book_id, response.model or model_field, shape, digest, params, packet,
+            notes, limit,
+            response.error or "the model returned nothing at all")
+        out.model_response = log
+        out.tokens_in, out.tokens_out = response.input_tokens, response.output_tokens
         out.cost_usd = response.cost_usd
         return out
 
@@ -765,14 +1032,58 @@ def decide(book: dict, strategy_dir: str | Path, shape: str, packet: dict,
         prompt_hash=digest, model=response.model or model_field, book_id=book_id,
         shape=shape, notes=list(notes))
     try:
-        picks, skips, exits, parse_notes = parse_decision(response.text, shape)
+        picks, skips, exits, parse_notes, rejections = parse_decision(response.text,
+                                                                      shape)
     except Exception as exc:                    # noqa: BLE001
+        # A reply that arrived and cannot be read. No fallback, nothing opened.
         result.ok = False
         result.error = f"the reply was not the JSON this shape asked for: {exc}"
+        result.rejections = [{"symbol": "",
+                              "reason": f"the whole reply was thrown away: {exc}"}]
         return result
     result.picks, result.skips, result.exits = picks, skips, exits
     result.notes.extend(parse_notes)
+    result.rejections = rejections
+    return _trim_picks(result, limit)
+
+
+def _trim_picks(result: DecisionResult, limit: int) -> DecisionResult:
+    """Cut a decision down to risk.max_picks, whoever made it.
+
+    The trimmed names become skips with the reason written out, rather than
+    disappearing, because "we would have taken it and the cap stopped us" is a
+    different fact from "we did not like it" and the eval needs both.
+    """
+    if limit <= 0 or len(result.picks) <= limit:
+        return result
+    dropped = result.picks[limit:]
+    result.picks = result.picks[:limit]
+    for row in dropped:
+        result.skips.append({
+            "symbol": row.get("symbol", ""),
+            "rationale": f"not taken: this book picks at most {limit} names in one "
+                         "call and this one came after them"})
+    result.notes.append(
+        f"trimmed {len(dropped)} pick(s) past the cap of {limit}")
     return result
+
+
+def _unavailable(book_id: str | None, model: str, shape: str, digest: str,
+                 params: dict, packet: dict | None, notes: list[str], limit: int,
+                 why: str) -> DecisionResult:
+    """No usable reply came back, so the book's own rules answer instead.
+
+    Tagged model_unavailable in the notes and in `fallback`, which the loop
+    turns into a ledger row of the same name. A rules answer that looked like a
+    model answer in the ledger would poison a month of comparison.
+    """
+    result = rules_only_decision(packet or {}, params, shape, book_id)
+    result.model = model
+    result.prompt_hash = digest
+    result.fallback = "model_unavailable"
+    result.notes = list(notes) + [f"model_unavailable: {why}. The book's own rules "
+                                  "answered instead."] + result.notes
+    return _trim_picks(result, limit)
 
 
 # ------------------------------------------------------------- the measuring
@@ -1018,7 +1329,11 @@ def measure(real: bool = False, models_to_call: dict | None = None,
                 "system_tokens_estimated": estimate_tokens(system),
                 "user_tokens_estimated": estimate_tokens(user),
                 "input_tokens_estimated": estimate_tokens(system) + estimate_tokens(user),
-                "prompt_hash": prompt_hash(system),
+                # Over the rendered prompt alone, so it can be compared across
+                # a --measure run. The ledger's hash also covers the packet
+                # shape, the output schema and the model, none of which are
+                # fixed here. See prompt_hash above.
+                "prompt_only_hash": prompt_hash(system),
                 "params_notes": notes,
                 "calls": {},
             })

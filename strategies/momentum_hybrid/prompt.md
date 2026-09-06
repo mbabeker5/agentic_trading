@@ -51,8 +51,9 @@ Judgment rules, heaviest first:
 Hard limits. Code enforces every one of these before an order exists, you cannot move them,
 and a pick that breaks one is thrown away:
 
-- At most {{entries_per_day_max}} picks in this call, and at most {{max_open_positions}}
-  positions open at once.
+- At most {{max_picks}} picks in this reply, at most {{entries_per_day_max}} new names
+  opened today, and at most {{max_open_positions}} positions open at once. Code trims a
+  reply past {{max_picks}} rather than choosing among them, so put your best first.
 - At most {{max_position_pct}} percent of book equity in any one name, and no single order
   worth more than ${{max_order_notional}}.
 - Stop {{stop_loss_pct}} percent from entry, or the opening range low (the range high for a
@@ -75,12 +76,24 @@ Levels for each pick:
 
 Reply with a single JSON object and nothing else, in exactly this shape:
 
-{"picks":[{"symbol":"ABC","side":"long","entry":9.38,"stop":9.24,"target":9.66,"qty_hint":1000,"rationale":"one sentence"}],"skips":[{"symbol":"XYZ","rationale":"one sentence"}]}
+{"no_action":false,"picks":[{"symbol":"ABC","side":"long","entry":9.38,"stop":9.24,"target":9.66,"qty_hint":1000,"confidence":0.7,"rationale":"one sentence"}],"skips":[{"symbol":"XYZ","rationale":"one sentence"}]}
 
 Every candidate you were handed appears exactly once, in picks or in skips. Every pick and
 every skip carries a one sentence rationale naming the specific thing that decided it.
 Prices are numbers, not strings, rounded to the cent. Keep each rationale to one short
 sentence. If you pick nothing, picks is an empty list and every candidate sits in skips.
+
+`no_action` is your explicit answer that you looked and chose to open nothing. Set it to true
+and leave picks empty. It is not the same as failing to reply, and the ledger records the two
+differently, so use it rather than sending an empty object.
+
+`confidence` is required on every pick: a number from 0 to 1 for how sure you are of that one
+trade. It is read at the end of the month to see whether your confident picks did better than
+your uncertain ones, so a row of 0.9s tells nobody anything. A pick with no confidence, or with
+a confidence outside 0 to 1, is thrown away and written into the ledger as decision_rejected.
+
+`side` has to be exactly the word "long" or the word "short". Anything else, including a blank
+or "buy", throws that pick away. It is never read as a long.
 
 ## SHAPE: manage
 
@@ -115,8 +128,13 @@ minutes; no new entries after {{entries_until}}.
 
 Reply with a single JSON object and nothing else, in exactly this shape:
 
-{"exits":[{"symbol":"ABC","action":"hold","rationale":"one sentence"}]}
+{"no_action":false,"exits":[{"symbol":"ABC","action":"hold","confidence":0.6,"rationale":"one sentence"}]}
 
 One object for every open position you were handed, the ones you are holding included. action is
 exactly one of "hold", "fade" or "exit". Each carries a one short sentence rationale naming the
 specific thing that decided it. No other keys, no other text.
+
+`confidence` is required on every position: a number from 0 to 1 for how sure you are of that
+one call. A row with none, or one outside 0 to 1, is thrown away and written into the ledger as
+decision_rejected. `no_action` set to true with an empty exits list is your explicit answer that
+everything should be left alone.
