@@ -3778,6 +3778,35 @@ def net_by_symbol(rows: dict[tuple[str, str], dict]) -> dict[str, dict]:
     return {symbol: row for symbol, row in out.items() if _number(row.get("position"))}
 
 
+#: What a Gateway that is not there looks like by the time it reaches this file.
+#: ConnectionError covers a refused socket, a reset one and a broken pipe.
+OUTAGE_ERRORS = (ConnectionError, TimeoutError)
+
+#: And the phrases a wrapped one carries. agent/mcp_client.py turns a dead
+#: socket into its own McpError and the exception type is lost on the way, so
+#: the words are read as well as the type. Lower case, matched anywhere in the
+#: message.
+OUTAGE_PHRASES = ("connection refused", "connection reset", "broken pipe",
+                  "not answering", "no connection", "cannot connect",
+                  "connection closed", "timed out", "timeout", "unreachable",
+                  "is not running", "gateway is down")
+
+
+def looks_like_an_outage(exc: BaseException) -> bool:
+    """Is this the Gateway being absent rather than the account being empty?
+
+    The difference is the whole of this rule. A Gateway that is not answering
+    and an account that holds nothing produce the same shape of answer if
+    nobody looks, and reading one as the other is how a twenty minute outage
+    turns into five books halted over a reconciliation mismatch that never
+    happened, and a whole trading day lost.
+    """
+    if isinstance(exc, OUTAGE_ERRORS):
+        return True
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(phrase in message for phrase in OUTAGE_PHRASES)
+
+
 @dataclass
 class BrokerFacts:
     """One read of the shared account, in the shapes the rest of the tick wants.
@@ -3787,6 +3816,10 @@ class BrokerFacts:
     which is what stops a second row for one name being lost, and it is what
     goes into the position snapshot so the history keeps what the account
     actually said.
+
+    available is False when the broker could not be reached at all. That is NOT
+    the same thing as an account holding nothing, and everything downstream has
+    to know which of the two it is looking at.
     """
 
     values: dict = field(default_factory=dict)
@@ -3794,6 +3827,8 @@ class BrokerFacts:
     rows: dict = field(default_factory=dict)
     orders: list = field(default_factory=list)
     problems: list = field(default_factory=list)
+    available: bool = True
+    outage: str = ""
 
 
 def alert_on_guard_files(guards: Guards, now: datetime) -> None:
@@ -3872,25 +3907,111 @@ def read_broker_facts(broker: broker_mod.Broker,
     Read once per tick rather than once per book, because five books asking IB
     Gateway the same three questions in the same second is how a data pacing
     violation happens.
+
+    A failure that looks like the Gateway being absent marks the whole read
+    unavailable rather than being written down as one missing answer. Anything
+    else, a malformed reply or a permission the account does not have, is a
+    problem to note and carry on from.
     """
     facts = BrokerFacts()
-    holdings: dict = {}
-    try:
-        facts.values = broker_mod.account_values(broker, wanted_account)
-    except Exception as exc:                 # noqa: BLE001
-        facts.problems.append(f"could not read the account summary: {exc}")
-    try:
-        holdings = broker.portfolio(wanted_account) or {}
-    except Exception as exc:                 # noqa: BLE001
-        facts.problems.append(f"could not read the positions: {exc}")
-    try:
-        facts.orders = (broker.open_orders(wanted_account) or {}).get("orders", []) or []
-    except Exception as exc:                 # noqa: BLE001
-        facts.problems.append(f"could not read the open orders: {exc}")
+
+    def ask(what: str, call):
+        try:
+            return call()
+        except Exception as exc:             # noqa: BLE001
+            if looks_like_an_outage(exc):
+                facts.available = False
+                if not facts.outage:
+                    facts.outage = f"{what}: {type(exc).__name__}: {exc}"
+            else:
+                facts.problems.append(f"could not read the {what}: {exc}")
+            return None
+
+    facts.values = ask("account summary",
+                       lambda: broker_mod.account_values(broker, wanted_account)) or {}
+    holdings = ask("positions", lambda: broker.portfolio(wanted_account)) or {}
+    answer = ask("open orders", lambda: broker.open_orders(wanted_account)) or {}
+    facts.orders = (answer.get("orders") or []) if isinstance(answer, dict) else []
+
+    if not facts.available:
+        # Nothing came back that can be trusted, so nothing is handed on. An
+        # empty positions map from a dead Gateway is the exact lie this change
+        # exists to stop, and every caller reads facts.available rather than the
+        # emptiness of that dictionary.
+        return facts
 
     facts.rows = positions_by_key(holdings, str(wanted_account or ""))
     facts.positions = net_by_symbol(facts.rows)
     return facts
+
+
+def broker_unavailable_tick(facts: BrokerFacts, books, now: datetime, rules: str,
+                            args) -> int:
+    """The whole tick when IB Gateway did not answer. Nothing is decided, nothing moves.
+
+    THE BUG THIS CLOSES. read_broker_facts() used to catch the connection error,
+    write down that it could not read the positions, and hand reconciliation an
+    EMPTY account. A book that held something then looked exactly like a book
+    that had lost it, so reconciliation called a mismatch, every book holding
+    anything was halted, and nothing anywhere cleared a halt. A twenty minute
+    outage cost the whole trading day.
+
+    So a tick that cannot see the broker does none of it. No reconciliation,
+    because there is nothing to reconcile against. No orders, because an order
+    worked out from facts nobody could read is a guess. And no book file is
+    touched at all: a book carries on believing exactly what it believed before
+    the Gateway went away, which is the only honest thing it can believe.
+
+    The tick still counts as a tick. It returns zero, it writes a row per book
+    saying broker_unavailable, it touches the heartbeat so the dead man's handle
+    knows the loop itself is alive, and the next tick that can see the broker
+    picks up exactly where this one left off.
+    """
+    print(f"\nBROKER UNAVAILABLE: {facts.outage}")
+    print("  No reconciliation, no orders, and no book file is touched. Every book "
+          "carries on believing what it believed before the Gateway went away.")
+    print("  This is NOT an empty account. Reading one as the other is what used to "
+          "halt every book for the rest of the day over a twenty minute outage.")
+
+    lines: list[str] = []
+    for book in books:
+        db_call("record_tick", ts=now, book_id=book.book_id,
+                phase="broker_unavailable", mode=str(book.mode), rules_commit=rules,
+                outcome="broker_unavailable", notes=facts.outage)
+        ledger_writer.log_rule(
+            now, "broker_unavailable", f"{facts.outage} [rules {rules}]",
+            "this book did nothing this tick and its file was left exactly as it was",
+            book_id=book.book_id, dry_run=not args.write_ledger)
+        lines.append(f"{now:%Y-%m-%d %H:%M:%S} {now.tzname()} | book={book.book_id} | "
+                     f"rules={rules} | mode={book.mode} | phase=broker_unavailable | "
+                     f"broker={facts.outage}")
+
+    raise_alert(
+        "error", "IB Gateway is not answering",
+        f"The trading loop could not reach the broker at "
+        f"{now:%Y-%m-%d %H:%M} New York.\n\n{facts.outage}\n\n"
+        "No book was reconciled, no order was worked out, and no book file was "
+        "touched, so nothing has been lost. Every book carries on believing what "
+        "it believed before this started, and the first tick that can see the "
+        "broker again reconciles and carries on.\n\n"
+        "agent/watchdog.py restarts Gateway on its own and will say whether that "
+        "worked. This message is here so a restart that does not take is not "
+        "silent.",
+        key="broker_unavailable", now=now)
+
+    path = write_tick_log(lines)
+    cadence = write_next_tick(300)
+    # The loop is alive even though the broker is not, and the dead man's handle
+    # is asking about the loop. Withholding the heartbeat here would have it
+    # flatten the account over a Gateway outage, which is the opposite of help.
+    beat = touch_heartbeat(now)
+    print("\n" + "=" * 78)
+    for line in lines:
+        print(line)
+    print(f"Tick log {path}")
+    print(f"Next tick wanted in 300 seconds ({cadence})")
+    print(f"Heartbeat {beat}")
+    return 0
 
 
 def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None) -> int:
@@ -3969,6 +4090,10 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
 
     for problem in facts.problems:
         print(f"  note: {problem}")
+
+    if not facts.available:
+        return broker_unavailable_tick(facts, books, now, rules, args)
+
     print(f"\nAccount {account_id}: worth {equity:,.2f}, {len(broker_positions)} "
           f"positions and {len(broker_orders)} working orders across all five books")
 
