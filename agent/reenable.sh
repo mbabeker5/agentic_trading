@@ -7,7 +7,7 @@
 # actually there:
 #
 #   output/LOOP_DISABLED   run_tick.sh refuses to run a tick while this exists.
-#                          Written by agent/kill_switch.sh.
+#                          Written by agent/kill_switch.sh and agent/kill_switch.py.
 #   output/STOP            the loop closes positions but opens none while this
 #                          exists. Written by agent/kill_switch.sh, and by hand
 #                          when you want to pause without stopping the job.
@@ -16,6 +16,14 @@
 #                          overnight, on purpose: a morning that failed its
 #                          checks should need a person to look before the agent
 #                          trades again.
+#
+# It then clears one more file, which is not a brake:
+#
+#   output/deadman_state.json  agent/deadman.py's note saying which silence it
+#                              has already acted on. Starting the agent again is
+#                              starting over, so the note goes with it. Leaving
+#                              it behind is what would make the dead man's handle
+#                              sit out the next incident.
 #
 # It does not restart IB Gateway, reload any launchd job, or re-open any position
 # the kill switch closed. It only removes the brakes.
@@ -38,6 +46,13 @@ for NAME in LOOP_DISABLED STOP NO_TRADE_TODAY; do
     echo "not there  $OUTPUT/$NAME"
   fi
 done
+
+if [[ -f "$OUTPUT/deadman_state.json" ]]; then
+  rm -f "$OUTPUT/deadman_state.json"
+  echo "removed $OUTPUT/deadman_state.json (the dead man's handle starts over)"
+else
+  echo "not there  $OUTPUT/deadman_state.json"
+fi
 
 echo
 if [[ $REMOVED -eq 0 ]]; then
