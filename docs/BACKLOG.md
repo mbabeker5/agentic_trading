@@ -16,3 +16,12 @@ Improvements ranked by how much risk they remove, highest first. Operational ite
 | 9 | Holiday calendar in guardrails | Loop treats a market holiday as a trading day | operational | queued |
 | 10 | Consolidated quote feed ($10 IBKR bundle) | Pricing limit orders off a fifth of the market | data, Mo's call | proposed |
 | 11 | Second free data source for Congress trades | Single volunteer-run mirror going stale | data | proposed |
+
+## Research gaps (from the momentum spec critique, 2026-09-06)
+
+| Rank | Item | Why it matters | Type | Status |
+|---|---|---|---|---|
+| R1 | Second literature pass on opening-range results: the published work traces to one research group with no independent replication or post-2023 out-of-sample test | The strategy's edge rests on it | research | open |
+| R2 | Rerun the Congress-trades research with sources that are not script-rendered or rate-limited before any of its figures are used | Unverified numbers in the spec | research | open |
+| R3 | Check commission and fee figures in the execution review against IBKR's live schedule | Cost model may be off | research | open |
+| R4 | Confirm on Tuesday 2026-09-08 whether scanner filters and real-time quotes reach the paper account after the subscription purchase | Everything downstream depends on it | research | scheduled 9:36 and 9:46 AM ET |
