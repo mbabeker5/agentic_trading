@@ -62,6 +62,78 @@
 # The code that reads this file is load_books() and load_book_guardrails() in
 # /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py
 
+# ---------------------------------------------------------------------------
+# THE GO LIVE RAMP (Mo's decision D4, 2026-09-06)
+# ---------------------------------------------------------------------------
+#
+# Mo said he would go live immediately if month one succeeds. This is the
+# responsible version of immediately: real money, from the first day, in an
+# amount too small to hurt while the machine is still proving itself.
+#
+# A book that goes live climbs this ladder one rung at a time. Each rung is 10
+# COMPLETED TRADING SESSIONS at that fraction of the intended size, and a rung
+# is only climbed by Mo editing ramp_step below by hand. No code promotes a
+# book, exactly as no code promotes one from dry_run to tiny to full.
+#
+#   ramp_step 1   10 percent of intended size, for 10 sessions
+#   ramp_step 2   25 percent, for 10 sessions
+#   ramp_step 3   50 percent, for 10 sessions
+#   ramp_step 4   full size
+#
+# Thirty sessions of climbing is about six weeks of live money before a book
+# reaches full size.
+#
+# GOING BACK DOWN IS NOT A HAND EDIT. Any one of these sends the book straight
+# back to paper, not down a rung, and it stays there until Mo has read what
+# happened and put it back himself:
+#
+#   - any guardrail cap was breached
+#   - any position could not be reconciled
+#   - the loop crashed while holding a position
+#   - the daily loss cap was hit twice in five sessions
+#   - drawdown went past 8 percent
+#   - measured live slippage came in at more than twice what paper showed
+#
+# The last one is why the ledger's slippage columns matter: without them that
+# trigger cannot be measured and the ramp is being climbed blind.
+live_ramp:
+  steps:                         # fraction of intended size, per rung
+    1: 10
+    2: 25
+    3: 50
+    4: 100
+  sessions_per_step: 10          # completed trading sessions before the next rung
+  demote_to_paper_on:            # any one of these, and the book goes back to paper
+    - cap_breach
+    - unreconciled_position
+    - crash_holding_a_position
+    - two_daily_cap_hits_in_five_sessions
+    - drawdown_over_8_pct
+    - live_slippage_over_twice_paper
+
+# ---------------------------------------------------------------------------
+# IBKR'S OWN ORDER PRECAUTIONS (Mo's decision D6, 2026-09-06)
+# ---------------------------------------------------------------------------
+#
+# IB Gateway has its own limits on order size and value, separate from ours.
+# Two reviewers disagreed about them: one wanted them bypassed for API orders so
+# that this project's caps are the only gate, the other wanted them kept. Mo
+# kept them.
+#
+# So: NEVER bypass IBKR's precautions for API orders. Set each of them just
+# ABOVE the matching cap in config/guardrails.yaml, so ours always bites first
+# and IBKR's is the second layer underneath. Two layers are cheaper than one
+# mistake, and a rejection from IBKR is a loud signal that our own cap has been
+# worked around somehow.
+#
+# A precaution rejection is not a quiet failure to be retried. It goes to the
+# alerts as an incident, because by the time IBKR is the thing saying no,
+# something upstream has already gone wrong.
+#
+# The settings live in IB Gateway's own configuration, in
+# /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/ibc.ini,
+# and are set when a live account is first funded, not before.
+
 shared:
   account_id: DUT077572          # the one IBKR paper account all five books
                                  # share. Paper account ids start with DU.
@@ -91,6 +163,8 @@ books:
     enabled: true
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
+    ramp_step:                   # empty until this book trades real money. See
+                                 # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
     rules_commit: 273e928          # the git hash of the rules this book runs
     rules_commit_note: >-
@@ -113,6 +187,8 @@ books:
     enabled: true
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
+    ramp_step:                   # empty until this book trades real money. See
+                                 # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
     rules_commit: 273e928          # the git hash of the rules this book runs
     rules_commit_note: >-
@@ -134,6 +210,8 @@ books:
     enabled: true
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
+    ramp_step:                   # empty until this book trades real money. See
+                                 # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
     rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
@@ -153,6 +231,8 @@ books:
     enabled: true
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
+    ramp_step:                   # empty until this book trades real money. See
+                                 # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
     rules_commit:                # and the git hash of the rules it approved
     start_date: 2026-09-08
@@ -171,6 +251,8 @@ books:
     enabled: true
     mode: dry_run                # dry_run, tiny or full. See the note at the
                                  # top of this file. Promotion is a hand edit.
+    ramp_step:                   # empty until this book trades real money. See
+                                 # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
     rules_commit: 273e928          # the git hash of the rules this book runs
     rules_commit_note: >-

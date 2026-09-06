@@ -5,7 +5,7 @@ Improvements ranked by how much risk they remove, highest first. Operational ite
 | Rank | Item | Risk it removes | Type | Status |
 |---|---|---|---|---|
 | 0 | Loop follow-on from the replay gate: fill ingestion from broker executions into book state, sector and halt and cross-book fields filled on every intent, no re-send while an order is working, alerts from the loop, Gateway outage handled without a false halt, halts clearable, orphan positions alert, 10197 and delayed data visible, halt reason bounded | Gate found nine bugs; no book can trade until fixed | operational | queued behind Momentum v2 |
-| 0a | DECISION for Mo: books sharing a strategy (A, B, E) collide under one-ticker-one-book. Either attribute fills per order reference and allow shared symbols, or give shared-strategy books an allocation rule | Eval comparison between A, B and E is meaningless if only A ever gets the top names | decision | open |
+| 0a | Books sharing a strategy (A, B, E) collided under one-ticker-one-book | Eval comparison between A, B and E is meaningless if only A ever gets the top names | decision | DECIDED by the hub 2026-09-06: shared symbols are allowed, attribution is by order reference, and reconciliation now compares the broker's net position per symbol against the sum across books. Mo can overturn it; see journal/2026-09-06.md |
 | 1 | Replay harness as the promotion gate (full five-book loop against recorded data with a fake broker) | Shipping a loop that breaks on its first live day | operational | shipped b5571ca; first run 6 pass 6 fail, see item 0 |
 | 2 | Reconciliation on every tick with per-book halt | Trading a book against the wrong picture of what it holds | operational | shipped (reconcile.py, loop) |
 | 3 | Watchdog with Gateway restart and Mo alert | Silent multi-day outage, seen 2026-09-03 to 09-06 | operational | shipped, launchd job not yet loaded |
@@ -19,6 +19,8 @@ Improvements ranked by how much risk they remove, highest first. Operational ite
 | 9 | Holiday calendar in guardrails | Loop treats a market holiday as a trading day | operational | queued |
 | 10 | Consolidated quote feed ($10 IBKR bundle) | Pricing limit orders off a fifth of the market | data, Mo's call | proposed |
 | 11 | Second free data source for Congress trades | Single volunteer-run mirror going stale | data | proposed |
+| 12 | Go live ramp (Mo's decision D4, 2026-09-06): 10 percent of intended size for 10 sessions, then 25, then 50, then full, with an automatic drop back to paper on a cap breach, an unreconciled position, a crash holding a position, two daily cap hits in five sessions, drawdown over 8 percent, or live slippage above twice paper | Going live at full size on a machine that has never handled real money | operational | ladder and demotion triggers written into config/books.yaml as `live_ramp` and a per book `ramp_step`; the code that enforces the session count and the demotion triggers is NOT built |
+| 13 | IBKR order precautions (Mo's decision D6, 2026-09-06): never bypass them for API orders, set each just above the matching cap in config/guardrails.yaml, and raise a precaution rejection as an alert rather than retrying it | One layer of caps instead of two | operational | decision recorded in config/books.yaml; the Gateway settings themselves are set when a live account is first funded |
 
 ## Research gaps (from the momentum spec critique, 2026-09-06)
 
@@ -28,3 +30,19 @@ Improvements ranked by how much risk they remove, highest first. Operational ite
 | R2 | Rerun the Congress-trades research with sources that are not script-rendered or rate-limited before any of its figures are used | Unverified numbers in the spec | research | open |
 | R3 | Check commission and fee figures in the execution review against IBKR's live schedule | Cost model may be off | research | open |
 | R4 | Confirm on Tuesday 2026-09-08 whether scanner filters and real-time quotes reach the paper account after the subscription purchase | Everything downstream depends on it | research | scheduled 9:36 and 9:46 AM ET |
+
+## Dated reminders
+
+Things that are not due yet and must not be forgotten. Each one has a date it
+becomes live, and nothing here is actionable before that date.
+
+| Due | Item | Why the date | Status |
+|---|---|---|---|
+| 2027-03-01 | **Section 475(f) election, mark to market accounting.** Talk to a trader tax CPA about whether to make the election for the 2027 tax year, and file it if the answer is yes (Mo's decision D8, 2026-09-06). | The election has to be filed by the due date of the prior year's return, WITHOUT extensions, and it CANNOT be made retroactively. Miss the date and the earliest it can apply is the year after. 1 March leaves a working month before the usual mid-April deadline, which is enough time to find a CPA who does this and to change your mind. | not due yet |
+
+Two facts to hand the CPA, both from the momentum spec critique of 2026-09-06:
+short term gains are taxed as ordinary income, and wash sale rules bite across
+the year end, which is exactly what a day trading book generates. The election
+is the thing that turns both of those off, at the cost of giving up capital gain
+treatment entirely. It is a real decision with real downside, not a formality,
+which is why it gets a CPA and not a search engine.
