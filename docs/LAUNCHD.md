@@ -84,11 +84,25 @@ environment exists.
 
 ## The schedule
 
-Every five minutes from 09:25 to 16:05, Monday to Friday, plus three extra wake
-ups a day for the filing sweeps. That is 84 wake ups a day and 420 entries in
-the file, one for each time on each weekday.
+Every five minutes from 09:25 to 16:05, Monday to Friday, every minute from
+09:00 to 09:26 for the pre-open run, plus three extra wake ups a day for the
+filing sweeps. That is 110 wake ups a day and 550 entries in the file, one for
+each time on each weekday. The two morning grids overlap at 09:25 and it is
+written once, which is why the pre-open half hour adds 26 entries rather than
+27.
 
-09:25 rather than 09:30 on purpose: the first wake up of the day happens five
+The pre-open minutes are there for a pacing rule rather than for tidiness.
+`agent/preopen.py` pulls each new candidate's history at no more than four
+requests a minute, and IB Gateway allows about sixty historical requests in any
+ten minutes. Twenty seven wake ups between 09:00 and 09:26 pay for about a
+hundred requests, which is what the morning needs, and every one of them is
+spent before the open rather than in the five minutes around it, where the data
+budget is scarcest and where the pick is made. A tick lasts a second or two, so
+waking every minute cannot overrun the four a minute rule. Waking every five
+minutes buys about a fifth of what the morning needs, which is what was
+happening until 2026-09-06. See `docs/PREOPEN_FLOW.md`.
+
+09:25 rather than 09:30 on purpose: the first wake up of the trading grid is five
 minutes before the market opens, so if IB Gateway is down or the MCP server
 needs restarting, that shows up in the log before it costs anything. It ends at
 16:05 rather than 16:00 because the tick at or after the close is the one that

@@ -20,6 +20,14 @@ AGENTIC_TRADING_ROOT = {ROOT}
 # The two morning filing sweeps.
 at 07:00 on weekdays
 at 07:30 on weekdays
+# The pre-open half hour, every single minute. This is the pacing rule and not a
+# preference: agent/preopen.py may send four historical requests a minute and a
+# tick is over in a second or two, so a tick can never send more than four.
+# Twenty seven wake ups between 09:00 and 09:26 pay for about a hundred
+# requests, which is what the morning needs. Five minute wake ups pay for about
+# twenty, and most of the candidate list would reach 09:35 with nothing behind
+# it. See docs/PREOPEN_FLOW.md.
+every 1 minute from 09:00 to 09:26 on weekdays
 # The trading day itself. 09:25 is five minutes before the open, so the first
 # tick has already checked Gateway and the MCP server before anything matters.
 # It ends at 16:05 rather than 16:00 because the tick at or after the close is
@@ -34,8 +42,19 @@ The five minute trading loop, run by launchd. One wake up is one tick for all
 five books in config/books.yaml.
 
 It runs {ROOT}/agent/run_tick.sh every five minutes from 09:25 to 16:05, Monday
-to Friday, plus three extra times a day for the filing sweeps. That is 84 wake
-ups a day and 420 entries below.
+to Friday, every minute from 09:00 to 09:26 for the pre-open run, plus three
+extra times a day for the filing sweeps. That is 110 wake ups a day and 550
+entries below. 09:25 falls in both morning grids and is written once, which is
+why the two grids add 26 rather than 27.
+
+The pre-open minutes are the reason this job is not simply a five minute grid.
+agent/preopen.py pulls each new candidate's history at no more than four
+requests a minute, and IB Gateway allows about sixty historical requests in any
+ten minutes. Spending that budget between 09:00 and 09:26 means it is not being
+spent in the five minutes around the open, where it is scarcest and where the
+pick is made. A tick lasts a second or two, so waking every minute cannot
+overrun the pacing rule; waking every five minutes buys about a fifth of what
+the morning needs.
 
 The three extra times, and which book each is for:
 

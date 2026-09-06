@@ -88,7 +88,9 @@ PROJECT_LINE = 'PROJECT="${AGENTIC_TRADING_ROOT:-$(cd "$(dirname "$0")/.." && pw
 
 #: How many times a week each generated job should wake up.
 EXPECTED_WAKE_UPS = {
-    "tick": 420,        # 84 a day, Monday to Friday
+    "tick": 550,        # 110 a day, Monday to Friday: 84 plus the 26 pre-open
+                        # minutes from 09:00 to 09:26 that are not already on
+                        # the five minute grid (09:25 is on both)
     "watchdog": 533,    # 97 a weekday, 24 a weekend day
     "preflight": 5,     # one a weekday
     "recorder": 405,    # 81 a day, Monday to Friday
@@ -356,6 +358,38 @@ def test_the_generator_writes_plists_that_parse(tmp_path):
         assert loaded["EnvironmentVariables"]["AGENTIC_TRADING_ROOT"] == str(REPO)
         assert loaded["WorkingDirectory"] == str(REPO)
     assert counts == EXPECTED_WAKE_UPS
+
+
+def test_the_tick_job_wakes_every_minute_through_the_pre_open():
+    """09:00 to 09:26, every minute, on every weekday, and none on the weekend.
+
+    agent/preopen.py may send four historical requests a minute and a tick is
+    over in a second or two, so a tick can never send more than four. Twenty
+    seven wake ups pay for about a hundred requests, which is what the morning
+    needs; five minute wake ups pay for about twenty. This is the launchd half
+    of that, and it is the half that was missing until 2026-09-06.
+    """
+    loaded = plistlib.loads(
+        (REPO / "config" / "launchd"
+         / "com.mtalib.agentic-trading.tick.plist").read_bytes())
+    entries = loaded["StartCalendarInterval"]
+
+    for weekday in (1, 2, 3, 4, 5):
+        minutes = {(e["Hour"], e["Minute"]) for e in entries
+                   if e["Weekday"] == weekday}
+        wanted = {(9, minute) for minute in range(0, 27)}
+        assert wanted <= minutes, (
+            f"weekday {weekday} is missing "
+            f"{sorted(f'09:{m:02d}' for _, m in wanted - minutes)}")
+
+    weekend = [e for e in entries if e["Weekday"] in (0, 6)]
+    assert weekend == [], "the market is shut at the weekend"
+
+    # One entry per minute, never two. The five minute grid also carries 09:25,
+    # and expand_schedule() drops the duplicate rather than firing twice.
+    monday = [(e["Hour"], e["Minute"]) for e in entries if e["Weekday"] == 1]
+    assert len(monday) == len(set(monday))
+    assert len(monday) == 110
 
 
 def test_the_files_on_disk_match_the_templates():

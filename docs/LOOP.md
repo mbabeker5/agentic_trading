@@ -373,11 +373,13 @@ Checked against the live MCP server on 2026-09-06: the snapshot it returns holds
 
 It tracks the one paper account all five books share, so a day is a day and not a day per book. Each book's own end of day figures go to the Rules Log, which does have a book column and which the Books tab slices on. The one account level line is written once, after every book has had its turn.
 
-### The pre-open wants waking every minute, and launchd wakes it every five
+### The pre-open wakes every minute now, which it did not until 2026-09-06
 
-`agent/preopen.py` is now driven by the loop: 09:00 to 09:30 is a phase of its own, `preopen`, and books A, B and E share the one run exactly as they share the one scanner run. What is not done is the launchd side. The pacing rule is four historical requests a minute, and a tick is over in a second or two, so a tick can never send more than four. Twenty six wake ups between 09:00 and 09:26 pays for about a hundred requests, which is what the morning needs. Five minute wake ups pay for about twenty, and most of the candidate list would reach 09:35 with nothing behind it.
+`agent/preopen.py` is driven by the loop: 09:00 to 09:30 is a phase of its own, `preopen`, and books A, B and E share the one run exactly as they share the one scanner run. The launchd side was the missing half and is now done. The pacing rule is four historical requests a minute, and a tick is over in a second or two, so a tick can never send more than four. Twenty seven wake ups between 09:00 and 09:26 pay for about a hundred requests, which is what the morning needs. Five minute wake ups paid for about twenty, and most of the candidate list reached 09:35 with nothing behind it.
 
-So the launchd job for that half hour has to fire every minute rather than every five. That is a change to `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.tick.plist` and to the generator that writes it, which belongs to whoever owns the launchd jobs. Until it is made, the pre-open gathers roughly a fifth of what it should, and the 09:35 scanner falls back to working the numbers out from daily bars, which is slower and spends the data budget at the worst moment of the day. Nothing breaks; the morning is just less prepared than it should be.
+`every 1 minute from 09:00 to 09:26 on weekdays` is now a line in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/tick.template`, so `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py` writes it into `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.tick.plist`. The job went from 84 wake ups a day to 110, and from 420 entries to 550: the pre-open half hour adds 26 rather than 27 because 09:25 is already on the five minute grid and the generator drops the duplicate. `test_the_tick_job_wakes_every_minute_through_the_pre_open` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_paths.py` checks every one of those minutes is there on every weekday.
+
+Nothing has been loaded. Writing the file is not the same as running it, and `scripts/gen_launchd.py --install` is still a separate, deliberate step.
 
 ### Holidays are known to the day trade counter and to nothing else
 
