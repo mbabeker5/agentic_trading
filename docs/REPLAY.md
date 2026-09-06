@@ -311,14 +311,16 @@ loop keeps shut, which is fine: it will not build an entry outside the entry
 window, it will not build one while the stop file is there, and it sizes every
 entry through `max_shares_for` so it cannot ask for more than the caps allow.
 
-The third pile is the one to read. As of 2026-09-06 seven rules can only be
-reached by a probe because the fact each of them checks is a field the loop
-never fills, and every one of those fields defaults to a value meaning all
-clear:
+The third pile is the one to read. The list below was seven rules when it was
+written; `symbol_exclusive` left it when the hub stopped it refusing anything,
+and it is back in `GUARDRAIL_RULE_IDS` now that `universe.symbol_exclusive` in
+`config/guardrails.yaml` decides whether it refuses or reports. The six that
+remain can only be reached by a probe because the fact each of them checks is a
+field the loop never fills, and every one of those fields defaults to a value
+meaning all clear:
 
 | Rule | Reads | Set by |
 |---|---|---|
-| `symbol_exclusive` | `AccountState.symbols_held_elsewhere`, which the loop now fills | reports only. It stopped refusing anything on 2026-09-06, when the hub decided two books may share a ticker. Per symbol reconciliation is what catches a real disagreement now |
 | `halted` | `OrderIntent.halted`, `OrderIntent.limit_state` | nothing |
 | `weekly_loss_cap` | `AccountState.week_pnl` | nothing |
 | `monthly_loss_cap` | `AccountState.month_pnl` | nothing |
@@ -328,7 +330,7 @@ clear:
 
 They work when a probe hands them the facts. They cannot fire in production
 however the day goes. What looks like twenty seven guardrails is twenty, and one
-of the seven is worse than dormant: `sector_cap` refuses any entry whose
+of the six is worse than dormant: `sector_cap` refuses any entry whose
 industry it was not told, so with nothing setting `OrderIntent.sector` it
 currently refuses every entry every momentum book works out. The clean day
 scenario reports any rule that refused ten or more orders as a stopped machine

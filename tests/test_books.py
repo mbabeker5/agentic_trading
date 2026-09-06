@@ -1637,16 +1637,52 @@ def noted_rule_ids(decision) -> list[str]:
     return [note.split(":", 1)[0] for note in decision.notes]
 
 
-# --- Two books in one ticker: allowed, and written down ---------------------
+# --- Two books in one ticker: a switch, and both sides of it ----------------
+#
+# universe.symbol_exclusive decides, and Mo has not. True is the default and is
+# what config/guardrails.yaml says today: one ticker, one book, and the second
+# book's entry is refused. False is what commit 03e5318 did: they may share, and
+# the rule reports instead. Both branches are tested below, and nothing here
+# picks one.
 
 
-def test_an_entry_in_a_name_another_book_holds_is_allowed_and_noted():
-    """Book B has AAPL. Book A gets in anyway, and the decision says so.
+def sharing_allowed(guard):
+    """The same book with universe.symbol_exclusive turned off."""
+    return dataclasses.replace(
+        guard,
+        universe=dataclasses.replace(guard.universe, symbol_exclusive=False),
+    )
 
-    This is the hub's decision of 2026-09-06 in one test. Before that afternoon
-    this order came back refused with symbol_exclusive in rule_ids.
-    """
+
+def test_the_default_in_the_settings_file_is_one_ticker_one_book():
+    """Nobody has to remember to write the key. Left out, it comes back true."""
+    for book_id in ("A", "B", "C", "D", "E"):
+        guard = load_book_guardrails(BOOKS_YAML, book_id)
+        assert guard.universe.symbol_exclusive is True, book_id
+
+
+def test_an_entry_in_a_name_another_book_holds_is_refused_by_default():
+    """Book B has AAPL, so book A may not open in it. The hub's standing rule."""
     momentum = load_book_guardrails(BOOKS_YAML, "A")
+    decision = check_order(
+        momentum,
+        state_with_others("A", {"AAPL": "B"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert decision.allowed is False, decision.summary
+    assert "symbol_exclusive" in decision.rule_ids
+    assert decision.notes == []
+
+    reason = decision.reasons[decision.rule_ids.index("symbol_exclusive")]
+    assert "Book B" in reason, "the refusal has to name the other book"
+    assert "AAPL" in reason
+    assert "symbol_exclusive" in reason, "it has to say which setting turns it off"
+    assert reason.endswith(".") and len(reason.split()) >= 6, reason
+
+
+def test_with_the_switch_off_the_same_entry_is_allowed_and_noted():
+    """The other branch, whole. This is exactly what commit 03e5318 did."""
+    momentum = sharing_allowed(load_book_guardrails(BOOKS_YAML, "A"))
     decision = check_order(
         momentum,
         state_with_others("A", {"AAPL": "B"}),
@@ -1663,8 +1699,8 @@ def test_an_entry_in_a_name_another_book_holds_is_allowed_and_noted():
 
 
 def test_the_note_never_touches_whether_the_order_was_allowed():
-    """A note is not a refusal, so nothing that counts refusals can see it."""
-    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    """With the switch off a note is not a refusal, so nothing counting refusals sees it."""
+    momentum = sharing_allowed(load_book_guardrails(BOOKS_YAML, "A"))
     decision = check_order(
         momentum,
         state_with_others("A", {"AAPL": "B"}),
@@ -1679,7 +1715,7 @@ def test_the_note_never_touches_whether_the_order_was_allowed():
 
 def test_a_note_rides_along_beside_a_real_refusal_without_becoming_one():
     """Book B has AAPL and the order is also on the blacklist. One refusal, one note."""
-    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    momentum = sharing_allowed(load_book_guardrails(BOOKS_YAML, "A"))
     blacklisted = dataclasses.replace(
         momentum,
         universe=dataclasses.replace(momentum.universe, blacklist=("AAPL",)),
@@ -1695,22 +1731,36 @@ def test_a_note_rides_along_beside_a_real_refusal_without_becoming_one():
     assert noted_rule_ids(decision) == ["symbol_exclusive"]
 
 
+def test_both_branches_leave_the_other_twenty_six_rules_alone():
+    """Flipping the switch changes this rule and nothing else about the order."""
+    strict = load_book_guardrails(BOOKS_YAML, "A")
+    loose = sharing_allowed(strict)
+    order = buy("A", symbol="MSFT", qty=10, limit_price=50.0)
+    nobody_else = state_with_others("A", {"AAPL": "B"})
+
+    assert check_order(strict, nobody_else, order).allowed is True
+    assert check_order(loose, nobody_else, order).allowed is True
+    assert check_order(strict, nobody_else, order).notes == []
+
+
 def test_getting_out_of_our_own_position_is_never_affected_by_this_rule():
     """Book A holds AAPL and book B has it too. A may still sell its own out.
 
-    This was true while the rule refused orders and it is still true now. An
-    exit, a stop and a flatten all go through, and none of them is even worth a
-    note, because leaving a name says nothing about who else is in it.
+    True under both settings, and that is the point: refusing to close is its
+    own kind of risk. An exit, a stop and a flatten all go through, and none of
+    them is even worth a note, because leaving a name says nothing about who
+    else is in it.
     """
-    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    strict = load_book_guardrails(BOOKS_YAML, "A")
     state = state_with_others(
         "A", {"AAPL": "B"}, positions={"AAPL": position("AAPL", 100, 50.0)}
     )
-    for purpose in ("exit", "stop", "flatten"):
-        decision = check_order(momentum, state, closing("A", "AAPL", 100, purpose))
-        assert decision.allowed is True, (purpose, decision.summary)
-        assert "symbol_exclusive" not in decision.rule_ids
-        assert decision.notes == [], (purpose, decision.notes)
+    for guard in (strict, sharing_allowed(strict)):
+        for purpose in ("exit", "stop", "flatten"):
+            decision = check_order(guard, state, closing("A", "AAPL", 100, purpose))
+            assert decision.allowed is True, (purpose, decision.summary)
+            assert "symbol_exclusive" not in decision.rule_ids
+            assert decision.notes == [], (purpose, decision.notes)
 
 
 def test_an_entry_in_a_name_no_other_book_has_goes_straight_through():
@@ -1751,7 +1801,7 @@ def test_a_book_is_never_reported_against_its_own_row_in_the_map():
 
 def test_the_map_of_other_books_is_read_however_it_is_typed():
     """Symbols and book ids are tidied the same way they are everywhere else."""
-    momentum = load_book_guardrails(BOOKS_YAML, "A")
+    momentum = sharing_allowed(load_book_guardrails(BOOKS_YAML, "A"))
     decision = check_order(
         momentum,
         state_with_others("A", {" aapl ": " b "}),
@@ -1759,6 +1809,15 @@ def test_the_map_of_other_books_is_read_however_it_is_typed():
     )
     assert decision.allowed is True, decision.summary
     assert "Book B" in note_for(decision, "symbol_exclusive")
+
+    strict = load_book_guardrails(BOOKS_YAML, "A")
+    refused = check_order(
+        strict,
+        state_with_others("A", {" aapl ": " b "}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert refused.allowed is False
+    assert "symbol_exclusive" in refused.rule_ids
 
 
 def test_a_nonsense_entry_in_the_map_of_other_books_is_refused_at_the_door():
@@ -1881,15 +1940,23 @@ def test_a_halt_flag_that_is_neither_true_nor_false_is_refused_at_the_door():
 def test_the_two_rule_ids_added_that_day_still_have_something_to_say():
     """One scenario each, so neither of them can quietly stop working.
 
-    They no longer do the same thing. halted refuses. symbol_exclusive was
-    retired as a refusal by the hub on 2026-09-06 and now only reports, so what
-    is checked here is that it still notices and still writes a readable
-    sentence, and that it lets the order through.
+    halted always refuses. symbol_exclusive does whichever the setting says, so
+    both of its shapes are checked here: that it refuses with the switch on, and
+    that with the switch off it still notices, still writes a readable sentence,
+    and lets the order through.
     """
     momentum = load_book_guardrails(BOOKS_YAML, "A")
 
-    reporting = check_order(
+    refusing = check_order(
         momentum,
+        state_with_others("A", {"AAPL": "B"}),
+        buy("A", symbol="AAPL", qty=10, limit_price=50.0),
+    )
+    assert refusing.allowed is False, refusing.summary
+    assert "symbol_exclusive" in refusing.rule_ids
+
+    reporting = check_order(
+        sharing_allowed(momentum),
         state_with_others("A", {"AAPL": "B"}),
         buy("A", symbol="AAPL", qty=10, limit_price=50.0),
     )
@@ -1908,5 +1975,6 @@ def test_the_two_rule_ids_added_that_day_still_have_something_to_say():
     # not a code.
     for sentence in (
         blocking.reasons + blocking.notes + reporting.reasons + reporting.notes
+        + refusing.reasons + refusing.notes
     ):
         assert sentence.endswith(".") and len(sentence.split()) >= 6, sentence

@@ -434,6 +434,14 @@ class UniverseConfig:
     companies, warrants, rights, preferred shares, anything traded over the
     counter or listed abroad, and anything halted right now. The scanner applies
     them; they are written here so a book's whole universe reads in one place.
+
+    symbol_exclusive is the one ticker, one book rule, and it is a switch
+    because Mo has not decided. True, which is the default and what
+    config/guardrails.yaml says today, means no two books may be in the same
+    name at once and the second book's entry is refused. False means they may,
+    and the rule reports rather than refuses. Both branches are real, both are
+    tested, and neither is chosen here: see _check_symbol_exclusivity below for
+    the argument on each side.
     """
 
     price_floor: float
@@ -459,6 +467,7 @@ class UniverseConfig:
     exclude_preferred: bool = True
     require_us_primary_listing: bool = True
     exclude_halted: bool = True
+    symbol_exclusive: bool = True
 
 
 @dataclass(frozen=True)
@@ -1537,6 +1546,12 @@ def _build_universe(raw: dict, where: str) -> UniverseConfig:
         ),
         exclude_halted=_optional_bool(
             raw, "universe.exclude_halted", where, default=True
+        ),
+        # One ticker, one book. True by default because that is the hub's
+        # standing instruction and because a settings file written before this
+        # switch existed should get the careful answer rather than the loose one.
+        symbol_exclusive=_optional_bool(
+            raw, "universe.symbol_exclusive", where, default=True
         ),
     )
 
@@ -2963,46 +2978,45 @@ def _opens_or_increases_position(state: AccountState, intent: OrderIntent) -> bo
 def _check_symbol_exclusivity(
     g: Guardrails, state: AccountState, intent: OrderIntent, decision: Decision
 ) -> None:
-    """Say so when another book is already in this name. Refuse nothing.
+    """One ticker, one book, or not. universe.symbol_exclusive decides.
 
-    RETIRED AS A BLOCKING RULE, 2026-09-06. Two books may now hold the same
-    ticker at the same time. This rule no longer refuses anything: it writes a
-    note on the decision and lets the order through.
+    A SWITCH RATHER THAN A DECISION, because Mo has not made one. Two people
+    have now disagreed about this in writing on the same day, both with a real
+    argument, and neither of them is Mo. So both answers are built, both are
+    tested, and the setting says which is in force.
 
-    The history, so it can be argued with later. The review team raised
-    cross-book symbol exclusivity on 2026-09-06 as a blocking finding, and it was
-    put in the same day: IBKR nets positions by symbol inside the one shared
-    paper account, so if book A is long 100 AAPL and book B buys 100 more, the
-    broker reports one line of 200 shares and cannot say whose is whose. The hub
-    overturned it the same day, for two reasons.
+        universe.symbol_exclusive: true    the default, and what
+                                           config/guardrails.yaml says today.
+                                           No two books may be in the same name
+                                           at once, and the second book's entry
+                                           is REFUSED.
+        universe.symbol_exclusive: false   they may. The rule writes a note and
+                                           refuses nothing, which is exactly
+                                           what commit 03e5318 did.
 
-    First, attribution never actually needed exclusivity. Every order already
-    carries an orderRef tag naming the book that sent it, and every book keeps
-    its own position record, so a fill can always be traced home. What the
-    broker's single netted line cannot do on its own, those two together can.
+    The case for true, which is the hub's standing instruction. IBKR nets
+    positions by symbol inside the one shared paper account, so if book A is
+    long 100 AAPL and book B buys 100 more, the broker reports one line of 200
+    shares. Keeping one ticker to one book means the account's own line and the
+    book's own line are the same number, and no arithmetic stands between a
+    position and knowing whose it is.
 
-    Second, forbidding it would throw away the signal the month is meant to
-    measure. Two independent strategies picking the same name on the same
-    morning is agreement, and agreement is exactly the thing worth counting.
+    The case for false, which the hub argued on 2026-09-06. Attribution never
+    needed exclusivity: every order carries an orderRef tag naming its book and
+    every book keeps its own position record, so a fill can be traced home
+    without it. And forbidding it throws away the signal month one exists to
+    measure, because books A, B and E run the same strategy on the same
+    shortlist and two of them picking the same name is agreement, not a clash.
 
-    What replaced it is in agent/reconcile.py, which now checks per SYMBOL
-    rather than per book: for each ticker, the broker's net position has to equal
-    the sum of what every book believes it holds in that ticker. If those
-    disagree, every book holding that ticker halts, and a book holding nothing in
-    it carries on.
+    Either way agent/reconcile.py checks per SYMBOL rather than per book: for
+    each ticker, the broker's net position has to equal the sum of what every
+    book believes it holds. That check is what actually catches a real
+    disagreement, and it is right under both settings. Under true it should
+    never see a shared ticker at all; under false it is the only thing that can.
 
-    The rule id stays alive on purpose. It still names a real fact about the
-    account, and the ledger can still count how often two books landed in one
-    name, which is the number month one wants. Note that the replay gate's list
-    in agent/replay/scenarios.py still expects this id to appear on a REFUSAL, so
-    that list needs a line moved before its rule id check passes again.
-
-    Mo can overturn this. Turning the block back on is one edit: swap
-    decision.note for decision.add in the call below, and the refusal returns
-    exactly as it was.
-
-    Getting out was never blocked by this rule and still is not. An exit, a stop
-    or a flatten goes through untouched.
+    Getting out is never blocked by this rule under either setting. An exit, a
+    stop or a flatten goes through untouched, and so does an order that only
+    reduces a position.
     """
     owner = state.symbol_owner(intent.symbol)
     if owner is None:
@@ -3022,15 +3036,32 @@ def _check_symbol_exclusivity(
     if intent.purpose != "entry" and not _opens_or_increases_position(state, intent):
         return
 
+    both_in_it = (
+        f"Book {owner} already holds {intent.symbol} or has a working order in it, "
+        f"and {_pot_words(g.book_id)} is opening a position in it as well."
+    )
+
+    if g.universe.symbol_exclusive:
+        decision.add(
+            "symbol_exclusive",
+            f"{both_in_it} One ticker belongs to one book at a time, so this "
+            "order is refused and the name stays with the book that got there "
+            "first, which is whichever comes first in config/books.yaml. IBKR "
+            "nets positions by symbol inside the one shared paper account, so "
+            "two books in one name means the account's own line is a sum rather "
+            "than an answer. Set universe.symbol_exclusive to false in "
+            "config/guardrails.yaml to allow it. Getting out of a position is "
+            "never blocked by this.",
+        )
+        return
+
     decision.note(
         "symbol_exclusive",
-        f"Book {owner} already holds {intent.symbol} or has a working order in it, "
-        f"and {_pot_words(g.book_id)} is opening a position in it as well. Two "
-        "books in one ticker has been allowed since 2026-09-06. Nothing is "
-        "refused here. The orderRef tag on every order and each book's own "
-        "position record are what keep the two apart inside the netted account, "
-        "and agent/reconcile.py checks the ticker as a whole by adding up what "
-        "every book holding it believes.",
+        f"{both_in_it} universe.symbol_exclusive is false, so nothing is refused "
+        "here. The orderRef tag on every order and each book's own position "
+        "record are what keep the two apart inside the netted account, and "
+        "agent/reconcile.py checks the ticker as a whole by adding up what every "
+        "book holding it believes.",
     )
 
 

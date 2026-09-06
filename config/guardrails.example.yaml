@@ -193,6 +193,23 @@ universe:
                               # path in agent/guardrails.py, rule id halted,
                               # reading IBKR's tick type 49.
 
+  # ONE TICKER, ONE BOOK. A SWITCH, BECAUSE MO HAS NOT DECIDED.
+  # true   no two books may be in the same name at once. The second book's
+  #        entry is refused, rule id symbol_exclusive, and the name stays with
+  #        whichever book comes first in config/books.yaml. This is the hub's
+  #        standing instruction and it is the default.
+  # false  two books may share a ticker. The rule reports and refuses nothing,
+  #        which is what commit 03e5318 did on 2026-09-06.
+  # The argument for false is that books A, B and E run the same strategy on the
+  # same shortlist, so two of them picking the same name is the agreement month
+  # one exists to measure rather than a clash. The argument for true is that
+  # IBKR nets positions by symbol inside the one shared paper account, so two
+  # books in one name means the account's own line is a sum rather than an
+  # answer. Both branches are built and both are tested. Mo picks.
+  # Either way agent/reconcile.py checks each ticker as a whole, by adding up
+  # what every book holding it believes and comparing that with the broker.
+  symbol_exclusive: true
+
   allow_options: false        # no options in month one
   allow_shorts: false         # no betting on falls. Item A10, shorting, is the
                               # one part of Momentum v2 STILL PENDING Mo's

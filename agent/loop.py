@@ -1111,6 +1111,46 @@ class BookTick:
             book_id=self.book.book_id, dry_run=not self.write_ledger)
 
 
+#: Refusals that cannot turn into a yes again today for this book and this name,
+#: so the pick is put down rather than worked out again on every tick.
+#:
+#: Deliberately short. A rule only belongs here when nothing that happens later
+#: in the day could change its answer. symbol_exclusive is the case that forced
+#: it: with universe.symbol_exclusive on, the name belongs to another book until
+#: that book lets go of it, and re-asking every five minutes writes the same
+#: sentence into the ledger forty times over and answers nothing. The first gate
+#: run showed exactly that shape, with one rule refusing fifty seven orders in a
+#: day, which reads as a stopped machine rather than a guardrail doing its job.
+#:
+#: sector_cap, max_open_positions, gross_exposure_cap and the loss caps are all
+#: deliberately NOT here. Closing a position changes every one of them, and a
+#: pick refused for want of room is meant to get another look once room appears.
+SETTLED_FOR_THE_DAY = ("symbol_exclusive", "blacklist", "whitelist",
+                       "sec_type", "currency", "no_shorts")
+
+
+def settled_refusal(decision: gr.Decision) -> str | None:
+    """The first refusal on this decision that will not change again today."""
+    for rule_id in decision.rule_ids:
+        if rule_id in SETTLED_FOR_THE_DAY:
+            return rule_id
+    return None
+
+
+def put_the_pick_down(tick: BookTick, state: bs.BookState, symbol: str,
+                      decision: gr.Decision) -> None:
+    """Stop re-asking about a pick whose refusal is settled for the day."""
+    settled = settled_refusal(decision)
+    if not settled:
+        return
+    row = state.triggered.get(symbol)
+    if isinstance(row, dict):
+        row["skipped"] = settled
+    tick.note(f"{symbol}: refused by {settled}, and that answer cannot change "
+              "again today, so this pick is put down rather than worked out "
+              "again on every tick")
+
+
 def describe(intent: gr.OrderIntent) -> str:
     """One line describing a would be order, in words."""
     where = f"limit {intent.limit_price:.2f}" if intent.limit_price else "at market"
@@ -1827,6 +1867,7 @@ def _consider_pick(tick: BookTick, state: bs.BookState, plan: BookPlan,
                         extra=extra, model=result.model, cost=None,
                         prompt_hash=result.prompt_hash, stop=stop, target=target)
     state.triggered[symbol]["allowed"] = decision.allowed
+    put_the_pick_down(tick, state, symbol, decision)
     if decision.daily_halt:
         state.halt("a guardrail asked for a halt for the rest of the day")
 
@@ -2861,6 +2902,7 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
         decision = consider(tick, state, guard, account_state, intent, broker, guards,
                             extra=extra, stop=levels.stop, target=levels.target)
         state.triggered[symbol]["allowed"] = decision.allowed
+        put_the_pick_down(tick, state, symbol, decision)
         if decision.daily_halt:
             state.halt("a guardrail asked for a halt for the rest of the day")
 
@@ -2976,28 +3018,102 @@ def write_daily(tick: BookTick, state: bs.BookState) -> None:
 
 # ------------------------------------------------------------------- one book
 
-@dataclass(frozen=True)
+def book_claims(state: bs.BookState) -> dict[str, float]:
+    """Every name one book holds or has a working entry order in, and what it is worth.
+
+    A working entry order counts exactly as much as a position here. A book with
+    an order resting at the broker is as committed to that name as one already
+    holding it, and pretending otherwise is how two books end up in the same
+    ticker in the gap between sending an order and it filling.
+    """
+    claims: dict[str, float] = {}
+    for symbol, position in state.all_positions().items():
+        claims[symbol] = round(
+            claims.get(symbol, 0.0) + abs(_number(position.market_value)), 2)
+    for order in (state.working_orders or {}).values():
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("purpose") or "entry") != "entry":
+            continue
+        symbol = str(order.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        remaining = _number(order.get("remaining"), _number(order.get("qty")))
+        price = _number(order.get("limit_price")) or _number(order.get("price"))
+        claims[symbol] = round(
+            claims.get(symbol, 0.0) + (remaining * price if remaining > 0
+                                       and price > 0 else 0.0), 2)
+    return claims
+
+
+@dataclass
 class AccountWide:
     """What all five books hold between them, which no single book can see.
 
-    owners     {symbol: book id} for every name a book already holds or has a
-               working order in, settled first come first served: whichever book
-               comes first in config/books.yaml keeps a symbol two books both
-               want on the same tick.
-    exposure   {symbol: dollars} added up across every book, for the account
-               level per symbol cap (item A9).
-    equity     what the five books are worth added together, which is what that
-               cap is a percentage of.
+    order      the book ids in register order, which is what settles a tie.
+    claims     {book id: {symbol: dollars}} for every name each book holds or
+               has a working entry order in.
+    equities   {book id: dollars} what each book is worth.
+
+    owners, exposure and equity are worked out from those three rather than
+    stored, because absorb() below rewrites one book's row part way through a
+    tick and three separately maintained copies of the same fact would drift.
+
+    WHY absorb() EXISTS. This used to be read once at the top of the tick and
+    then left alone while all five books took their turns. That made one ticker,
+    one book a rule about yesterday: book A could open AAPL at 09:35 and book B,
+    running four lines later in the SAME tick, would still be told nobody was in
+    it, because the map it was handed had been built before A moved. So the
+    exclusivity rule refused nothing on the only tick where it mattered. Now
+    main() folds each book's own state back in the moment that book finishes,
+    and the book after it sees the truth.
     """
 
-    owners: dict[str, str] = field(default_factory=dict)
-    exposure: dict[str, float] = field(default_factory=dict)
-    equity: float = 0.0
+    order: list[str] = field(default_factory=list)
+    claims: dict[str, dict[str, float]] = field(default_factory=dict)
+    equities: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def owners(self) -> dict[str, str]:
+        """{symbol: book id}, first come first served in register order."""
+        found: dict[str, str] = {}
+        for book_id in self.order:
+            for symbol in self.claims.get(book_id) or {}:
+                found.setdefault(symbol, book_id)
+        return found
+
+    @property
+    def exposure(self) -> dict[str, float]:
+        """{symbol: dollars} added up across every book, for item A9's cap."""
+        total: dict[str, float] = {}
+        for book_id in self.order:
+            for symbol, money in (self.claims.get(book_id) or {}).items():
+                total[symbol] = round(total.get(symbol, 0.0) + money, 2)
+        return total
+
+    @property
+    def equity(self) -> float:
+        """What the five books are worth added together."""
+        return round(sum(self.equities.values()), 2)
 
     def without(self, book_id: str) -> dict[str, str]:
         """The owners map as one book sees it, with its own names taken out."""
         return {symbol: owner for symbol, owner in self.owners.items()
                 if owner != book_id}
+
+    def absorb(self, book_id: str, state: bs.BookState) -> None:
+        """Replace one book's row with what that book believes right now.
+
+        Called after each book's turn, so the next book in the register sees
+        what this one just did rather than what it had before the tick started.
+        A replacement rather than an addition, because the book's earlier row is
+        already in here and adding to it would count the same position twice.
+        """
+        book_id = str(book_id)
+        if book_id not in self.order:
+            self.order.append(book_id)
+        self.claims[book_id] = book_claims(state)
+        self.equities[book_id] = bs.book_equity(state)
 
 
 def read_account_wide(books, now: datetime,
@@ -3014,34 +3130,14 @@ def read_account_wide(books, now: datetime,
     config/books.yaml, which is the rule named as SYMBOL_TIE_BREAK in
     agent/guardrails.py.
     """
-    owners: dict[str, str] = {}
-    exposure: dict[str, float] = {}
-    equity = 0.0
+    wide = AccountWide()
     for book in books:
         state = bs.load_state(book.book_id, book.order_ref, now.date(),
                               capital=book.capital_usd)
         if broker_positions:
             bs.mark_positions(state, broker_positions)
-        equity += bs.book_equity(state)
-        for symbol, position in state.all_positions().items():
-            owners.setdefault(symbol, book.book_id)
-            exposure[symbol] = round(
-                exposure.get(symbol, 0.0) + abs(_number(position.market_value)), 2)
-        for order in (state.working_orders or {}).values():
-            if not isinstance(order, dict):
-                continue
-            if str(order.get("purpose") or "entry") != "entry":
-                continue
-            symbol = str(order.get("symbol") or "").upper()
-            if not symbol:
-                continue
-            owners.setdefault(symbol, book.book_id)
-            remaining = _number(order.get("remaining"), _number(order.get("qty")))
-            price = _number(order.get("limit_price")) or _number(order.get("price"))
-            if remaining > 0 and price > 0:
-                exposure[symbol] = round(
-                    exposure.get(symbol, 0.0) + remaining * price, 2)
-    return AccountWide(owners=owners, exposure=exposure, equity=round(equity, 2))
+        wide.absorb(book.book_id, state)
+    return wide
 
 
 def sector_exposure_for(state: bs.BookState) -> dict[str, float]:
@@ -3415,6 +3511,11 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                                halt_reason=halts.get(book.book_id),
                                account_wide=account_wide,
                                broker_orders=broker_orders)
+        # Fold this book's own answer back in before the next one takes its
+        # turn, so one ticker, one book is a rule about right now rather than a
+        # rule about how the day started. Without this, book B is told nobody is
+        # in a name that book A opened four lines ago.
+        account_wide.absorb(book.book_id, state)
         lines.append(tick_log_line(now, rules, book, tick, state))
         totals["would_be"] += tick.would_be_orders
         totals["approved"] += tick.approved

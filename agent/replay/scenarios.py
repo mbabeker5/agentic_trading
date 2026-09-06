@@ -69,15 +69,16 @@ from agent.replay.stub_decider import (                             # noqa: E402
 #: A rule missing from a gate run has not been tested, it has merely not been
 #: reached.
 #:
-#: symbol_exclusive USED TO BE IN THIS LIST and deliberately is not any more.
-#: The hub retired it on 2026-09-06: two books may now hold the same ticker, and
-#: the rule reports rather than refuses, so it calls decision.note() instead of
-#: decision.add(). This list is refusals only, which is why it is gone from it.
-#: The rule itself is alive and still says which other book is in a name. What
-#: replaced the block is per symbol reconciliation in agent/reconcile.py, and
-#: the reasoning plus how Mo can overturn it is in journal/2026-09-06.md.
+#: symbol_exclusive left this list on 2026-09-06 and is back in it. It is now a
+#: SWITCH rather than a decision: universe.symbol_exclusive in
+#: config/guardrails.yaml is true by default, which is one ticker one book and a
+#: refusal, and false makes it report instead, which is what the hub's commit
+#: 03e5318 did. This list is refusals only, and the rule can refuse again, so it
+#: belongs here. Both branches are tested in tests/test_books.py, and Mo has not
+#: chosen: see journal/2026-09-06.md.
 GUARDRAIL_RULE_IDS = (
     "paper_only", "wrong_account", "wrong_book", "kill_switch",
+    "symbol_exclusive",
     "halted", "sec_type", "currency", "blacklist", "whitelist", "no_shorts",
     "short_price_floor", "shortable_required", "entry_window",
     "outside_market_hours", "flatten_time", "daily_loss_cap", "weekly_loss_cap",
@@ -671,12 +672,17 @@ def every_guardrail(day: date_type) -> Scenario:
                            context.account_state("A", gross_exposure=100_000.0),
                            note="a book already 100 percent invested")
 
-        # symbol_exclusive is deliberately NOT probed any more. It stopped
-        # refusing anything on 2026-09-06, when the hub decided two books may
-        # hold the same ticker, so there is no refusal left for a probe to
-        # provoke. It still runs and still says which other book is in a name,
-        # it just says it as a note rather than as a no. What replaced the block
-        # is per symbol reconciliation in agent/reconcile.py.
+        # symbol_exclusive: another book is already in the name. It refuses by
+        # default, because universe.symbol_exclusive is true in
+        # config/guardrails.yaml, and Mo has not decided otherwise. Set that to
+        # false and the same order comes back allowed with a note on it, which
+        # is what the hub's commit 03e5318 did and what tests/test_books.py
+        # covers on both sides. Either way agent/reconcile.py checks each ticker
+        # as a whole by adding up what every book holding it believes.
+        context.probe_rule(
+            "A", entry(symbol="TAKEN"),
+            context.account_state("A", symbols_held_elsewhere={"TAKEN": "B"}),
+            note="a name book B is already in")
 
         # The three caps that look beyond one day, and the losing streak pause.
         # The loop fills all four fields now, so a probe is a belt and braces

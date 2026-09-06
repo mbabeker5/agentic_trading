@@ -466,6 +466,115 @@ def test_the_facts_reach_the_snapshot_the_guardrails_check(sandbox):
     assert account_state.account_equity == pytest.approx(wide.equity)
 
 
+def test_a_book_sees_what_the_book_before_it_did_in_the_same_tick(sandbox):
+    """One ticker, one book has to be a rule about now, not about this morning.
+
+    This is the hole absorb() closes. The account wide view used to be read once
+    at the top of the tick and left alone while all five books took their turns,
+    so book A could open AAPL at 09:35 and book B, four lines later in the same
+    tick, would still be told nobody was in it.
+    """
+    books = gr.load_books(BOOKS_YAML).enabled_books()
+    for book in books:
+        _write_state(sandbox, book.order_ref, book.book_id, {})
+    wide = loop.read_account_wide(books, at(9, 35))
+    assert wide.owners == {}, "nobody holds anything at the top of the tick"
+
+    # Book A opens AAPL part way through the tick, in memory, not on disk yet.
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    state.put_position(bs.Position(symbol="AAPL", qty=100, avg_cost=100.0,
+                                   entry=100.0, side="long",
+                                   opened_on="2026-09-08", market_value=10000.0))
+    wide.absorb("A", state)
+
+    assert wide.owners["AAPL"] == "A"
+    assert wide.without("B") == {"AAPL": "A"}, "book B has to be told"
+    assert wide.without("A") == {}, "book A is never shut out of its own name"
+    assert wide.exposure["AAPL"] == 10000.0
+
+
+def test_absorbing_a_book_twice_does_not_count_its_money_twice(sandbox):
+    """absorb() replaces that book's row. Adding to it would double the exposure."""
+    books = gr.load_books(BOOKS_YAML).enabled_books()
+    _write_state(sandbox, "BOOK_A", "A", {"AAPL": (100, 100.0)})
+    for book in books[1:]:
+        _write_state(sandbox, book.order_ref, book.book_id, {})
+
+    wide = loop.read_account_wide(books, at(9, 40))
+    assert wide.exposure["AAPL"] == 10000.0
+
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    wide.absorb("A", state)
+    assert wide.exposure["AAPL"] == 10000.0, "the same position, counted once"
+
+
+def test_a_working_entry_order_placed_this_tick_claims_the_name_too(sandbox):
+    """An order resting at the broker is as committed as a position."""
+    books = gr.load_books(BOOKS_YAML).enabled_books()
+    for book in books:
+        _write_state(sandbox, book.order_ref, book.book_id, {})
+    wide = loop.read_account_wide(books, at(9, 35))
+
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    state.working_orders["99"] = {"symbol": "TSLA", "purpose": "entry",
+                                  "remaining": 10, "limit_price": 300.0}
+    wide.absorb("A", state)
+
+    assert wide.owners["TSLA"] == "A"
+    assert wide.exposure["TSLA"] == 3000.0
+
+
+# ---------------------------------------------------------------------------
+# One ticker, one book: a switch, and the loop stops re-asking when it is on
+# ---------------------------------------------------------------------------
+
+
+def test_a_pick_refused_for_a_settled_reason_is_put_down_for_the_day(sandbox):
+    """A refusal that cannot change again must not be worked out every tick.
+
+    The first gate run found one rule refusing fifty seven orders in a day,
+    which is what a stopped machine looks like rather than a guardrail doing its
+    job. A name another book owns is gone for the day, so the pick is put down.
+    """
+    tick = tick_for("A", at(9, 40))
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    state.triggered["AAPL"] = {"at": "2026-09-08T09:35", "price": 100.0,
+                               "allowed": False, "sent": False}
+    decision = gr.Decision(allowed=False)
+    decision.add("symbol_exclusive", "Book B is already in it.")
+
+    loop.put_the_pick_down(tick, state, "AAPL", decision)
+
+    assert state.triggered["AAPL"]["skipped"] == "symbol_exclusive"
+    assert any("cannot change again today" in note for note in tick.notes)
+
+
+def test_a_pick_refused_for_want_of_room_gets_another_look(sandbox):
+    """Closing something changes the answer, so these are deliberately not settled."""
+    tick = tick_for("A", at(9, 40))
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    state.triggered["AAPL"] = {"at": "2026-09-08T09:35", "price": 100.0,
+                               "allowed": False, "sent": False}
+    for rule_id in ("sector_cap", "max_open_positions", "gross_exposure_cap",
+                    "max_position_pct", "daily_loss_cap"):
+        decision = gr.Decision(allowed=False)
+        decision.add(rule_id, "No room right now.")
+        loop.put_the_pick_down(tick, state, "AAPL", decision)
+        assert "skipped" not in state.triggered["AAPL"], rule_id
+
+
+def test_the_settled_list_only_holds_rules_the_guardrails_actually_emit():
+    """A typo here would silently stop putting a pick down and nobody would know."""
+    import re                                          # noqa: PLC0415
+
+    source = (REAL_ROOT / "agent" / "guardrails.py").read_text(encoding="utf-8")
+    pattern = 'decision' + r'\.add\(\s*\n?\s*' + '"([a-z_]+)"'
+    emitted = set(re.findall(pattern, source))
+    assert set(loop.SETTLED_FOR_THE_DAY) <= emitted, (
+        f"{sorted(set(loop.SETTLED_FOR_THE_DAY) - emitted)} is not a rule id "
+        "agent/guardrails.py can refuse on")
+
+
 def test_without_the_account_wide_read_the_fields_stay_empty(sandbox):
     """And the account level cap then falls back to this book's own equity."""
     state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
