@@ -1,9 +1,11 @@
 """Tests for the watchdog's decision rules.
 
 Everything here exercises the pure part of
-/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/watchdog.py,
-which is decide_actions() and its bookkeeping partner update_state(). No test
-here touches IB Gateway, sends an alert, or starts anything.
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/watchdog.py:
+decide_actions(), its bookkeeping partner update_state(), and judge_restart(),
+which is the rule for whether a restart of IB Gateway actually took. No test
+here touches IB Gateway, sends an alert, or starts anything. The restart tests
+feed made up probes to the decision, so no Gateway is started or stopped.
 
 Run them with:
 
@@ -12,6 +14,7 @@ Run them with:
 """
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -378,3 +381,282 @@ def test_both_no_subscription_codes_mean_the_same_thing():
     assert wd.CODE_NO_SUBSCRIPTION in wd.NOT_SUBSCRIBED_CODES
     assert wd.CODE_NO_API_SUBSCRIPTION in wd.NOT_SUBSCRIBED_CODES
     assert wd.CODE_COMPETING_SESSION not in wd.NOT_SUBSCRIBED_CODES
+
+
+# ------------------------------------------------- proving a restart happened
+
+BEFORE_LOGIN = datetime(2026, 9, 8, 6, 30, tzinfo=wd.EASTERN)
+AFTER_LOGIN = datetime(2026, 9, 8, 10, 16, tzinfo=wd.EASTERN)
+
+#: What Gateway looked like just before the watchdog started it: process 123,
+#: logged in at half six this morning, port already shut.
+BEFORE = wd.GatewayProbe(pid="123", login_at=BEFORE_LOGIN, port_open=False)
+
+#: What a Gateway that really did come back looks like.
+ALL_THREE = wd.GatewayProbe(pid="456", login_at=AFTER_LOGIN, port_open=True)
+
+
+class FakeHandle:
+    """Stands in for the handle the start script comes back as.
+
+    poll() is None while the script is still running, which is what a working
+    start looks like, because that script becomes Gateway and never returns.
+    """
+
+    def __init__(self, exit_code=None):
+        self.exit_code = exit_code
+
+    def poll(self):
+        return self.exit_code
+
+
+class FakeProbe:
+    """Hands out a prepared list of looks at Gateway, then repeats the last one.
+
+    The first call is the "before" look that restart_gateway() takes, so the
+    list reads in the order the real thing would see them.
+    """
+
+    def __init__(self, *looks):
+        self.looks = list(looks)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.looks[min(self.calls - 1, len(self.looks) - 1)]
+
+
+def try_restart(*looks, exit_code=None, handle=True, wait_seconds=120,
+                poll_seconds=5):
+    """One restart attempt with made up answers. No Gateway is anywhere near it.
+
+    Returns the outcome and the list of sleeps it asked for, so a test can say
+    both what it decided and how long it was willing to wait.
+    """
+    slept: list[int] = []
+    launcher = (lambda: (FakeHandle(exit_code), "IB Gateway starting"))
+    if not handle:
+        launcher = lambda: (None, "cannot restart, the script is missing")  # noqa: E731
+    outcome = wd.restart_gateway(
+        wait_seconds=wait_seconds, poll_seconds=poll_seconds,
+        probe=FakeProbe(BEFORE, *looks), launcher=launcher,
+        sleep=lambda seconds: slept.append(seconds))
+    return outcome, slept
+
+
+def test_the_same_process_id_back_again_is_not_a_restart():
+    """Everything else can look right; the old process id means nothing started."""
+    same_pid = wd.GatewayProbe(pid="123", login_at=AFTER_LOGIN, port_open=True)
+    outcome, slept = try_restart(same_pid)
+
+    assert outcome.took is False
+    assert outcome.new_pid is False
+    assert outcome.fresh_login is True and outcome.port_open is True
+    assert "a different process id: no" in outcome.detail
+    assert "was 123, now 123" in outcome.detail
+    assert outcome.waited_seconds == 120, "it waits the whole two minutes first"
+    assert len(slept) == 24
+
+
+def test_a_new_process_that_never_logged_in_is_not_a_restart():
+    """Gateway can start, fail the login and sit on the prompt all day."""
+    no_login = wd.GatewayProbe(pid="456", login_at=BEFORE_LOGIN, port_open=True)
+    outcome, _ = try_restart(no_login)
+
+    assert outcome.took is False
+    assert outcome.new_pid is True and outcome.port_open is True
+    assert outcome.fresh_login is False
+    assert "a newer login in the IBC log: no" in outcome.detail
+
+
+def test_a_fresh_login_with_a_shut_port_is_not_a_restart():
+    """Logged in but not listening is the hang the watchdog exists to catch."""
+    shut_port = wd.GatewayProbe(pid="456", login_at=AFTER_LOGIN, port_open=False)
+    outcome, _ = try_restart(shut_port)
+
+    assert outcome.took is False
+    assert outcome.new_pid is True and outcome.fresh_login is True
+    assert outcome.port_open is False
+    assert f"port {wd.GATEWAY_PORT} accepting connections: no" in outcome.detail
+
+
+def test_all_three_proofs_together_are_a_restart():
+    outcome, slept = try_restart(ALL_THREE)
+
+    assert outcome.took is True
+    assert (outcome.new_pid, outcome.fresh_login, outcome.port_open) == (True, True, True)
+    assert slept == [], "there is nothing to wait for once all three are there"
+    assert outcome.waited_seconds == 0
+
+
+def test_a_start_script_that_exits_with_an_error_is_not_a_restart():
+    """That script becomes Gateway when it works, so an exit code means it gave up."""
+    outcome, slept = try_restart(ALL_THREE, exit_code=1)
+
+    assert outcome.took is False
+    assert "exited with code 1" in outcome.detail
+    assert slept == [], "no point waiting two minutes for a script that has stopped"
+
+
+def test_a_start_script_that_could_not_be_run_at_all_is_not_a_restart():
+    outcome, slept = try_restart(ALL_THREE, handle=False)
+
+    assert outcome.took is False
+    assert "never ran" in outcome.detail
+    assert slept == []
+
+
+def test_a_slow_gateway_is_still_a_restart_once_it_finishes_starting():
+    """It keeps looking for two minutes rather than judging the first glance."""
+    starting = wd.GatewayProbe(pid="456", login_at=BEFORE_LOGIN, port_open=False)
+    logged_in = wd.GatewayProbe(pid="456", login_at=AFTER_LOGIN, port_open=False)
+    outcome, slept = try_restart(starting, logged_in, ALL_THREE)
+
+    assert outcome.took is True
+    assert slept == [5, 5], "two waits, then the third look had everything"
+    assert outcome.waited_seconds == 10
+
+
+def test_a_gateway_that_never_comes_back_gives_up_after_two_minutes():
+    nothing = wd.GatewayProbe(pid=None, login_at=BEFORE_LOGIN, port_open=False)
+    outcome, slept = try_restart(nothing)
+
+    assert outcome.took is False
+    assert outcome.waited_seconds == 120
+    assert sum(slept) == 120
+    assert "nothing running" in outcome.detail
+
+
+def test_the_very_first_login_ever_still_counts_as_fresh():
+    """An empty IBC log before the restart must not make a good restart look bad."""
+    nothing_before = wd.GatewayProbe(pid=None, login_at=None, port_open=False)
+    outcome = wd.judge_restart(nothing_before, ALL_THREE)
+    assert outcome.took is True
+    assert "was never, now 2026-09-08 10:16:00" in outcome.detail
+
+
+def test_judge_restart_changes_nothing_it_was_given():
+    before = wd.GatewayProbe(pid="123", login_at=BEFORE_LOGIN, port_open=False)
+    after = wd.GatewayProbe(pid="456", login_at=AFTER_LOGIN, port_open=True)
+    snapshot = (repr(before), repr(after))
+    wd.judge_restart(before, after, None)
+    assert (repr(before), repr(after)) == snapshot
+
+
+def test_two_minutes_is_what_a_restart_gets():
+    assert wd.RESTART_VERIFY_SECONDS == 120
+    assert wd.RESTART_POLL_SECONDS == 5
+
+
+# ----------------------------------------------- reading IBC's own login times
+
+IBC_LINES = """Parsing arguments
+
+Starting IBC version 3.24.2 on 2026-09-06 at 11:41:12
+2026-09-06 11:41:20:118 IBC: Login dialog found
+2026-09-06 11:42:11:200 IBC: Login has completed
+2026-09-06 11:42:12:000 IBC: something else entirely
+2026-09-06 13:22:04:542 IBC: Login has completed
+2026-09-06 13:22:05:100 IBC: after the last login
+"""
+
+
+def test_the_newest_login_is_read_off_the_ibc_log(tmp_path):
+    (tmp_path / "ibc-3.24.2_GATEWAY-10.45_Sunday.txt").write_text(IBC_LINES, encoding="utf-8")
+    assert wd.newest_ibc_login(tmp_path) == datetime(2026, 9, 6, 13, 22, 4, tzinfo=wd.EASTERN)
+
+
+def test_the_newest_log_file_wins_not_the_one_with_the_likeliest_name(tmp_path):
+    """IBC names its logs after the weekday, so a restart past midnight moves file."""
+    old = tmp_path / "ibc-3.24.2_GATEWAY-10.45_Wednesday.txt"
+    old.write_text("2026-09-02 13:27:06:948 IBC: Login has completed\n", encoding="utf-8")
+    new = tmp_path / "ibc-3.24.2_GATEWAY-10.45_Sunday.txt"
+    new.write_text("2026-09-06 11:42:11:200 IBC: Login has completed\n", encoding="utf-8")
+    os.utime(old, (1_000_000, 1_000_000))
+    os.utime(new, (2_000_000, 2_000_000))
+    assert wd.newest_ibc_login(tmp_path) == datetime(2026, 9, 6, 11, 42, 11, tzinfo=wd.EASTERN)
+
+
+def test_no_ibc_log_at_all_is_no_login_rather_than_a_crash(tmp_path):
+    assert wd.newest_ibc_login(tmp_path) is None
+    assert wd.newest_ibc_login(tmp_path / "not there") is None
+
+
+def test_a_log_with_no_login_line_reports_no_login(tmp_path):
+    (tmp_path / "ibc-3.24.2_GATEWAY-10.45_Monday.txt").write_text(
+        "2026-09-06 11:41:20:118 IBC: Login dialog found\n", encoding="utf-8")
+    assert wd.newest_ibc_login(tmp_path) is None
+
+
+# ------------------------------------------- what gets written down afterwards
+
+def catch_alerts(monkeypatch) -> list[tuple[str, str]]:
+    """Swallow the alerts and hand back (level, title) for each one."""
+    sent: list[tuple[str, str]] = []
+
+    def fake_alert(level, title, body):
+        sent.append((level, title))
+        return ["test"]
+
+    monkeypatch.setattr(wd.alerts_module, "alert", fake_alert)
+    return sent
+
+
+def fake_outcome(took: bool) -> wd.RestartOutcome:
+    return wd.RestartOutcome(took=took, new_pid=took, fresh_login=took, port_open=took,
+                             detail="  a different process id: yes", waited_seconds=30)
+
+
+def test_a_verified_restart_is_written_down_as_an_attempt(monkeypatch):
+    sent = catch_alerts(monkeypatch)
+    monkeypatch.setattr(wd, "restart_gateway", lambda *a, **k: fake_outcome(True))
+
+    actions = wd.decide_actions(gateway_down(), MID_MORNING, {"checks": {}})
+    _lines, happened = wd.perform(actions, allow_restart=True)
+    state = wd.update_state(gateway_down(), MID_MORNING, {"checks": {}}, happened)
+
+    assert state["checks"][wd.CHECK_GATEWAY_PROCESS]["restart_attempted"] is True
+    assert ("error", "Watchdog: restart did not take") not in sent
+
+
+def test_a_restart_that_did_not_take_is_not_written_down_as_an_attempt(monkeypatch):
+    """It failed, so the outage keeps its restart in hand rather than spending it."""
+    sent = catch_alerts(monkeypatch)
+    monkeypatch.setattr(wd, "restart_gateway", lambda *a, **k: fake_outcome(False))
+
+    actions = wd.decide_actions(gateway_down(), MID_MORNING, {"checks": {}})
+    lines, happened = wd.perform(actions, allow_restart=True)
+    state = wd.update_state(gateway_down(), MID_MORNING, {"checks": {}}, happened)
+
+    assert state["checks"][wd.CHECK_GATEWAY_PROCESS]["restart_attempted"] is False
+    assert ("error", "Watchdog: restart did not take") in sent
+    assert any("NOT verified" in line for line in lines)
+    assert restarts_in(happened) == [], "an unproved restart is not one of the things that happened"
+
+
+def test_the_no_restart_flag_still_starts_nothing(monkeypatch):
+    catch_alerts(monkeypatch)
+    started: list[int] = []
+    monkeypatch.setattr(wd, "restart_gateway",
+                        lambda *a, **k: started.append(1) or fake_outcome(True))
+
+    actions = wd.decide_actions(gateway_down(), MID_MORNING, {"checks": {}})
+    lines, happened = wd.perform(actions, allow_restart=False)
+
+    assert started == []
+    assert any("--no-restart" in line for line in lines)
+    assert restarts_in(happened) == []
+
+
+def test_the_restart_did_not_take_message_says_which_of_the_three_failed():
+    shut_port = wd.GatewayProbe(pid="456", login_at=AFTER_LOGIN, port_open=False)
+    outcome = wd.judge_restart(BEFORE, shut_port, None, waited_seconds=120)
+    alert = wd.restart_did_not_take_alert(wd.CHECK_GATEWAY_PROCESS, outcome)
+
+    assert alert.kind == wd.ACTION_ALERT and alert.level == "error"
+    assert alert.title == "Watchdog: restart did not take"
+    assert "a different process id: yes" in alert.body
+    assert "a newer login in the IBC log: yes" in alert.body
+    assert f"port {wd.GATEWAY_PORT} accepting connections: no" in alert.body
+    assert "120 seconds" in alert.body
+    assert "What to do" in alert.body

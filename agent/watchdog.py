@@ -42,6 +42,14 @@ properly. The rules are:
 * If that miss is IB Gateway being down, also schedule exactly one restart
   attempt through agent/start_gateway.sh. One attempt per outage, not one per
   wake up, and never a second Gateway on top of a running one.
+* A restart only counts once it has been proved. The start script exiting 0
+  proves nothing, because that script becomes Gateway when it works. So the
+  watchdog looks at Gateway before it starts anything, then watches for two
+  minutes and wants all three of: a different process id, a "Login has
+  completed" line in the IBC log newer than the one it saw before, and port
+  4002 accepting a connection. Anything less is a "restart did not take"
+  message that says which of the three did and did not happen, and the attempt
+  is not written down as an attempt.
 * A check that keeps missing re-alerts at most every thirty minutes, so an
   outage over lunch is two or three messages rather than fifty.
 * A check that comes back alerts once, at level info, so Mo knows it is over.
@@ -85,6 +93,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, time as clock_time, timedelta
 from pathlib import Path
@@ -115,6 +124,21 @@ DISK_FLOOR_BYTES = 1024 ** 3
 
 #: How long a check has to keep failing before we say so again.
 REALERT_AFTER = timedelta(minutes=30)
+
+#: How long to give a restart before deciding it did not take. IB Gateway needs
+#: the best part of a minute to start, log in and open its port, so two minutes
+#: is generous without leaving the watchdog run hanging around forever.
+RESTART_VERIFY_SECONDS = 120
+
+#: How often to look while waiting for those two minutes.
+RESTART_POLL_SECONDS = 5
+
+#: IBC writes one line like this every time a login goes through:
+#:     2026-09-06 11:42:11:200 IBC: Login has completed
+#: That line, and its time, is the only proof we have that a fresh Gateway got
+#: all the way in rather than sitting on a login prompt.
+IBC_LOGIN_MARKER = "Login has completed"
+IBC_LOG_GLOB = "ibc-*.txt"
 
 #: IBKR message codes worth naming.
 CODE_NO_SUBSCRIPTION = 354        # not subscribed, delayed prices only
@@ -212,6 +236,38 @@ class Action:
     level: str = "info"
     title: str = ""
     body: str = ""
+
+
+@dataclass(frozen=True)
+class GatewayProbe:
+    """One look at IB Gateway. Taken twice: once before a restart, once after.
+
+    pid        the process id IBC is running under, or None when nothing is.
+    login_at   the time of the newest "Login has completed" line in the IBC log.
+    port_open  whether anything accepts a connection on the paper API port.
+    """
+    pid: str | None = None
+    login_at: datetime | None = None
+    port_open: bool = False
+
+
+@dataclass(frozen=True)
+class RestartOutcome:
+    """Whether a restart really happened, and the evidence either way.
+
+    took            all three proofs came back. Only this counts as a restart.
+    new_pid         the process id changed.
+    fresh_login     the IBC log has a newer login than before the restart.
+    port_open       port 4002 is accepting connections again.
+    detail          the three lines a person reads to see what did not happen.
+    waited_seconds  how long we watched before giving up or being satisfied.
+    """
+    took: bool
+    new_pid: bool
+    fresh_login: bool
+    port_open: bool
+    detail: str
+    waited_seconds: int = 0
 
 
 @dataclass
@@ -331,6 +387,74 @@ def in_nightly_restart_window(now: datetime) -> bool:
     """True during IBC's own 2 AM restart, when we must not start a second Gateway."""
     start, end = IBC_NIGHTLY_RESTART
     return start <= now.time() < end
+
+
+def _stamp(moment: datetime | None) -> str:
+    return "never" if moment is None else f"{moment:%Y-%m-%d %H:%M:%S}"
+
+
+def judge_restart(before: GatewayProbe, after: GatewayProbe,
+                  launch_exit: int | None = None,
+                  waited_seconds: int = 0) -> RestartOutcome:
+    """Did the restart actually take? Pure: it only reads its two arguments.
+
+    Three proofs, and all three have to be there, because each one on its own
+    can lie:
+
+    * a different process id. The same process id back again does not mean
+      Gateway restarted, it means we are looking at the Gateway that was
+      already sitting there.
+    * a login in the IBC log newer than the one taken before the restart. A
+      process can start, fail its login and sit on the prompt for hours, so a
+      new process id on its own is not a Gateway anyone can trade through.
+    * port 4002 accepting a connection. Logged in but not listening is exactly
+      the hang this watchdog exists to catch.
+
+    The start script's exit code short circuits all three. agent/start_gateway.sh
+    becomes Gateway when it works and never returns, so any exit code at all
+    means it gave up first, usually a missing credentials file or a Gateway
+    version that is not installed.
+    """
+    if launch_exit is not None and launch_exit != 0:
+        return RestartOutcome(
+            took=False, new_pid=False, fresh_login=False, port_open=False,
+            waited_seconds=waited_seconds,
+            detail=(f"  the start script exited with code {launch_exit} instead of "
+                    "becoming IB Gateway, so nothing was started"))
+
+    new_pid = bool(after.pid) and after.pid != before.pid
+    fresh_login = after.login_at is not None and (
+        before.login_at is None or after.login_at > before.login_at)
+    port_open = bool(after.port_open)
+
+    yes_no = {True: "yes", False: "no"}
+    detail = "\n".join([
+        f"  a different process id: {yes_no[new_pid]} "
+        f"(was {before.pid or 'nothing running'}, now {after.pid or 'nothing running'})",
+        f"  a newer login in the IBC log: {yes_no[fresh_login]} "
+        f"(was {_stamp(before.login_at)}, now {_stamp(after.login_at)})",
+        f"  port {GATEWAY_PORT} accepting connections: {yes_no[port_open]}",
+    ])
+    return RestartOutcome(took=new_pid and fresh_login and port_open,
+                          new_pid=new_pid, fresh_login=fresh_login,
+                          port_open=port_open, detail=detail,
+                          waited_seconds=waited_seconds)
+
+
+def restart_did_not_take_alert(check: str, outcome: RestartOutcome) -> Action:
+    """The message for a restart that was tried and cannot be confirmed. Pure."""
+    return Action(
+        kind=ACTION_ALERT, check=check, level="error",
+        title="Watchdog: restart did not take",
+        body=("IB Gateway was started but the restart cannot be confirmed. Here is "
+              f"what was and was not seen in the {outcome.waited_seconds} seconds "
+              "after it was started:\n\n"
+              f"{outcome.detail}\n\n"
+              "All three have to be true before this counts as a restart, so it is "
+              "not being written down as one.\n\n"
+              "What to do: run agent/start_gateway.sh yourself and watch the Gateway "
+              "window. IBKR Mobile may be waiting for you to approve the login. "
+              "output/gateway_launch.log and output/ibc_logs hold what happened."))
 
 
 def _restart_already_tried(state: dict) -> bool:
@@ -454,15 +578,32 @@ def update_state(checks: dict, now: datetime, state: dict,
 
 # --------------------------------------------------------------- the checks
 
-def check_gateway_process() -> Check:
-    """Is IB Gateway running? IBC starts it, so we look for IBC's own class name."""
+def _pgrep_ibc() -> tuple[list[str], str | None]:
+    """Ask which IB Gateway processes are running.
+
+    IBC is what starts Gateway, so the thing to look for is IBC's own class
+    name. Returns the process ids it found and, separately, a message when the
+    question itself could not be asked, which is not the same as "none running".
+    """
     try:
         finished = subprocess.run(["pgrep", "-f", "ibcalpha.ibc"],
                                   capture_output=True, text=True, timeout=10)
     except Exception as exc:                                      # noqa: BLE001
-        return Check(CHECK_GATEWAY_PROCESS, ok=False,
-                     detail=f"could not ask which processes are running: {exc}")
-    pids = [line for line in finished.stdout.split() if line.strip()]
+        return [], f"could not ask which processes are running: {exc}"
+    return [line for line in finished.stdout.split() if line.strip()], None
+
+
+def gateway_pid() -> str | None:
+    """The process id IB Gateway is running under, or None when it is not."""
+    pids, _error = _pgrep_ibc()
+    return pids[0] if pids else None
+
+
+def check_gateway_process() -> Check:
+    """Is IB Gateway running?"""
+    pids, error = _pgrep_ibc()
+    if error:
+        return Check(CHECK_GATEWAY_PROCESS, ok=False, detail=error)
     if pids:
         return Check(CHECK_GATEWAY_PROCESS, ok=True,
                      detail=f"IB Gateway is running, process {pids[0]}.")
@@ -470,16 +611,94 @@ def check_gateway_process() -> Check:
                  detail="No IB Gateway process is running on this Mac.")
 
 
+def port_is_open(host: str = GATEWAY_HOST, port: int = GATEWAY_PORT,
+                 timeout: int = 3) -> tuple[bool, str]:
+    """Does anything accept a connection on that port, and if not, why not?
+
+    This is as read only as a check can be: the socket is opened and closed
+    again without a single byte being sent, so it cannot ask Gateway for
+    anything, let alone tell it to do anything.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
 def check_gateway_port(host: str = GATEWAY_HOST, port: int = GATEWAY_PORT) -> Check:
     """Is anything accepting connections on the paper API port?"""
-    try:
-        with socket.create_connection((host, port), timeout=3):
-            pass
-    except OSError as exc:
+    open_now, why = port_is_open(host, port)
+    if not open_now:
         return Check(CHECK_GATEWAY_PORT, ok=False,
-                     detail=f"Nothing is accepting connections on {host}:{port} ({exc}).")
+                     detail=f"Nothing is accepting connections on {host}:{port} ({why}).")
     return Check(CHECK_GATEWAY_PORT, ok=True,
                  detail=f"{host}:{port} is accepting connections.")
+
+
+def ibc_log_dir() -> Path:
+    return output_dir() / "ibc_logs"
+
+
+def _parse_ibc_time(line: str) -> datetime | None:
+    """Read the timestamp off the front of an IBC log line.
+
+    The lines look like this, with the milliseconds hung on the end of the time
+    with another colon rather than a full stop:
+
+        2026-09-06 11:42:11:200 IBC: Login has completed
+    """
+    parts = line.split()
+    if len(parts) < 2:
+        return None
+    bits = parts[1].split(":")
+    if len(bits) < 3:
+        return None
+    try:
+        moment = datetime.strptime(f"{parts[0]} {bits[0]}:{bits[1]}:{bits[2]}",
+                                   "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=EASTERN)
+
+
+def newest_ibc_login(log_dir: Path | None = None) -> datetime | None:
+    """When IBC last finished a login, read from the newest IBC log file.
+
+    IBC names its log files after the day of the week, so a Gateway started
+    just after midnight writes into a different file from the one that was
+    being written a minute earlier. Picking the newest file by when it was last
+    written, rather than by the name that looks right, survives that.
+    """
+    folder = log_dir or ibc_log_dir()
+    try:
+        logs = sorted(folder.glob(IBC_LOG_GLOB), key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return None
+    if not logs:
+        return None
+    try:
+        lines = logs[-1].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if IBC_LOGIN_MARKER not in line:
+            continue
+        moment = _parse_ibc_time(line)
+        if moment is not None:
+            return moment
+    return None
+
+
+def probe_gateway() -> GatewayProbe:
+    """One look at IB Gateway: which process, when it logged in, is the port up.
+
+    This is the only part of the restart check that touches the machine, which
+    is what lets judge_restart() below be a pure function that tests can feed
+    made up answers to.
+    """
+    return GatewayProbe(pid=gateway_pid(), login_at=newest_ibc_login(),
+                        port_open=port_is_open()[0])
 
 
 def _is_number(value) -> bool:
@@ -683,42 +902,102 @@ def run_checks(now: datetime, schedule: Schedule) -> dict[str, Check]:
 
 # ------------------------------------------------------------ carrying it out
 
-def start_gateway() -> str:
+def launch_gateway():
     """Start IB Gateway in the background and come straight back.
 
-    agent/start_gateway.sh never returns, it becomes Gateway, so this launches
-    it detached and does not wait. Its output goes to output/gateway_launch.log.
+    agent/start_gateway.sh never returns when it works, it becomes Gateway, so
+    this launches it detached and does not wait. The handle is kept anyway,
+    because the one path where that script does return is the path where it
+    gave up, and its exit code is the quickest way to know that. Its output goes
+    to output/gateway_launch.log.
+
+    Returns (handle, message). A handle of None means nothing was started at all.
     """
     script = agent_dir() / "start_gateway.sh"
     if not script.exists():
-        return f"cannot restart, {script} is missing"
+        return None, f"cannot restart, {script} is missing"
     log = output_dir() / "gateway_launch.log"
     try:
-        handle = open(log, "a", encoding="utf-8")
-        handle.write(f"\n----- started by the watchdog at "
-                     f"{datetime.now(EASTERN):%Y-%m-%d %H:%M:%S %Z} -----\n")
-        handle.flush()
-        subprocess.Popen(["/bin/bash", str(script)], stdout=handle, stderr=handle,
-                         cwd=str(project_root()), start_new_session=True)
+        log_file = open(log, "a", encoding="utf-8")
+        log_file.write(f"\n----- started by the watchdog at "
+                       f"{datetime.now(EASTERN):%Y-%m-%d %H:%M:%S %Z} -----\n")
+        log_file.flush()
+        started = subprocess.Popen(["/bin/bash", str(script)], stdout=log_file,
+                                   stderr=log_file, cwd=str(project_root()),
+                                   start_new_session=True)
     except Exception as exc:                                      # noqa: BLE001
-        return f"could not start IB Gateway: {exc}"
-    return f"IB Gateway starting, output going to {log}"
+        return None, f"could not start IB Gateway: {exc}"
+    return started, f"IB Gateway starting, output going to {log}"
 
 
-def perform(actions: list[Action], allow_restart: bool) -> list[str]:
-    """Do the actions and describe what happened, one line each."""
+def restart_gateway(wait_seconds: int = RESTART_VERIFY_SECONDS,
+                    poll_seconds: int = RESTART_POLL_SECONDS,
+                    probe=None, launcher=None, sleep=time.sleep) -> RestartOutcome:
+    """Start IB Gateway, then prove it really came back.
+
+    Look at Gateway first, start it, then keep looking until either all three
+    proofs in judge_restart() are there or the two minutes are up. The looking
+    is done by probe(), the deciding by judge_restart(), which is why the whole
+    rule can be tested with made up probes and no Gateway anywhere near it.
+
+    Stops early on a start script that exited with an error, because nothing is
+    going to change in the remaining two minutes if the script has already
+    given up.
+    """
+    probe = probe or probe_gateway
+    launcher = launcher or launch_gateway
+
+    before = probe()
+    handle, message = launcher()
+    if handle is None:
+        return RestartOutcome(took=False, new_pid=False, fresh_login=False,
+                              port_open=False, waited_seconds=0,
+                              detail=f"  the start script never ran: {message}")
+
+    waited = 0
+    while True:
+        exit_code = handle.poll()
+        outcome = judge_restart(before, probe(), exit_code, waited_seconds=waited)
+        if outcome.took or exit_code not in (None, 0) or waited >= wait_seconds:
+            return outcome
+        sleep(poll_seconds)
+        waited += poll_seconds
+
+
+def perform(actions: list[Action], allow_restart: bool) -> tuple[list[str], list[Action]]:
+    """Do the actions, describe what happened, and say which ones really happened.
+
+    Two lists come back. The first is one line per action for the run log. The
+    second is what update_state() should be told about, which is not always what
+    was decided: a restart that could not be proved is dropped from it and
+    replaced by the alert about that, so nothing writes down an attempt that
+    did not work.
+    """
     done: list[str] = []
+    happened: list[Action] = []
     for action in actions:
         if action.kind == ACTION_ALERT:
             delivered = alerts_module.alert(action.level, action.title, action.body)
             done.append(f"alert [{action.level}] {action.title} "
                         f"-> {', '.join(delivered) or 'nothing'}")
+            happened.append(action)
         elif action.kind == ACTION_RESTART:
             if not allow_restart:
                 done.append("restart skipped, --no-restart was given")
                 continue
-            done.append(f"restart: {start_gateway()}")
-    return done
+            outcome = restart_gateway()
+            done.append(f"restart: {'verified' if outcome.took else 'NOT verified'} "
+                        f"after {outcome.waited_seconds}s")
+            done.extend(outcome.detail.splitlines())
+            if outcome.took:
+                happened.append(action)
+                continue
+            failed = restart_did_not_take_alert(action.check, outcome)
+            delivered = alerts_module.alert(failed.level, failed.title, failed.body)
+            done.append(f"alert [{failed.level}] {failed.title} "
+                        f"-> {', '.join(delivered) or 'nothing'}")
+            happened.append(failed)
+    return done, happened
 
 
 def append_run_log(line: str) -> None:
@@ -782,9 +1061,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  would {action.kind}: [{action.level}] {action.title}")
         return 0
 
-    for line in perform(actions, allow_restart=not args.no_restart):
+    # What was decided is not always what happened, so the state is written from
+    # what happened. An unproved restart is not recorded as an attempt.
+    lines, happened = perform(actions, allow_restart=not args.no_restart)
+    for line in lines:
         print(f"  {line}")
-    save_state(update_state(checks, now, state, actions))
+    save_state(update_state(checks, now, state, happened))
 
     failed = [name for name, check in checks.items() if not check.ok and not check.skipped]
     append_run_log(f"{now:%Y-%m-%d %H:%M:%S %Z} | {summarise(checks)} | "
