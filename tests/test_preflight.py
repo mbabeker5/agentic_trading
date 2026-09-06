@@ -197,3 +197,78 @@ def test_the_scanner_check_fails_when_the_scanner_is_missing(monkeypatch, tmp_pa
     result = preflight.check_scanner(tmp_path / "scan.json")
     assert result.passed is False
     assert "does not exist" in result.detail
+
+
+# ------------------------------- one file per book per day, from book_state.py
+
+def test_only_the_newest_day_of_each_book_counts(monkeypatch, tmp_path):
+    """agent/book_state.py writes one file per book per day, so yesterday's file
+    is still sitting there. Adding both would count Monday again on Tuesday."""
+    folder = use_temp_output(monkeypatch, tmp_path)
+    (folder / "state_BOOK_A_2026-09-07.json").write_text(
+        json.dumps({"positions": {"SPY": {"qty": 9}}}), encoding="utf-8")
+    (folder / "state_BOOK_A_2026-09-08.json").write_text(
+        json.dumps({"positions": {"SPY": {"qty": 1}}}), encoding="utf-8")
+    monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"SPY": 1.0}))
+
+    assert [p.name for p in preflight.newest_book_files(folder)] == ["state_BOOK_A_2026-09-08.json"]
+    assert preflight.check_reconcile().passed is True
+
+
+def test_each_book_keeps_its_own_newest_day(monkeypatch, tmp_path):
+    folder = use_temp_output(monkeypatch, tmp_path)
+    for name in ("state_BOOK_A_2026-09-07.json", "state_BOOK_A_2026-09-08.json",
+                 "state_BOOK_C_2026-09-08.json"):
+        (folder / name).write_text(json.dumps({"positions": {}}), encoding="utf-8")
+    assert [p.name for p in preflight.newest_book_files(folder)] == [
+        "state_BOOK_A_2026-09-08.json", "state_BOOK_C_2026-09-08.json"]
+
+
+def test_a_state_file_with_no_date_on_the_end_still_counts(tmp_path):
+    (tmp_path / "state_BOOK_A.json").write_text("{}", encoding="utf-8")
+    assert [p.name for p in preflight.newest_book_files(tmp_path)] == ["state_BOOK_A.json"]
+
+
+def test_the_book_state_shape_is_read_correctly():
+    """The real shape agent/book_state.py writes: symbol keys, qty, side."""
+    loaded = {"positions": {"SPY": {"symbol": "SPY", "qty": 3.0, "side": "long",
+                                    "entry": 766.15, "stop": 754.65}}}
+    assert preflight._positions_from_book(loaded) == {"SPY": 3.0}
+
+
+def test_a_short_held_as_a_positive_number_still_reconciles_as_a_short():
+    """book_state.py marks a short with side, and the qty may be positive. The
+    broker always reports a short as a negative number, so these must match."""
+    loaded = {"positions": {"DELL": {"symbol": "DELL", "qty": 25.0, "side": "short"}}}
+    assert preflight._positions_from_book(loaded) == {"DELL": -25.0}
+
+
+def test_a_short_already_stored_as_a_negative_number_is_left_alone():
+    loaded = {"positions": {"DELL": {"symbol": "DELL", "qty": -25.0, "side": "short"}}}
+    assert preflight._positions_from_book(loaded) == {"DELL": -25.0}
+
+
+def test_a_short_book_position_matches_a_short_broker_position(monkeypatch, tmp_path):
+    folder = use_temp_output(monkeypatch, tmp_path)
+    (folder / "state_BOOK_A_2026-09-08.json").write_text(
+        json.dumps({"positions": {"DELL": {"qty": 25.0, "side": "short"}}}), encoding="utf-8")
+    monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"DELL": -25.0}))
+    assert preflight.check_reconcile().passed is True
+
+
+def test_the_day_trade_check_finds_the_files_agent_pdt_actually_writes(monkeypatch, tmp_path):
+    """agent/pdt.py writes output/pdt_BOOK_A.json, one per book."""
+    folder = use_temp_output(monkeypatch, tmp_path)
+    (folder / "pdt_BOOK_A.json").write_text('{"round_trips": []}', encoding="utf-8")
+    (folder / "pdt_BOOK_C.json").write_text('{"round_trips": []}', encoding="utf-8")
+    result = preflight.check_day_trade_counters()
+    assert result.passed is True
+    assert result.facts["files"] == ["pdt_BOOK_A.json", "pdt_BOOK_C.json"]
+
+
+def test_a_corrupt_pdt_file_stops_the_morning(monkeypatch, tmp_path):
+    folder = use_temp_output(monkeypatch, tmp_path)
+    (folder / "pdt_BOOK_A.json").write_text("{ truncated", encoding="utf-8")
+    result = preflight.check_day_trade_counters()
+    assert result.passed is False
+    assert "pdt_BOOK_A.json" in result.detail

@@ -38,8 +38,9 @@ The five checks
 4. reconcile       What the books think they hold matches what the broker says
                    they hold, symbol by symbol. With no book state files yet,
                    this reports "no books active" and passes.
-5. day_trades      Any day trade counter files present can be read. Missing
-                   files pass; a corrupt one fails.
+5. day_trades      Every day trade counter file present can be read.
+                   agent/pdt.py writes one per book as output/pdt_BOOK_A.json.
+                   Missing files pass; a corrupt one fails.
 
 What it writes
 --------------
@@ -194,6 +195,45 @@ def check_scanner(out_path: Path) -> Result:
                   facts={"candidates": found, "exit_code": 0})
 
 
+def newest_book_files(folder: Path) -> list[Path]:
+    """The most recent state file for each book, and only that one.
+
+    agent/book_state.py writes one file per book per day, named like
+    state_BOOK_A_2026-09-08.json. Adding every file in the folder together would
+    count Monday's positions again on Tuesday, so the files are grouped by book
+    and only the newest day of each is kept. ISO dates sort in date order, which
+    is why a plain sort is enough to find it.
+    """
+    by_book: dict[str, Path] = {}
+    for path in sorted(folder.glob("state_BOOK_*.json")):
+        tail = path.stem[len("state_BOOK_"):]
+        book, _, maybe_date = tail.rpartition("_")
+        if not (book and len(maybe_date) == 10 and maybe_date.count("-") == 2):
+            book = tail          # no date on the end, so the whole tail is the book
+        by_book[book] = path     # sorted order means the last one wins
+    return [by_book[book] for book in sorted(by_book)]
+
+
+def _quantity_from(item: dict) -> float | None:
+    """One position's share count, negative for a short.
+
+    agent/book_state.py stores the size in qty and the direction in side, and a
+    short may be written either as a negative qty or as a positive one with
+    side "short". Both have to come out negative here, or a short would look
+    like a long that the broker disagrees about.
+    """
+    for key in ("position", "qty", "quantity", "shares"):
+        if item.get(key) is not None:
+            try:
+                size = float(item[key])
+            except (TypeError, ValueError):
+                return None
+            if str(item.get("side", "")).lower() == "short" and size > 0:
+                size = -size
+            return size
+    return None
+
+
 def _positions_from_book(loaded) -> dict[str, float]:
     """Pull {symbol: shares} out of a book's state file, whatever shape it is in.
 
@@ -212,37 +252,37 @@ def _positions_from_book(loaded) -> dict[str, float]:
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            symbol = item.get("symbol") or item.get("ticker")
-            for key in ("position", "qty", "quantity", "shares"):
-                if item.get(key) is not None:
-                    try:
-                        held[str(symbol)] = held.get(str(symbol), 0.0) + float(item[key])
-                    except (TypeError, ValueError):
-                        pass
-                    break
+            symbol = str(item.get("symbol") or item.get("ticker"))
+            size = _quantity_from(item)
+            if size is not None:
+                held[symbol] = held.get(symbol, 0.0) + size
     elif isinstance(raw, dict):
         for symbol, value in raw.items():
-            if isinstance(value, dict):
-                for key in ("position", "qty", "quantity", "shares"):
-                    if value.get(key) is not None:
-                        value = value[key]
-                        break
-            try:
-                held[str(symbol)] = held.get(str(symbol), 0.0) + float(value)
-            except (TypeError, ValueError):
-                pass
+            size = (_quantity_from(value) if isinstance(value, dict)
+                    else _as_float(value))
+            if size is not None:
+                held[str(symbol)] = held.get(str(symbol), 0.0) + size
     return held
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def check_reconcile() -> Result:
     """Does what the books think they hold match what the broker says?
 
-    Book by book, the state files under output/state_BOOK_*.json are added up
-    per symbol and compared with the broker's own position list. A book that has
-    not started yet has no state file, and with no state files at all this
-    passes with "no books active".
+    Book by book, the newest state file under output/state_BOOK_*.json is added
+    up per symbol and compared with the broker's own position list. There is one
+    file per book per day, so only the newest day of each book counts: adding
+    every file in the folder together would count Monday's positions again on
+    Tuesday. A book that has not started yet has no state file, and with no state
+    files at all this passes with "no books active".
     """
-    books = sorted(output_dir().glob("state_BOOK_*.json"))
+    books = newest_book_files(output_dir())
     if not books:
         return Result(CHECK_RECONCILE, True,
                       "No books active: there are no output/state_BOOK_*.json "
@@ -305,19 +345,28 @@ def check_reconcile() -> Result:
                   facts=facts)
 
 
-def check_day_trade_counters() -> Result:
-    """Any day trade counter files that exist must be readable JSON.
+#: Where the day trade counters live. agent/pdt.py writes one file per book as
+#: output/pdt_BOOK_A.json; the other two patterns are here in case the naming
+#: moves, so this check keeps finding them rather than quietly finding nothing.
+DAY_TRADE_PATTERNS = ("pdt_BOOK_*.json", "daytrades*.json", "day_trades*.json")
 
-    Nothing writes these yet. The check is here so that the day the pattern day
-    trade counter arrives, a corrupt one stops the morning rather than being
-    discovered at 15:55.
+
+def check_day_trade_counters() -> Result:
+    """Every day trade counter file that exists must be readable JSON.
+
+    A corrupt one has to stop the morning here, at 09:00, rather than being
+    discovered at 15:55 when the loop tries to work out whether it is allowed to
+    close a position it opened an hour ago.
     """
-    found = sorted(set(output_dir().glob("daytrades*.json"))
-                   | set(output_dir().glob("day_trades*.json")))
+    found: set[Path] = set()
+    for pattern in DAY_TRADE_PATTERNS:
+        found |= set(output_dir().glob(pattern))
+    found = sorted(found)
     if not found:
         return Result(CHECK_DAY_TRADES, True,
                       "No day trade counter files exist yet, so there is nothing "
-                      "to load.")
+                      "to load. agent/pdt.py writes them as output/pdt_BOOK_A.json "
+                      "once a book has traded.")
     broken = []
     for path in found:
         try:
