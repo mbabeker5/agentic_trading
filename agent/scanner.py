@@ -1,10 +1,35 @@
 #!/usr/bin/env python3
 """Opening-momentum scanner for the agentic trading project.
 
-Asks IB Gateway which US stocks and ETFs are gaining hard and trading unusually
+Asks IB Gateway which US stocks and ETFs are moving hard and trading unusually
 heavily, checks each one against the strategy's rules, and writes a shortlist of
 at most twenty names to a JSON file. Claude reads that file at 9:35 AM and
-decides which names, if any, are worth trading.
+decides which names, if any, are worth trading. Both directions: gainers become
+long candidates and losers become short candidates.
+
+WE DO NOT TRUST IBKR'S SCANNER FILTERS (Mo, 2026-09-06)
+-------------------------------------------------------
+On this account every scanner filter we tried, priceAbove, stVolume5MinAbove,
+marketCapAbove and volumeAbove, made the scan return ZERO rows while Gateway
+quietly logged error 162, "Scanner filter X is disabled", followed by 365 on the
+same request. Nothing raised. An unfiltered scan of the same code returned 50
+rows in under a second. So a filtered scan on this account looks exactly like a
+morning when nothing gapped, and a loop that believed it would sit idle for a
+month and never know why.
+
+So this script sends NO filters to Gateway, ever. Every scan is unfiltered, and
+every rule in docs/STRATEGY.md is applied here in our own code against real
+daily bars: the 5 dollar price floor, the 20 million dollar liquidity floor, the
+2 times relative volume floor at 09:35, the US listing test and the leveraged
+and inverse fund test. Filters that are checked here cannot be silently switched
+off by a subscription we do not have.
+
+Every scan also goes through agent/scan_truth.py before its rows are believed:
+errors are captured against the scan's own request id, an unfiltered control
+scan has to come back with real rows, and the end-of-scan signal has to arrive
+inside the timeout. A scan that fails any of those raises ScanFailure, and this
+script then exits 3 and writes nothing, leaving yesterday's shortlist where it
+is. An empty shortlist and a broken scanner must never look the same.
 
 Two of the filters are Mo's decisions of 2026-09-06 and are worth knowing about
 before reading the code. The liquidity floor is 20 million dollars of average
@@ -31,8 +56,10 @@ Run it like this, from the project folder:
 
     venv312/bin/python agent/scanner.py --out output/shortlist_2026-09-02.json
 
-Exit code is 0 whenever the scan ran, even if nothing survived the filters.
-It is 1 only when the Gateway connection itself failed.
+Exit codes:
+    0   the scan ran and was believed, even if nothing survived the filters
+    1   the Gateway connection itself failed
+    3   a scan could not be trusted (ScanFailure). Nothing was written
 """
 
 from __future__ import annotations
@@ -40,28 +67,52 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import csv
+import io
 import json
 import logging
 import math
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, ScannerSubscription, Stock
+from ib_async import IB, ScannerSubscription, Stock, TagValue
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GUARDRAILS_PATH = PROJECT_ROOT / "config" / "guardrails.yaml"
+SECRETS_DIR = PROJECT_ROOT / ".secrets"
+
+# The project folder goes on the import path so that "agent.scan_truth" means the
+# same module here as it does in the tests. Importing it as a bare "scan_truth"
+# instead would make a second copy of the class, and an "except ScanFailure" in
+# one copy would not catch a ScanFailure raised by the other.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from agent.scan_truth import (  # noqa: E402
+    DEFAULT_TIMEOUT_S,
+    ErrorCapture,
+    ScanFailure,
+    ScanResult,
+    assert_trustworthy,
+    run_scan_async,
+)
 
 try:
     import yaml
 except ImportError:  # pragma: no cover - pyyaml is in requirements-312.txt
     yaml = None
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-GUARDRAILS_PATH = PROJECT_ROOT / "config" / "guardrails.yaml"
+#: What the CLI returns when a scan could not be trusted. Distinct from 1, which
+#: is a connection failure, so the pre-flight can tell the two apart and say so.
+EXIT_SCAN_FAILURE = 3
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -85,18 +136,37 @@ REL_VOLUME_ANCHOR_HOUR, REL_VOLUME_ANCHOR_MINUTE = 9, 35
 REL_VOLUME_ANCHOR_LABEL = "09:35"
 REL_VOLUME_ANCHOR_MINUTES = 5.0
 
-# How many names we are willing to pull extra data for. Kept low on purpose:
-# IB Gateway rations historical-data requests (roughly 60 in any ten minutes),
-# and blowing through that ration gets the whole connection throttled.
-# The arithmetic: one reference request, plus one daily request per name we
-# enrich, plus one intraday request per name that makes the shortlist. That is
-# 1 + 40 + 20 = 61 in the worst case, which is why the budget sits just under
-# Gateway's sixty. A normal run lands in the low fifties because the filters
-# thin the shortlist well below twenty.
-ENRICHMENT_CAP = 40
-HISTORY_REQUEST_BUDGET = 58
+# THE PACING BUDGET, WORKED OUT IN FULL
+# -------------------------------------
+# Gateway rations requests to roughly sixty in any ten minutes, counted across
+# the whole connection, and going over gets everything on that connection
+# throttled, not just this script. Since 2026-09-06 the run makes five scanner
+# requests rather than two, so the arithmetic was redone:
+#
+#      5   scanner requests: TOP_PERC_GAIN, TOP_PERC_LOSE, HOT_BY_VOLUME,
+#          HIGH_STVOLUME_5MIN, plus the unfiltered control scan
+#     55   left over for historical data, which is HISTORY_REQUEST_BUDGET
+#      1   SPY reference bars, to see how far today's data actually reaches
+#     35   daily bars, one per enriched name, which is ENRICHMENT_CAP
+#     19   opening ranges left, against a shortlist that can hold twenty
+#   ----
+#     60   the whole ration
+#
+# So the only way to run out is for all 35 enriched names to survive every
+# filter and fill a shortlist of twenty, in which case the twentieth name loses
+# its opening range and the run says so in its warnings rather than quietly
+# publishing a name with no entry trigger. A normal run spends about 45, because
+# the filters thin the shortlist well below twenty.
+#
+# The enrichment cap came down from 40 to 35 to pay for the three extra scans.
+# The names that lose their place are the lowest ranked across all four scans,
+# which are the ones least likely to have survived anyway.
+SCANNER_REQUESTS_PER_RUN = 5
+ENRICHMENT_CAP = 35
+HISTORY_REQUEST_BUDGET = 55
 HISTORY_CONCURRENCY = 4
 HISTORY_MIN_GAP_SECONDS = 0.25
+TOTAL_REQUEST_RATION = 60
 
 # How many completed sessions a name needs before we trust its "normal" volume.
 # A stock listed last week has no normal, and averaging its first three days
@@ -114,16 +184,63 @@ DAILY_HISTORY_DURATION = "60 D"
 # shorter window tracks a change in a stock's normal pace more quickly.
 REL_VOLUME_AVERAGE_SESSIONS = 20
 
-SCAN_CODES = ("TOP_PERC_GAIN", "HOT_BY_VOLUME")
 SCAN_INSTRUMENT = "STK"
 SCAN_LOCATION = "STK.US.MAJOR"
 SCAN_ROWS = 50
+SCAN_TIMEOUT_S = DEFAULT_TIMEOUT_S
+
+DIRECTION_LONG = "long"
+DIRECTION_SHORT = "short"
+
+# Scan codes we will never ask for, and why. TOP_OPEN_PERC_GAIN and its mirror
+# sound like exactly what a 9:35 gap scan wants, but IBKR staff confirmed they
+# return nothing before the regular session is properly under way, so they hand
+# back an empty list at the one moment we care about. TOP_PERC_GAIN is the code
+# that actually answers at 9:35. A test asserts these never appear in a request.
+FORBIDDEN_SCAN_CODES = frozenset({"TOP_OPEN_PERC_GAIN", "TOP_OPEN_PERC_LOSE"})
+
+
+@dataclass(frozen=True)
+class ScanSpec:
+    """One scan we ask Gateway for, and what a hit on it means.
+
+    direction is "long" for a list of gainers, "short" for a list of fallers,
+    and None for a volume list, which says a name is busy without saying which
+    way it is going. A name flagged only by a volume scan takes its direction
+    from the sign of its own move once the daily bars are in.
+    """
+
+    code: str
+    direction: str | None
+    label: str
+
+
+# Confirmed present on this Gateway on 2026-09-06 by reading ib.reqScannerParameters(),
+# which listed 527 scan codes including all four of these.
+SCAN_SPECS = (
+    ScanSpec("TOP_PERC_GAIN", DIRECTION_LONG, "IBKR's biggest percentage gainers list"),
+    ScanSpec("TOP_PERC_LOSE", DIRECTION_SHORT, "IBKR's biggest percentage fallers list"),
+    ScanSpec("HOT_BY_VOLUME", None, "IBKR's unusually heavy volume list"),
+    ScanSpec("HIGH_STVOLUME_5MIN", None,
+             "IBKR's heaviest five minute volume list"),
+)
+SCAN_CODES = tuple(spec.code for spec in SCAN_SPECS)
+
+# The control scan. It has no filters, like all the others, and it exists only to
+# answer one question: is the scanner service actually answering this account? The
+# market is never empty, so a control that comes back with fewer than twenty rows
+# means the scan results cannot be believed, whatever the other four returned.
+CONTROL_SCAN_CODE = "MOST_ACTIVE"
 
 # Plain-English labels for the scan codes, for the "reasons" field.
-SCAN_CODE_LABELS = {
-    "TOP_PERC_GAIN": "IBKR's biggest percentage gainers list",
-    "HOT_BY_VOLUME": "IBKR's unusually heavy volume list",
-}
+SCAN_CODE_LABELS = {spec.code: spec.label for spec in SCAN_SPECS}
+SCAN_CODE_LABELS[CONTROL_SCAN_CODE] = "IBKR's most active list (the control scan)"
+SCAN_CODE_LABELS["finviz"] = "the Finviz Elite export cross-check"
+
+# Sending a forbidden code would be a silent nothing at 9:35, so refuse at import.
+assert not (set(SCAN_CODES) | {CONTROL_SCAN_CODE}) & FORBIDDEN_SCAN_CODES, (
+    "a forbidden scan code is in SCAN_SPECS or CONTROL_SCAN_CODE"
+)
 
 # Where a real US listing trades. Anything else is a foreign line and is dropped.
 ALLOWED_PRIMARY_EXCHANGES = frozenset(
@@ -178,12 +295,54 @@ NO_LIVE_DATA_CODES = frozenset({354, 492, 10089, 10091, 10167, 10168, 10197})
 
 MARKET_DATA_TYPE_LABELS = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed frozen"}
 
+# Finviz Elite, the optional cross-check. Mo has not bought it (39.50 dollars a
+# month as of 2026-09-06), so the switch in config/guardrails.yaml is off and
+# this code path does nothing but log one line. Nothing here signs up for
+# anything, and with the switch off nothing here touches the network.
+FINVIZ_SECRETS_FILE = "finviz.env"
+FINVIZ_DEFAULT_TOKEN_KEY = "FINVIZ_AUTH_TOKEN"
+FINVIZ_TIMEOUT_S = 20.0
+FINVIZ_MAX_SYMBOLS = 100
+FINVIZ_TICKER_COLUMNS = ("ticker", "symbol")
+FINVIZ_FLAG = "finviz"
+
 log = logging.getLogger("scanner")
 
 
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class FinvizSettings:
+    """The optional Finviz Elite cross-check, off unless the YAML turns it on.
+
+    Finviz Elite has native gap and relative-volume filters and a CSV export
+    endpoint, which makes it a useful second opinion on what actually gapped.
+    Mo has not bought it, so `enabled` is false in config/guardrails.yaml and
+    with it false nothing here touches the network at all.
+
+    export_url is the whole Finviz export link, screener settings and all. If
+    that link already carries its `auth=` token then nothing else is needed. If
+    it does not, put the token in a file of KEY=value lines at
+    /Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/finviz.env
+    under the key named by auth_token_key, and it is appended to the link at
+    request time. The token is never written into the output file or the log.
+    """
+
+    enabled: bool = False
+    export_url: str = ""
+    auth_token_key: str = FINVIZ_DEFAULT_TOKEN_KEY
+    secrets_file: str = FINVIZ_SECRETS_FILE
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "export_url_set": bool(self.export_url),
+            "auth_token_key": self.auth_token_key,
+            "secrets_file": self.secrets_file,
+        }
 
 
 @dataclass
@@ -210,6 +369,7 @@ class Thresholds:
     max_candidates: int = DEFAULT_MAX_CANDIDATES
     source: str = "built-in defaults"
     deprecated_min_avg_volume: float | None = None
+    finviz: FinvizSettings = field(default_factory=lambda: FinvizSettings())
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -222,6 +382,7 @@ class Thresholds:
             "max_candidates": self.max_candidates,
             "source": self.source,
             "deprecated_min_avg_volume": self.deprecated_min_avg_volume,
+            "finviz_enabled": self.finviz.enabled,
         }
 
 
@@ -307,9 +468,39 @@ def load_thresholds(path: Path) -> Thresholds:
             thresholds.max_candidates,
         )
         thresholds.max_candidates = 1
+
+    finviz = scanner.get("finviz") or {}
+    if isinstance(finviz, dict):
+        thresholds.finviz = FinvizSettings(
+            enabled=bool(finviz.get("enabled", False)),
+            export_url=str(finviz.get("export_url") or "").strip(),
+            auth_token_key=str(
+                finviz.get("auth_token_key") or FINVIZ_DEFAULT_TOKEN_KEY
+            ).strip(),
+            secrets_file=str(
+                finviz.get("secrets_file") or FINVIZ_SECRETS_FILE
+            ).strip(),
+        )
+
     thresholds.source = str(path)
     log.info("Loaded thresholds from %s", path)
     return thresholds
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """KEY=value lines out of a .env style file. Missing file means no keys."""
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +566,16 @@ class Candidate:
     stock_type: str = ""
     flagged_by: list[str] = field(default_factory=list)
 
+    #: "long" from a gainers scan, "short" from a fallers scan, and for a name
+    #: only ever seen on a volume scan it is filled in from the sign of its own
+    #: move once the daily bars are in. Never None by the time it is written out.
+    direction: str | None = None
+    #: The directions the scans themselves implied, before the move decided it.
+    directions_flagged: list[str] = field(default_factory=list)
+    #: Best place this name took on any scan, 0 being the top of a list. Used to
+    #: decide which names are worth spending a data request on.
+    scan_rank: int | None = None
+
     last: float | None = None
     prev_close: float | None = None
     gain_pct: float | None = None
@@ -392,7 +593,11 @@ class Candidate:
 
     def contract(self) -> Stock:
         stock = Stock(self.symbol, "SMART", "USD")
-        stock.conId = self.con_id
+        # A name that came from Finviz rather than from a scan has no contract id
+        # yet, and setting conId to 0 would make Gateway look for contract zero
+        # instead of looking the ticker up. Leave it unset in that case.
+        if self.con_id:
+            stock.conId = self.con_id
         if self.primary_exchange:
             stock.primaryExchange = self.primary_exchange
         return stock
@@ -402,6 +607,11 @@ class Candidate:
             "symbol": self.symbol,
             "conId": self.con_id,
             "primaryExchange": self.primary_exchange,
+            # Both spellings on purpose. agent/decide.py reads "side" or
+            # "direction", and agent/loop.py reads "side", so writing both means
+            # a short is never quietly read as a long by whichever reads it next.
+            "direction": self.direction,
+            "side": self.direction,
             "last": round2(self.last),
             "gain_pct": round2(self.gain_pct),
             "opening_range_high": round2(self.opening_range_high),
@@ -413,6 +623,7 @@ class Candidate:
             "rel_volume": round2(self.rel_volume),
             "rel_volume_minutes_elapsed": round2(self.rel_volume_minutes_elapsed),
             "flagged_by": list(self.flagged_by),
+            "scan_rank": self.scan_rank,
             "reasons": list(self.reasons),
             "score": round2(self.score),
             "long_name": self.long_name,
@@ -436,6 +647,35 @@ def human_millions(value: float | None) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.0f} thousand"
     return f"{value:.0f}"
+
+
+def parse_finviz_csv(body: str) -> list[str]:
+    """Tickers out of a Finviz Elite CSV export, in the order the export gave them.
+
+    Finviz calls the column "Ticker". "Symbol" is accepted too in case the export
+    template is set up differently. Anything that is not a plain ticker is
+    dropped rather than guessed at, and duplicates are removed keeping the first.
+    """
+    try:
+        reader = csv.DictReader(io.StringIO(body))
+        fieldnames = [str(name or "").strip().lower() for name in (reader.fieldnames or [])]
+        column = next((name for name in FINVIZ_TICKER_COLUMNS if name in fieldnames), None)
+        if column is None:
+            return []
+        index = fieldnames.index(column)
+        real_name = (reader.fieldnames or [])[index]
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in reader:
+            symbol = str(row.get(real_name) or "").strip().upper()
+            if not symbol or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", symbol):
+                continue
+            if symbol not in seen:
+                seen.add(symbol)
+                out.append(symbol)
+        return out
+    except (csv.Error, UnicodeDecodeError):
+        return []
 
 
 def human_dollars(value: float | None) -> str:
@@ -610,6 +850,14 @@ class OpeningMomentumScanner:
         self.session_minutes_elapsed: float | None = None
         self.data_as_of: str | None = None
         self.skipped_for_budget = 0
+        self.scan_diagnostics: dict[str, dict[str, Any]] = {}
+        self.scanner_requests = 0
+        self.finviz_report: dict[str, Any] = {
+            "enabled": thresholds.finviz.enabled,
+            "symbols_added": 0,
+            "symbols": [],
+            "note": "",
+        }
 
     # -- plumbing ----------------------------------------------------------
 
@@ -637,77 +885,233 @@ class OpeningMomentumScanner:
 
     # -- step 1: run the scans --------------------------------------------
 
-    async def run_one_scan(self, scan_code: str) -> list[Any]:
-        subscription = ScannerSubscription(
+    def make_subscription(self, scan_code: str) -> ScannerSubscription:
+        """One scanner request, with no filters on it whatsoever.
+
+        Deliberately no abovePrice, no aboveVolume, no marketCapAbove. Every
+        filter tag we tried on this account made Gateway return zero rows and
+        log "Scanner filter X is disabled" into a callback, which is
+        indistinguishable from a quiet morning. Whatever we ask Gateway to
+        filter on, it can decline to filter on without telling us. So we ask for
+        the raw list and do the filtering here, where nothing can switch it off.
+        """
+        if scan_code in FORBIDDEN_SCAN_CODES:
+            raise ValueError(
+                f"{scan_code} returns nothing before the session is under way, "
+                "which is the one moment this scanner runs. Use TOP_PERC_GAIN."
+            )
+        return ScannerSubscription(
             instrument=SCAN_INSTRUMENT,
             locationCode=SCAN_LOCATION,
             scanCode=scan_code,
             numberOfRows=SCAN_ROWS,
-            abovePrice=self.thresholds.price_floor,
         )
-        # No volume filter is sent to Gateway any more. Gateway's scanner can
-        # filter on a share count and has no dollar volume filter at all, and a
-        # share count cannot stand in for one: 20 million dollars is 4 million
-        # shares at 5 dollars and 40 thousand shares at 500, so any share floor
-        # loose enough to keep the expensive names would let through everything
-        # else as well. The liquidity floor is applied further down instead,
-        # against 30 sessions of real daily bars. The price floor is still sent,
-        # in abovePrice above, because that one means the same thing either way.
+
+    def record_scan(self, result: ScanResult, role: str,
+                    direction: str | None = None) -> None:
+        """Write one scan's own numbers into the diagnostics block."""
+        self.scanner_requests += 1
+        self.scan_diagnostics[result.scan_code] = {
+            "role": role,
+            "direction": direction,
+            "rows": len(result.rows),
+            "elapsed_s": round(result.elapsed_s, 3),
+            "completed": result.completed,
+            "req_id": result.req_id,
+            "filters": [{"tag": tag, "value": value} for tag, value in result.filters],
+            "errors": [{"code": code, "message": message}
+                       for code, message in result.errors],
+        }
+        log.info(
+            "Scan %s (%s) returned %d rows in %.2fs%s",
+            result.scan_code,
+            role,
+            len(result.rows),
+            result.elapsed_s,
+            f", errors {[c for c, _ in result.errors]}" if result.errors else "",
+        )
+
+    async def run_all_scans(self) -> list[tuple[ScanSpec, ScanResult]]:
+        """Run the control scan and the four real ones, and believe none of them
+        until agent/scan_truth.py says they can be believed.
+
+        Sequential on purpose. ib_async hands out request ids from a counter, and
+        reading that counter to know which errors belong to which scan only works
+        while one request is in flight at a time. Five scans at well under a
+        second each is a few seconds in total, which is a cheap price for knowing
+        whose error is whose.
+
+        Raises ScanFailure when any scan cannot be trusted. The caller turns that
+        into exit code 3 and writes nothing.
+        """
+        capture = ErrorCapture(self.ib)
         try:
-            rows = await self.ib.reqScannerDataAsync(subscription)
-        except Exception as exc:
-            self.note(f"Scan {scan_code} failed outright: {exc}")
-            return []
-        log.info("Scan %s returned %d rows", scan_code, len(rows))
-        return list(rows)
+            control = await run_scan_async(
+                self.ib, self.make_subscription(CONTROL_SCAN_CODE), [], capture,
+                SCAN_TIMEOUT_S)
+            self.record_scan(control, "control")
+
+            results: list[tuple[ScanSpec, ScanResult]] = []
+            for spec in SCAN_SPECS:
+                result = await run_scan_async(
+                    self.ib, self.make_subscription(spec.code), [], capture,
+                    SCAN_TIMEOUT_S)
+                self.record_scan(result, "candidate source", spec.direction)
+                results.append((spec, result))
+        except ScanFailure:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ScanFailure(f"a scanner request blew up: {exc!r}") from exc
+        finally:
+            capture.close()
+
+        # Judge every scan against the same control. The first one that cannot be
+        # believed stops the run, because a shortlist built from part of a broken
+        # set of scans is worse than no shortlist at all.
+        for _, result in results:
+            assert_trustworthy(result, control)
+        return results
 
     async def collect_candidates(self) -> list[Candidate]:
-        """Run both scans and merge them, taking turns between the two lists.
+        """Run every scan, merge the results, and tag each name long or short.
 
-        Taking turns matters. If we simply stacked one list on top of the other,
-        the cap further down would chop the second scan off completely and we
-        would only ever look at the biggest gainers, never the heavy volume
-        names. Alternating means the top of both lists survives the cap, and
-        anything both scans flagged floats to the front.
+        Merging takes turns down the four lists rather than stacking them. That
+        matters: stacking would let the enrichment cap chop the last scan off
+        entirely, so we would only ever look at the biggest gainers and never at
+        the fallers or the heavy volume names. Alternating keeps the top of all
+        four, and anything more than one scan flagged floats to the front,
+        because two scans agreeing is a stronger signal than one.
+
+        Keyed on the ticker, not the contract id, so a name that arrives from
+        Finviz without a contract id still merges with the same name from a scan.
         """
-        by_con_id: dict[int, Candidate] = {}
-        per_scan: list[list[int]] = []
-        for scan_code in SCAN_CODES:
-            rows = await self.run_one_scan(scan_code)
-            self.counts[f"scanned_{scan_code.lower()}"] = len(rows)
-            ranked: list[int] = []
-            for row in rows:
-                contract = getattr(getattr(row, "contractDetails", None), "contract", None)
+        results = await self.run_all_scans()
+
+        by_symbol: dict[str, Candidate] = {}
+        per_scan: list[list[str]] = []
+        for spec, result in results:
+            self.counts[f"scanned_{spec.code.lower()}"] = len(result.rows)
+            ranked: list[str] = []
+            for position, row in enumerate(result.rows):
+                contract = getattr(
+                    getattr(row, "contractDetails", None), "contract", None)
                 if contract is None or not contract.symbol:
                     continue
-                existing = by_con_id.get(contract.conId)
-                if existing is None:
-                    existing = Candidate(
-                        symbol=contract.symbol,
-                        con_id=contract.conId,
+                symbol = str(contract.symbol).upper()
+                candidate = by_symbol.get(symbol)
+                if candidate is None:
+                    candidate = Candidate(
+                        symbol=symbol,
+                        con_id=int(getattr(contract, "conId", 0) or 0),
                         primary_exchange=contract.primaryExchange or "",
                         currency=contract.currency or "",
                     )
-                    by_con_id[contract.conId] = existing
-                if scan_code not in existing.flagged_by:
-                    existing.flagged_by.append(scan_code)
-                ranked.append(contract.conId)
+                    by_symbol[symbol] = candidate
+                if spec.code not in candidate.flagged_by:
+                    candidate.flagged_by.append(spec.code)
+                rank = int(getattr(row, "rank", position) or position)
+                if candidate.scan_rank is None or rank < candidate.scan_rank:
+                    candidate.scan_rank = rank
+                if spec.direction and spec.direction not in candidate.directions_flagged:
+                    candidate.directions_flagged.append(spec.direction)
+                ranked.append(symbol)
             per_scan.append(ranked)
 
-        # Names both scans flagged go first, then alternate down the two lists.
-        both = [
-            con_id
-            for con_id, candidate in by_con_id.items()
-            if len(candidate.flagged_by) > 1
-        ]
-        order: list[int] = list(both)
-        seen = set(both)
+        self.add_finviz_symbols(by_symbol, per_scan)
+
+        # Names more than one source flagged go first, in their best rank order,
+        # then take turns down the lists.
+        many = sorted(
+            (symbol for symbol, c in by_symbol.items() if len(c.flagged_by) > 1),
+            key=lambda s: (by_symbol[s].scan_rank if by_symbol[s].scan_rank is not None
+                           else SCAN_ROWS),
+        )
+        order: list[str] = list(many)
+        seen = set(many)
         for position in range(max((len(r) for r in per_scan), default=0)):
             for ranked in per_scan:
                 if position < len(ranked) and ranked[position] not in seen:
                     seen.add(ranked[position])
                     order.append(ranked[position])
-        return [by_con_id[con_id] for con_id in order]
+        return [by_symbol[symbol] for symbol in order]
+
+    # -- step 1b: the optional Finviz cross-check --------------------------
+
+    def add_finviz_symbols(self, by_symbol: dict[str, Candidate],
+                           per_scan: list[list[str]]) -> None:
+        """Fold the Finviz Elite export into the union, when it is switched on.
+
+        Off by default, because Mo has not bought Finviz Elite. Off means one
+        line in the log and nothing else: no network call, no signup, no keys
+        read. On means fetching the CSV export, taking the ticker column, and
+        adding those names to the union tagged "finviz" so it is always clear in
+        the output which names IBKR found and which Finviz did.
+        """
+        settings = self.thresholds.finviz
+        if not settings.enabled:
+            log.info(
+                "Finviz cross-check is off (scanner.finviz.enabled is false in %s), "
+                "so nothing was fetched", self.thresholds.source)
+            self.finviz_report["note"] = (
+                "off in scanner.finviz.enabled, nothing was fetched")
+            return
+
+        symbols, note = self.fetch_finviz_symbols(settings)
+        self.finviz_report["note"] = note
+        if not symbols:
+            if "could not" in note or "no " in note:
+                self.note(f"Finviz cross-check: {note}")
+            return
+
+        ranked: list[str] = []
+        added = 0
+        for symbol in symbols:
+            candidate = by_symbol.get(symbol)
+            if candidate is None:
+                candidate = Candidate(symbol=symbol, con_id=0)
+                by_symbol[symbol] = candidate
+                added += 1
+            if FINVIZ_FLAG not in candidate.flagged_by:
+                candidate.flagged_by.append(FINVIZ_FLAG)
+            ranked.append(symbol)
+        per_scan.append(ranked)
+        self.finviz_report["symbols_added"] = added
+        self.finviz_report["symbols"] = list(symbols)
+        log.info(
+            "Finviz cross-check returned %d symbol(s), %d of them new to the union",
+            len(symbols), added)
+
+    def fetch_finviz_symbols(self, settings: FinvizSettings) -> tuple[list[str], str]:
+        """Download the Finviz export and read the ticker column out of it.
+
+        Returns the tickers and one sentence about what happened, which goes into
+        the output either way. Never raises: a cross-check that cannot be reached
+        must not take down a scan that worked.
+        """
+        url = settings.export_url
+        if not url:
+            return [], ("scanner.finviz.enabled is true but no export_url is set, "
+                        "so there was nothing to fetch")
+        if "auth=" not in url:
+            token = read_env_file(SECRETS_DIR / settings.secrets_file).get(
+                settings.auth_token_key, "")
+            if not token:
+                return [], (
+                    f"no {settings.auth_token_key} in "
+                    f"{SECRETS_DIR / settings.secrets_file} and no auth token in the "
+                    "export_url, so Finviz would refuse the request")
+            url = f"{url}{'&' if '?' in url else '?'}auth={token}"
+        try:
+            with urllib.request.urlopen(url, timeout=FINVIZ_TIMEOUT_S) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # The URL carries the token, so the URL never goes into a message.
+            return [], f"could not reach the Finviz export ({type(exc).__name__})"
+
+        symbols = parse_finviz_csv(body)
+        if not symbols:
+            return [], "the Finviz export came back with no ticker column in it"
+        return symbols[:FINVIZ_MAX_SYMBOLS], f"read {len(symbols)} tickers from Finviz"
 
     # -- step 2: how far into the day is the data? ------------------------
 
@@ -992,24 +1396,57 @@ class OpeningMomentumScanner:
                 f"{human_dollars(self.thresholds.min_avg_dollar_volume)}"
             )
         if candidate.opening_range_high is not None and candidate.opening_range_low is not None:
-            reasons.append(
-                f"First five minutes ranged {candidate.opening_range_low:.2f} to "
-                f"{candidate.opening_range_high:.2f} dollars, so a break above "
-                f"{candidate.opening_range_high:.2f} is the entry to watch"
-            )
+            if candidate.direction == DIRECTION_SHORT:
+                reasons.append(
+                    f"First five minutes ranged {candidate.opening_range_low:.2f} to "
+                    f"{candidate.opening_range_high:.2f} dollars, so a break below "
+                    f"{candidate.opening_range_low:.2f} is the entry to watch on the "
+                    "short side"
+                )
+            else:
+                reasons.append(
+                    f"First five minutes ranged {candidate.opening_range_low:.2f} to "
+                    f"{candidate.opening_range_high:.2f} dollars, so a break above "
+                    f"{candidate.opening_range_high:.2f} is the entry to watch"
+                )
         if candidate.stock_type:
             reasons.append(f"Listed on {candidate.primary_exchange or 'a US venue'} as {candidate.stock_type.lower()}")
         return reasons
 
+    def resolve_direction(self, candidate: Candidate) -> str | None:
+        """Long or short for one name, or None when nothing says which.
+
+        A gainers scan says long, a fallers scan says short, and a volume scan
+        says nothing about direction at all. So a name only ever seen on a volume
+        scan takes its direction from the sign of its own move, and a name the
+        scans disagree about does the same, because its own price is better
+        evidence than a list it appeared on.
+        """
+        flagged = candidate.directions_flagged
+        if len(flagged) == 1:
+            return flagged[0]
+        if candidate.gain_pct is None:
+            return None
+        if candidate.gain_pct > 0:
+            return DIRECTION_LONG
+        if candidate.gain_pct < 0:
+            return DIRECTION_SHORT
+        return None
+
     def compute_score(self, candidate: Candidate) -> float:
-        """Gain multiplied by the log of relative volume.
+        """The size of the move multiplied by the log of relative volume.
 
         A big move on normal volume is suspicious, and heavy volume with no move
         is not a momentum trade. Multiplying the two rewards names that have both.
+
+        The size of the move, not the signed move, because a stock down 9 percent
+        on five times its normal volume is as good a short as the mirror image is
+        a long. Ranking on the signed number would sort every short to the bottom
+        of the shortlist and the cap would then throw them all away.
         """
-        gain = candidate.gain_pct or 0.0
+        move = abs(candidate.gain_pct or 0.0)
         rel = max(candidate.rel_volume or 1.0, 1.0001)
-        return gain * math.log(rel)
+        return move * math.log(rel)
 
     # -- the whole run -----------------------------------------------------
 
@@ -1018,11 +1455,17 @@ class OpeningMomentumScanner:
         self.counts["merged_unique"] = len(candidates)
 
         if self.saw_no_live_data and self.market_data_type == 1:
-            log.info("No live data entitlement, retrying the scans on delayed data")
+            # Switch the rest of the run to delayed data so the historical
+            # requests below come back with something. The scans are NOT run
+            # again: five more scanner requests is a quarter of the whole ten
+            # minute ration, and a scan that could not be believed has already
+            # raised ScanFailure by this point rather than quietly returning a
+            # worse answer.
+            log.info(
+                "No live data entitlement seen, switching the rest of this run to "
+                "delayed data. The scans are not repeated.")
             await self.set_market_data_type(3)
             self.saw_no_live_data = False
-            candidates = await self.collect_candidates()
-            self.counts["merged_unique"] = len(candidates)
 
         # Drop the obvious leveraged and inverse tickers now, before spending
         # any data requests on them.
@@ -1039,15 +1482,12 @@ class OpeningMomentumScanner:
         self.counts["capped_for_enrichment"] = len(candidates)
 
         if not candidates:
-            self.counts["daily_bars_ok"] = 0
-            self.counts["passed_price_floor"] = 0
-            self.counts["passed_dollar_volume"] = 0
-            self.counts["passed_rel_volume"] = 0
-            self.counts["passed_moving_up"] = 0
-            self.counts["passed_us_listing"] = 0
-            self.counts["passed_leverage_name_filter"] = 0
-            self.counts["opening_range_ok"] = 0
-            self.counts["final"] = 0
+            for stage in ("daily_bars_ok", "passed_price_floor",
+                          "passed_dollar_volume", "passed_rel_volume",
+                          "passed_direction_agrees", "passed_us_listing",
+                          "passed_leverage_name_filter", "opening_range_ok",
+                          "final", "final_long", "final_short"):
+                self.counts[stage] = 0
             return self.build_output([])
 
         await self.measure_session_progress(reference_symbol)
@@ -1064,7 +1504,13 @@ class OpeningMomentumScanner:
                 f"No daily bars for {len(missing)} name(s), skipped: {', '.join(missing[:12])}"
             )
 
-        survivors = [c for c in with_data if (c.last or 0.0) > self.thresholds.price_floor]
+        # The price floor. At or above 5 dollars, not strictly above it, which is
+        # what "price floor: 5" in docs/STRATEGY.md means. Applied here rather
+        # than sent to Gateway as abovePrice, because a filter Gateway can
+        # disable without telling us is not a filter.
+        survivors = [
+            c for c in with_data if (c.last or 0.0) >= self.thresholds.price_floor
+        ]
         self.counts["passed_price_floor"] = len(survivors)
 
         # The liquidity floor. Dollars a day, not shares a day (Mo, 2026-09-06).
@@ -1077,19 +1523,39 @@ class OpeningMomentumScanner:
         ]
         self.counts["passed_dollar_volume"] = len(survivors)
 
+        # At or above 2 times normal, measured at the 09:35 anchor.
         survivors = [
             c
             for c in survivors
-            if (c.rel_volume or 0.0) > self.thresholds.rel_volume_min
+            if (c.rel_volume or 0.0) >= self.thresholds.rel_volume_min
         ]
         self.counts["passed_rel_volume"] = len(survivors)
 
-        # The strategy only ever buys, so a name that is down on the day is not
-        # a candidate however heavily it is trading. The volume scan flags
-        # plenty of hard fallers, and pairing one with a "break above the
-        # opening high" trigger would be a nonsense instruction.
-        survivors = [c for c in survivors if (c.gain_pct or 0.0) > 0]
-        self.counts["passed_moving_up"] = len(survivors)
+        # Which way is each name going, and does its own price agree with the
+        # list it came off? A name from the gainers scan that is somehow down on
+        # the day, or one from the fallers scan that is up, is contradicting
+        # itself and gets dropped rather than shortlisted with a trigger that
+        # points the wrong way. A name from a volume scan alone has its direction
+        # decided here, by the sign of its own move.
+        directional = []
+        for candidate in survivors:
+            candidate.direction = self.resolve_direction(candidate)
+            move = candidate.gain_pct
+            if candidate.direction is None or move is None:
+                log.debug("Dropped %s, nothing says which way it is going",
+                          candidate.symbol)
+                continue
+            if candidate.direction == DIRECTION_LONG and move <= 0:
+                log.debug("Dropped %s, flagged as a gainer but down %.2f percent",
+                          candidate.symbol, move)
+                continue
+            if candidate.direction == DIRECTION_SHORT and move >= 0:
+                log.debug("Dropped %s, flagged as a faller but up %.2f percent",
+                          candidate.symbol, move)
+                continue
+            directional.append(candidate)
+        survivors = directional
+        self.counts["passed_direction_agrees"] = len(survivors)
 
         if survivors:
             await asyncio.gather(
@@ -1157,6 +1623,10 @@ class OpeningMomentumScanner:
         for candidate in shortlist:
             candidate.reasons = self.build_reasons(candidate)
         self.counts["final"] = len(shortlist)
+        self.counts["final_long"] = sum(
+            1 for c in shortlist if c.direction == DIRECTION_LONG)
+        self.counts["final_short"] = sum(
+            1 for c in shortlist if c.direction == DIRECTION_SHORT)
         return self.build_output(shortlist)
 
     def build_output(self, shortlist: list[Candidate]) -> dict[str, Any]:
@@ -1195,9 +1665,16 @@ class OpeningMomentumScanner:
                 else self.session_minutes_elapsed + 1e-9 >= REL_VOLUME_ANCHOR_MINUTES
             ),
             "scan_codes": list(SCAN_CODES),
+            "control_scan_code": CONTROL_SCAN_CODE,
+            "scan_filters_sent": [],
+            "scan_diagnostics": dict(self.scan_diagnostics),
+            "finviz": {**self.thresholds.finviz.as_dict(), **self.finviz_report},
             "thresholds": self.thresholds.as_dict(),
             "counts": dict(self.counts),
+            "scanner_requests_used": self.scanner_requests,
             "historical_requests_used": self.pacer.used,
+            "total_requests_used": self.scanner_requests + self.pacer.used,
+            "total_request_ration": TOTAL_REQUEST_RATION,
             "warnings": list(self.warnings),
             "candidates": [c.as_dict() for c in shortlist],
         }
@@ -1252,14 +1729,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--enrichment-cap",
         type=int,
         default=ENRICHMENT_CAP,
-        help="How many scan hits to pull extra data for. Default: %(default)s",
+        help="How many scan hits to pull extra data for, best ranked first. "
+        "Default: %(default)s",
     )
     parser.add_argument(
         "--history-budget",
         type=int,
         default=HISTORY_REQUEST_BUDGET,
-        help="Cap on data requests per run, to stay under Gateway's sixty per "
-        "ten minutes. Default: %(default)s",
+        help="Cap on historical data requests per run. The five scanner requests "
+        "are counted separately, and the two together stay under Gateway's sixty "
+        "per ten minutes. Default: %(default)s",
     )
     parser.add_argument(
         "--reference-symbol",
@@ -1270,12 +1749,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+#: The line agent/preflight.py looks for on stderr when the scanner exits 3. One
+#: line of JSON, so the codes and messages survive the trip between processes
+#: without anyone having to parse English out of a log.
+SCAN_FAILURE_MARKER = "SCAN_FAILURE_JSON "
+
+
+def report_scan_failure(failure: ScanFailure, scanner: OpeningMomentumScanner,
+                        out: str) -> None:
+    """Say loudly what went wrong, on stderr, and write no shortlist."""
+    codes = sorted({code for code, _ in failure.errors})
+    log.error("The scan could not be trusted, so nothing was written: %s", failure)
+    log.error(
+        "Gateway error codes on this run: %s",
+        ", ".join(str(c) for c in codes) or "none, so it was a short control or a timeout")
+    log.error(
+        "%s was left exactly as it was. An empty shortlist and a broken scanner "
+        "must never look the same.", out)
+    payload = {
+        "message": str(failure),
+        "codes": codes,
+        "errors": [{"code": code, "message": message}
+                   for code, message in failure.errors],
+        "scan_diagnostics": scanner.scan_diagnostics,
+        "out": str(out),
+        "wrote_anything": False,
+    }
+    print(SCAN_FAILURE_MARKER + json.dumps(payload), file=sys.stderr, flush=True)
+
+
 async def main_async(args: argparse.Namespace) -> int:
     thresholds = load_thresholds(Path(args.config))
     log.info(
-        "Thresholds: price above %.2f, average daily dollar volume of %s or more over "
-        "%d sessions, relative volume above %.2f measured at the %s anchor, at most "
-        "%d names (%s)",
+        "Thresholds: price at or above %.2f, average daily dollar volume of %s or more "
+        "over %d sessions, relative volume at or above %.2f measured at the %s anchor, "
+        "at most %d names (%s)",
         thresholds.price_floor,
         human_dollars(thresholds.min_avg_dollar_volume),
         thresholds.dollar_volume_sessions,
@@ -1314,6 +1822,13 @@ async def main_async(args: argparse.Namespace) -> int:
     try:
         await scanner.set_market_data_type(1)
         result = await scanner.run(args.reference_symbol)
+    except ScanFailure as failure:
+        # The one thing this script must never do is write an empty shortlist
+        # because a scan broke. An empty file and a broken scanner look the same
+        # to everything downstream, so nothing is written at all: whatever was
+        # there before is left exactly where it is, and the exit code says why.
+        report_scan_failure(failure, scanner, args.out)
+        return EXIT_SCAN_FAILURE
     except Exception as exc:
         log.exception("Scan blew up after connecting: %s", exc)
         result = scanner.build_output([])
@@ -1338,14 +1853,22 @@ async def main_async(args: argparse.Namespace) -> int:
     )
     for candidate in result.get("candidates", [])[:5]:
         log.info(
-            "  %-6s gain %6s%%  rel vol %5s  last %8s  range %s to %s",
+            "  %-6s %-5s move %6s%%  rel vol %5s  last %8s  range %s to %s",
             candidate["symbol"],
+            candidate.get("direction") or "?",
             candidate["gain_pct"],
             candidate["rel_volume"],
             candidate["last"],
             candidate["opening_range_low"],
             candidate["opening_range_high"],
         )
+    log.info(
+        "Requests used: %d scanner + %d historical = %d of the %d per ten minutes",
+        result.get("scanner_requests_used", 0),
+        result.get("historical_requests_used", 0),
+        result.get("total_requests_used", 0),
+        result.get("total_request_ration", TOTAL_REQUEST_RATION),
+    )
     return 0
 
 

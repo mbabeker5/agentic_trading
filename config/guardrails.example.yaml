@@ -88,10 +88,40 @@ universe:
                               # else says otherwise
 
 scanner:
+  # Since 2026-09-06 the scanner sends NO filters to IB Gateway at all. Every
+  # filter we tried on this account (priceAbove, stVolume5MinAbove,
+  # marketCapAbove, volumeAbove) made the scan return zero rows while Gateway
+  # logged "Scanner filter X is disabled" into a callback nobody reads, which is
+  # indistinguishable from a morning when nothing gapped. The same scan with no
+  # filters returns 50 rows in under a second. So the numbers below, and the
+  # universe block above, are applied in our own code against real daily bars.
+  # A filter we apply ourselves cannot be switched off by a subscription we do
+  # not have. See agent/README_scanner.md.
   rel_volume_min: 2.0         # a candidate must be trading at least this many
-                              # times its normal pace for the time of day
+                              # times its normal pace for the time of day,
+                              # measured at 09:35. At or above, not above.
   max_candidates: 20          # the shortlist handed to Claude is capped here
   exclude_leveraged_etfs: true  # no 2x or 3x or inverse products
+
+  finviz:
+    # An optional second opinion on what actually gapped. Finviz Elite has
+    # native gap and relative volume filters and a CSV export endpoint, so it
+    # would catch anything IBKR's lists miss. Mo has NOT bought it (39.50
+    # dollars a month), so this is off and nothing here signs up for anything.
+    # With enabled false the scanner writes one line in the log and makes no
+    # network call at all.
+    enabled: false
+    export_url: ""            # the whole Finviz export link, screener settings
+                              # and all. If it already carries its own auth=
+                              # token, nothing else is needed.
+    auth_token_key: FINVIZ_AUTH_TOKEN
+                              # otherwise the token is read from this key in the
+                              # secrets file below and appended to the link at
+                              # request time. It is never logged or written into
+                              # the shortlist.
+    secrets_file: finviz.env  # a file of KEY=value lines inside .secrets/, which
+                              # is gitignored. So the full path is
+                              # .secrets/finviz.env under the project folder.
 
 schedule:
   timezone: America/New_York  # every time below is New York time
