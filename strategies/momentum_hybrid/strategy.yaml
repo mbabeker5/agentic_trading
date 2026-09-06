@@ -71,11 +71,12 @@ universe:
   min_avg_volume: 1000000     # DEPRECATED, kept as an alias so an older file
                               # still loads. The scanner ignores it.
   allow_options: false        # no options in month one
-  allow_shorts: false   # shorting deferred to month two pending review (2026-09-06); flip only after the hub confirms
-                              # gap up (Mo, 2026-09-02). Switched on here, and
-                              # only here, now that the mirrored stop, the
-                              # gross exposure cap and the borrow check exist.
-                              # config/guardrails.yaml stays false.
+  allow_shorts: false         # OFF. Shorting is deferred to month two pending the
+                              # review team's critique (2026-09-06). The mirrored
+                              # stop, gross exposure cap and borrow check already
+                              # exist in the code, so flipping this to true is all
+                              # it takes once the hub confirms. Until then a short
+                              # is refused with rule id no_shorts.
   short_price_floor: 10       # shorts only on shares at 10 dollars or more.
                               # Cheap shares are the expensive ones to be short
                               # of: hard to borrow, and they can double in a
