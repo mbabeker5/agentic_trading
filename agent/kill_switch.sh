@@ -20,9 +20,22 @@
 # somebody typing this command in a hurry, leaving off --really, and walking away
 # believing the agent had been stopped when it had not.
 #
+# agent/kill_switch.py writes the same two files as its own first step, so on the
+# normal path they are written twice with the same content. Either half of the
+# panic button on its own stops the loop.
+#
 # What --really adds is the part that talks to the broker: cancelling working
 # orders and selling out of every position at the market. Without it, the script
 # reads the account and prints exactly what it would have done.
+#
+# Every argument is passed straight through to agent/kill_switch.py, so the third
+# flag works here too:
+#
+#   --live-account-ok   allow an account that does not start with DU to be
+#                       flattened. It needs AGENTIC_TRADING_KILL_LIVE=yes in the
+#                       environment as well, and refuses without both:
+#
+#     AGENTIC_TRADING_KILL_LIVE=yes .../agent/kill_switch.sh --really --live-account-ok
 #
 # Turn everything back on with:
 #   /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/reenable.sh
@@ -37,9 +50,11 @@ PYTHON="$PROJECT/venv312/bin/python"
 OUTPUT="$PROJECT/output"
 
 REALLY=""
-if [[ "${1:-}" == "--really" ]]; then
-  REALLY="--really"
-fi
+for ARGUMENT in "$@"; do
+  if [[ "$ARGUMENT" == "--really" ]]; then
+    REALLY="yes"
+  fi
+done
 
 mkdir -p "$OUTPUT"
 
@@ -68,7 +83,7 @@ if [[ -z "$REALLY" ]]; then
   echo
 fi
 
-"$PYTHON" "$PROJECT/agent/kill_switch.py" $REALLY
+"$PYTHON" "$PROJECT/agent/kill_switch.py" "$@"
 STATUS=$?
 
 echo
