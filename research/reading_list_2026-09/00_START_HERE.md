@@ -1,6 +1,8 @@
 # Trading strategy reading pack, September 2026
 
-Built for Mo's flight. Three annotated lists and 75 downloaded papers (about 173 MB) in the `pdfs/` folder beside this file. The PDFs are not in git; the lists carry every link, so anything missing can be re-downloaded.
+Built for Mo's flight. Four annotated lists and 159 downloaded papers (about 314 MB) in the `pdfs/` folder beside this file. The PDFs are not in git; the lists carry every link, so anything missing can be re-downloaded.
+
+**Read the fourth list first if you only read one thing new.** `04_gap_fill.md` was written later on 2026-09-06 by agents that had web search, after the first three lists were written from memory. It fixes 24 errors in the first three (each fix is dated in place), adds seven strategy families the first list skipped, adds the 2025 and 2026 live tests of language-model trading agents, verifies the Congress ETF numbers from SEC filings, and carries a revised flight order that merges everything. Its first three sections take ten minutes.
 
 Folder: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/`
 
@@ -9,6 +11,8 @@ Folder: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/re
 The published record says three things at once. First, a handful of simple effects are real, well documented and cheap to trade with an automated system: following executives who buy their own stock, momentum on daily ETF prices, the turn-of-month calendar effect, and the opening-range breakout when it is filtered by unusual volume. Second, the evidence that language-model agents beat buy-and-hold is weak, most of the impressive backtests are contaminated by models that already know how the story ended, and the fix is cheap: hide tickers, names and dates from the model. Third, the honest studies of retail day trading find fewer than one percent of participants earn reliable profits after fees, and nearly all the losses come from crossing the spread. Read the pack with those three facts in mind and the rest falls into place.
 
 ## Flight order
+
+The revised order that merges the fourth list is at the end of `04_gap_fill.md`. It runs about six and a half hours. The original five-hour order is kept below; it still works, it just predates the second pass.
 
 Read in this order. Times are rough, for a reader who skims the maths.
 
@@ -36,8 +40,8 @@ Read in this order. Times are rough, for a reader who skims the maths.
 
 ## What is not in the PDFs folder
 
-Each list has an appendix of papers that sit behind publisher bot walls (SSRN, AQR, Oxford, Cambridge, Springer). They are free but need a browser click. Do that on wifi before the flight if you want them: the anomalies list names seventeen, the practitioner list four, the LLM list one, plus two with no free copy anywhere.
+After the second pass, most of the papers the first three lists could not fetch are in the folder. Nineteen still need a browser click, and they are listed with links in Appendix 1 of `04_gap_fill.md`. Three of those (Bernard and Thomas 1989, Livnat and Mendenhall 2006, Harris and Gurel 1986) have no free copy anywhere and need a library login.
 
 ## Provenance
 
-The lists were written on 2026-09-06 by three research agents working mostly from their own knowledge, with web search unavailable for most of the session. Every PDF was opened and its first page checked against the claimed title, and several wrong downloads were caught and deleted. Links the agents could not verify are marked "unverified" in place. Treat any number not backed by a downloaded PDF as approximate.
+The first three lists were written on 2026-09-06 by three research agents working mostly from their own knowledge, with web search unavailable for most of the session. Later the same day a second set of agents with web search verified every item the first three lists had marked unverified, fixed 24 errors in place (each marked with the date), and wrote `04_gap_fill.md`. Every PDF was opened and its first page checked against the claimed title. Anything still unconfirmed is marked "still unverified" where it appears. Treat any number not backed by a downloaded PDF as approximate.

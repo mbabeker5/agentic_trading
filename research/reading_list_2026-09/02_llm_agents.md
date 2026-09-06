@@ -55,7 +55,7 @@ This is the section that makes people quit their jobs. Read section C immediatel
 - PDF: https://arxiv.org/pdf/2304.07619 (local: `LopezLira_2023_CanChatGPTForecastStockPriceMovements.pdf`)
 - The authors hand news headlines to ChatGPT with no financial fine-tuning at all and ask whether the news is good or bad for the stock, then trade on the answer. Using headlines from after the model's knowledge cutoff, GPT-4 gets roughly 90 percent portfolio-day hit rates on the initial, non-tradable market reaction, and the scores also predict the subsequent drift, most strongly in small stocks and on negative news. The 2025 revision adds the finding that most matters to you: strategy returns decline as more of the market adopts language models, which is exactly what you would expect if the edge is real and being competed away.
 - **Copy this:** the core prompt design, which is deliberately simple, plus the discipline of testing only on headlines dated after the model's training cutoff.
-- **Honesty: peer-reviewed** (the acknowledgements name a journal editor and two anonymous referees; earlier versions circulated as a preprint, so make sure you are reading the current one).
+- **Honesty: peer-reviewed.** Published in the Journal of Financial Economics, volume 184, October 2026, article 104335, DOI 10.1016/j.jfineco.2026.104335. The arXiv record still shows no journal reference, so anyone reading arXiv alone sees a preprint. (Corrected 2026-09-06: the earlier justification, that the acknowledgements named referees, proved nothing.)
 
 ### 4. Chen, Kelly and Xiu 2024, "Expected Returns and Large Language Models"
 - PDF: https://mgmt675-2025.kerryback.com/assets/ExpectedReturns_LLMs.pdf (local: `Chen_2024_ExpectedReturnsAndLargeLanguageModels.pdf`)
@@ -111,7 +111,7 @@ This is the most important section in the list for someone about to build a syst
 - **Copy this:** the headline number to remember is that two thirds of an in-sample return can be memory. Assume that about your own results until you have proved otherwise.
 - **Honesty: preprint.**
 
-### 12. Roy and Roy 2026, "MemGuard-Alpha: Detecting and Filtering Memorization-Contaminated Signals in LLM-Based Financial Forecasting"
+### 12. Roy and Roy 2026, "MemGuard-Alpha: Detecting and Filtering Memorization-Contaminated Signals in LLM-Based Financial Forecasting via Membership Inference and Cross-Model Disagreement"
 - PDF: https://arxiv.org/pdf/2603.26797 (local: `Roy_2026_MemGuardAlpha.pdf`)
 - Rather than fixing the model, this filters the signals: it scores each generated signal for how likely it is to be memorised, using membership inference tests and, more cleverly, disagreement between models with different training cutoff dates. Across seven models, 50 S&P 100 stocks and 42,800 prompts over 2019 to 2024, filtered signals produce a Sharpe ratio of 4.11 against 2.76 unfiltered, and clean signals earn 14.48 basis points a day against 2.13 for tainted ones. The single most damning chart in the whole reading list is here: as contamination rises, in-sample accuracy climbs from 40.8 to 52.5 percent while out-of-sample accuracy falls from 47 to 42 percent.
 - **Copy this:** the cross-model disagreement trick is genuinely cheap for a small shop. Ask two models with different cutoff dates the same question, and distrust the answer where the older one is suspiciously confident.
@@ -130,10 +130,10 @@ This is the most important section in the list for someone about to build a syst
 - **Honesty: preprint,** by authors whose applied econometrics work is peer-reviewed and widely cited.
 
 ### 15. Sarkar and Vafa 2024, "Lookahead Bias in Pretrained Language Models"
-- Link: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4754678 and https://openreview.net/forum?id=fn9cJkB86T
-- **PDF NOT DOWNLOADED.** SSRN and OpenReview both refused automated download (HTTP 403). The paper's existence, title, authors and 2024 date are verified through OpenAlex, but the links above are **unverified** in the sense that I could not open them to confirm they resolve for you. It appeared at ICML 2025, so a proceedings copy may exist by the time you look.
-- The paper demonstrates that pretrained models leak future information even on tasks where you would not expect it, and proposes a masking approach for financial text. I have summarised it from its abstract record rather than from the full text, so treat this entry as a pointer rather than a review.
-- **Honesty: preprint** (conference paper).
+- PDF: https://suproteem.is/assets/files/lookahead.pdf (local: `SarkarVafa_2024_LookaheadBiasPretrainedLMs.pdf`, 32 pages, version dated 18 October 2024). Also SSRN 4754678, DOI 10.2139/ssrn.4754678.
+- The paper develops direct statistical tests for lookahead bias, built on the idea that some events are unpredictable given a prespecified information set, so any model that predicts them must be remembering. They apply the tests to two tasks, predicting risk factors from corporate earnings calls and predicting election winners from candidate biographies, and find leakage in both. They also discuss why prompting the model to "pretend it is 2019" does not reliably remove the bias. (Corrected 2026-09-06: an earlier version of this entry said the paper proposes a masking approach for financial text. It does not; it proposes tests.)
+- **Copy this:** their unpredictable-event test. Ask the model to predict something it could not possibly know from the inputs; if it scores well, the period is contaminated.
+- **Honesty: preprint.** 2024 working paper, presented as a poster at the ICML 2025 DIG-BUGS workshop, not the main conference. No proceedings version exists.
 
 ---
 
@@ -150,7 +150,7 @@ The pre-LLM work in this section is the foundation. It is also better science th
 ### 17. Loughran and McDonald 2011, "When Is a Liability Not a Liability? Textual Analysis, Dictionaries, and 10-Ks"
 - PDF: https://www.uts.edu.au/globalassets/sites/default/files/adg_cons2015_loughran-mcdonald-je-2011.pdf (local: `LoughranMcDonald_2011_WhenIsALiabilityNotALiability.pdf`)
 - The authors show that the general-purpose Harvard psychological dictionary badly misclassifies financial writing, because words like liability, tax, cost and capital are negative in ordinary English but neutral in a 10-K. They build a finance-specific word list instead and show it produces stronger and more sensible links between filing tone and returns, volatility and trading volume. The Loughran-McDonald word lists that came out of this paper are free and are still the standard baseline that every new method has to beat.
-- **Copy this:** use the free word lists as your zero-cost benchmark. Their 2016 survey, "Textual Analysis in Accounting and Finance: A Survey" in the Journal of Accounting Research, is the natural follow-up, though I found no free PDF for it.
+- **Copy this:** use the free word lists as your zero-cost benchmark. Their 2016 survey, "Textual Analysis in Accounting and Finance: A Survey", Journal of Accounting Research 54(4), pages 1187 to 1230, DOI 10.1111/1475-679X.12123, is the natural follow-up. It is closed access with no repository copy anywhere (checked through Unpaywall 2026-09-06); the free route is a browser click at https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2504147.
 - **Honesty: peer-reviewed** (Journal of Finance).
 
 ### 18. Araci 2019, "FinBERT: Financial Sentiment Analysis with Pre-trained Language Models"
@@ -209,9 +209,9 @@ You asked which strategies gain most from an agent that can read around the cloc
 
 ### 26. Greenwood and Sammon 2022, "The Disappearing Index Effect"
 - PDF: https://www.nber.org/system/files/working_papers/w30748/w30748.pdf (local: `Greenwood_2022_DisappearingIndexEffect.pdf`)
-- The abnormal return from being added to the S&P 500 has fallen from 3.4 percent in the 1980s and 7.6 percent in the 1990s to 0.8 percent in the last decade, and the deletion effect has shrunk similarly to minus 0.6 percent. This happened despite index-linked assets growing enormously, which is the opposite of what a simple demand-curve story predicts. The authors work through the possible causes and discuss what it implies for market efficiency.
+- The abnormal return from being added to the S&P 500 has collapsed. The local PDF is the 2022 NBER working paper, which reports 3.4 percent in the 1980s, 7.6 percent in the 1990s, 0.8 percent in the last decade, and a deletion effect of minus 0.6 percent. The published Journal of Finance version revised these: the 1990s addition effect is 7.4 percent, the recent decade is "less than 1 percent", and the 2010 to 2020 deletion effect is **plus 0.1 percent, not minus 0.6**, so deleted stocks no longer fall at all. (Corrected 2026-09-06.) This happened despite index-linked assets growing enormously, which is the opposite of what a simple demand-curve story predicts. The authors work through the possible causes and discuss what it implies for market efficiency.
 - **Copy this:** read this as a warning, not a strategy. Index announcement trading is the textbook example of a reading-speed edge, and it is gone. Assume the same has happened to any event strategy you can name in one sentence.
-- **Honesty: preprint** (NBER working paper), subsequently published in the Journal of Finance.
+- **Honesty: peer-reviewed.** Journal of Finance 80(2), April 2025, pages 657 to 698, DOI 10.1111/jofi.13410. The local file is the earlier NBER working paper.
 
 A note on FDA decisions, which you asked about specifically. I did not find a strong recent open-access paper on trading FDA approval announcements, and I am not going to invent one. The general finding in that literature is that approval decisions move biotech prices sharply but that the PDUFA action dates are public in advance, so the edge is in interpreting the advisory committee documents rather than in learning the outcome first. Treat that as my summary of the area rather than as a cited finding, and if it matters to the project it deserves its own search.
 
@@ -343,7 +343,7 @@ The short answer from the best available evidence is: mostly no, and where they 
 - PDF: https://conferences.fuqua.duke.edu/assetpricing/wp-content/uploads/sites/2/2025/08/p9_DouGoldsteinJi.pdf (local: `Dou_2025_AIPoweredTradingAlgorithmicCollusion.pdf`)
 - Models what happens when many informed traders all use reinforcement learning, and shows they can learn to collude without any agreement, communication or awareness that they are colluding. It happens through two separate mechanisms, one where the algorithms learn price-trigger punishment strategies, and one the authors dryly call artificial stupidity, where homogenised learning biases produce the same under-reaction across everyone. The second mechanism persists even in efficient, liquid markets, and the result is worse price informativeness and worse liquidity.
 - **Copy this:** the warning that running the same model everyone else runs, on the same data, produces correlated behaviour you did not choose. This is the herding mechanism, and it is a real risk to your positions, not just a market-structure curiosity.
-- **Honesty: preprint** (NBER working paper w34054 and an SSRN version), by three well-regarded finance academics.
+- **Honesty: preprint.** The local PDF is the January 2024 SSRN version (abstract 4452704); the NBER working paper w34054 is dated July 2025, so cite it as 2025 if you use the NBER number. (Corrected 2026-09-06: the earlier entry mixed the NBER number with the SSRN date.) Authors are Winston Wei Dou and Itay Goldstein at Wharton and Yan Ji at HKUST.
 
 ---
 
@@ -359,7 +359,7 @@ The short answer from the best available evidence is: mostly no, and where they 
 - PDF: https://consumerwatchdog.org/sites/default/files/resources/abnormalreturnsziobrowski.pdf (local: `Ziobrowski_2004_AbnormalReturnsUSSenate.pdf`)
 - The paper that made congressional stock trading a public issue, finding that a portfolio mimicking senators' purchases beat the market by a substantial margin over 1993 to 1998. The evidence is a standard event-study calendar-time portfolio built from the senators' own disclosure filings. It is worth reading for the method, but be aware that this result has been directly contested by later work.
 - **Copy this:** the disclosure-mimicking portfolio construction, which is the template every congressional-trading tracker still uses.
-- **Honesty: peer-reviewed** (Journal of Financial and Quantitative Analysis), **but contested.** Eggers and Hainmueller's 2013 "Capitol Losses: The Mediocre Performance of Congressional Stock Portfolios" in the Journal of Politics reaches the opposite conclusion using a larger sample. I could not find a free PDF of the Eggers and Hainmueller paper, so that link is **unverified** and it is not in the folder.
+- **Honesty: peer-reviewed** (Journal of Financial and Quantitative Analysis), **but contested.** Eggers and Hainmueller (2013), "Capitol Losses: The Mediocre Performance of Congressional Stock Portfolios", Journal of Politics 75(2), pages 535 to 551, DOI 10.1017/s0022381613000194, find that members' portfolios underperformed a passive index fund by 2 to 3 percent a year over 2004 to 2008. They do two things: they reinterpret Ziobrowski's own results (arguing the Senate paper finds excess returns under only one of four specifications) and they run the first analysis of members' actual portfolio holdings rather than trades over fixed windows. Free author copy: https://andy.egge.rs/papers/Eggmueller_CapitolLosses.pdf (local: `EggersHainmueller_2013_CapitolLosses.pdf`, downloaded 2026-09-06).
 
 ### 48. Roodman, Sy, Atero Vázquez et al 2026, "Detecting Information Channels in Congressional Trading via Temporal Graph Learning"
 - PDF: https://arxiv.org/pdf/2602.05514 (local: `Roodman_2026_CongressionalTradingTemporalGraph.pdf`)
@@ -371,10 +371,10 @@ The short answer from the best available evidence is: mostly no, and where they 
 
 ## What I could not get
 
-- **Sarkar and Vafa 2024, "Lookahead Bias in Pretrained Language Models"**: SSRN and OpenReview both returned HTTP 403 to automated download. The paper is real and verified through OpenAlex, but the PDF is not in the folder and the links are unverified in the sense that I could not open them.
-- **Loughran and McDonald 2016, "Textual Analysis in Accounting and Finance: A Survey"** (Journal of Accounting Research): no free PDF found. The 2011 paper in the folder covers the essential idea.
-- **Eggers and Hainmueller 2013, "Capitol Losses"** (Journal of Politics): no free PDF found, and it matters because it is the main rebuttal to Ziobrowski.
-- **A good open-access paper on trading FDA decisions**: I did not find one I would stand behind, so I have not cited one.
+Updated 2026-09-06 after a verification pass with web search. Sarkar and Vafa 2024 and Eggers and Hainmueller 2013 are now downloaded (see entries 15 and 47). What remains:
+
+- **Loughran and McDonald 2016, "Textual Analysis in Accounting and Finance: A Survey"** (Journal of Accounting Research 54(4)): closed access, no repository copy anywhere. Free by browser click at https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2504147. The 2011 paper in the folder covers the essential idea.
+- **A good open-access paper on trading FDA decisions**: not found, so none is cited.
 
 ## The bottom line for a one-person shop
 

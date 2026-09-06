@@ -17,7 +17,7 @@ This file: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research
 
 #### 1. Inside the Black Box: A Simple Guide to Quantitative and High-Frequency Trading
 Rishi K. Narang, 2nd edition, 2013.
-Where to get it: no free PDF. Wiley store, `https://www.wiley.com/en-us/Inside+the+Black+Box%3A+A+Simple+Guide+to+Quantitative+and+High+Frequency+Trading%2C+2nd+Edition-p-9781118362419`. Also on Amazon and Kindle.
+Where to get it: no free PDF. Wiley store, `https://www.wiley.com/en-us/Inside+the+Black+Box%3A+A+Simple+Guide+to+Quantitative+and+High+Frequency+Trading%2C+2nd+Edition-p-9781118662717` (link corrected 2026-09-06; the earlier print-ISBN link returned 404). Also on Amazon and Kindle.
 
 This is the only book on the list written for someone who runs or funds a quant shop rather than someone who codes one. Narang breaks a systematic trading firm into its parts (alpha model, risk model, transaction cost model, portfolio construction, execution, data, research) and explains what each part does and how they fail, with almost no maths. It is short, roughly 300 pages, and the second edition adds a plain section on high frequency trading that clears up most of the noise around it.
 
@@ -29,7 +29,7 @@ Skip: the appendices on specific HFT market structure debates. They date from 20
 
 #### 2. Systematic Trading: A Unique New Method for Designing Trading and Investing Systems
 Robert Carver, 2015.
-Where to get it: no free PDF. Harriman House store, `https://harriman-house.com/systematictrading`. Carver's own site with errata and code, `https://qoppac.blogspot.com/p/systematic-trading-book.html`.
+Where to get it: no free PDF. Harriman House store, `https://www.harriman-house.com/authors/robert-carver/systematic-trading/9780857194459` (link corrected 2026-09-06; the short link returned 404). Carver's own site with errata and code, `https://qoppac.blogspot.com/p/systematic-trading-book.html`.
 
 Carver ran systematic funds at AHL and then went home and ran the same ideas on his own money, which is exactly your situation. The book's central argument is that most retail systematic traders lose not because their signal is bad but because their position sizing, diversification and rule count are wrong, so he spends most of the pages on risk targeting, volatility scaling and how few rules you actually need. It has a genuinely useful framework for deciding how much to trade based on how confident you are, which he calls forecast scaling.
 
@@ -55,7 +55,7 @@ Skip: the sections on spread betting and CFDs. Those are UK retail products, not
 
 #### 4. Advanced Futures Trading Strategies: 30 Fully Tested Strategies for Multiple Trading Styles and Time Frames
 Robert Carver, 2023.
-Where to get it: no free PDF. Harriman House store, `https://harriman-house.com/advancedfuturestrading`. Python code is free at `https://github.com/robcarver17/advanced_futures_trading_strategies` (link unverified in this session).
+Where to get it: no free PDF. Harriman House store, `https://www.harriman-house.com/authors/robert-carver/advanced-futures-trading-strategies/9780857199683` (link corrected 2026-09-06). There is no GitHub repository for this book; Carver publishes the spreadsheets and Python snippets at `https://www.systematicmoney.org/advanced-futures-information`. (Corrected 2026-09-06: an earlier version pointed at a repo that does not exist.)
 
 Carver's third book takes the framework from the first two and runs 30 concrete strategies through it, reporting real costs and real Sharpe ratios rather than backtest fantasies. The strategies escalate from a single moving average to carry, skew, seasonality and relative value, each with the sizing already worked out. The value is less in any one strategy and more in seeing the same disciplined evaluation applied 30 times.
 
@@ -115,9 +115,9 @@ Skip: most of it, on a first pass. Read chapter 7 on cross validation, chapter 3
 
 #### 9. Machine Learning for Asset Managers
 Marcos López de Prado, 2020.
-Where to get it: no free PDF. Cambridge University Press, `https://www.cambridge.org/core/elements/machine-learning-for-asset-managers/6D9211305EA2E425D33A9F38D0AE3545`.
+Where to get it: no free PDF. Cambridge University Press, `https://www.cambridge.org/core/elements/abs/machine-learning-for-asset-managers/6D9211305EA2E425D33A9F38D0AE3545`.
 
-A 190 page Cambridge Element that is far more approachable than Advances, covering denoising covariance matrices, distance metrics, clustering and the false strategy theorem. It is the readable version of the same author's worldview. The false strategy theorem section is the one to read.
+A short Cambridge Element (about 150 pages) that is far more approachable than Advances, covering denoising covariance matrices, distance metrics, clustering and the false strategy theorem. It is the readable version of the same author's worldview. The false strategy theorem section is the one to read.
 
 Why it matters for an agent-run shop: it gives you the arithmetic for how much a Sharpe ratio must be discounted when a machine tried many strategies, which is precisely your risk.
 
@@ -223,14 +223,14 @@ AQR publish full journal-quality papers for free, and Cliff Asness in particular
 
 Why it matters for an agent-run shop: AQR are the most credible public source on the gap between a paper's backtest and a live portfolio, which is the gap that will kill you.
 
-Note: `https://www.aqr.com/Insights/Research` responds normally in a browser but returned a bot-block to my command line download attempts, so the individual PDFs are not in the local folder. Download by hand before the flight.
+Two of the four are now local (downloaded 2026-09-06): `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/Asness_2014_FactFictionMomentum.pdf` (19 pages, from the AQR journal-articles mirror) and `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/Frazzini_2018_TradingCosts.pdf` (88 pages, August 2018 working paper, from Chicago Booth). "Value and Momentum Everywhere" and "Betting Against Beta" are already in the folder under the anomalies list. The main aqr.com research index still blocks scripts, so anything else from AQR needs a browser.
 
 **Flight reading**, one paper at a time.
 
 #### Robert Carver's blog
 `https://qoppac.blogspot.com/`
 
-Carver has blogged since 2014 about running his own systematic futures portfolio, with real results, real mistakes and open source code (`pysystemtrade` at `https://github.com/robcarver17/pysystemtrade`). It is the single most useful free account of a one-person systematic operation that exists.
+Carver has blogged since 2014 about running his own systematic futures portfolio, with real results, real mistakes and open source code (`pysystemtrade`, moved to a GitHub organisation in January 2026: `https://github.com/pst-group/pysystemtrade`; the old robcarver17 address still redirects). It is the single most useful free account of a one-person systematic operation that exists.
 
 Why it matters for an agent-run shop: `pysystemtrade` is a working reference implementation of everything the books describe, including the boring parts like broker reconnection and position reconciliation, which is exactly where an autonomous system breaks.
 
@@ -295,16 +295,14 @@ Why it matters for an agent-run shop: a machine will not quit on its own, so you
 
 #### Day Trading for a Living?
 Fernando Chague, Rodrigo De-Losso, Bruno Giovannetti, SSRN working paper 3423101, 2020.
-Where to get it: `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3423101` (store link, free to download from SSRN in a browser).
-**Download failed.** SSRN returns 403 to command line requests, the FGV institutional repository at `https://repositorio.fgv.br/dspace/handle/10438/28162` sits behind a bot-protection wall, and neither OpenAlex nor Semantic Scholar lists an open-access copy. Get it manually from SSRN in a browser.
+Local: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/Chague_2020_DayTradingForALiving.pdf` (18 pages, FEA/USP Working Paper 2019-47, downloaded 2026-09-06)
+Source: `http://www.repec.eae.fea.usp.br/documentos/Chague_Losso_Giovannetti_47WP.pdf`. Also SSRN 3423101.
 
-The Brazilian counterpart to the Taiwan studies, and the more brutal one. The authors follow every individual who began day trading equity index futures on the Brazilian exchange between 2013 and 2015, and among those who persisted for at least 300 days almost all lost money, with only a tiny fraction earning more than a bank teller's salary. The headline finding, that roughly 97% of persistent day traders lost money, is the number most often quoted from this paper.
-
-Note: I am reporting the headline figures from memory here because I could not download the PDF to verify them. Treat the exact percentages as approximate until you have read the paper.
+The Brazilian counterpart to the Taiwan studies, and the more brutal one. The authors follow every individual who began day trading equity index futures on the Brazilian exchange between 2013 and 2015 and persisted for at least 300 days. From the abstract: 97 percent of them lost money, only 0.4 percent earned more than a bank teller (54 US dollars a day), and the top individual earned only 310 US dollars a day with a standard deviation of 2,560. They also find no evidence of learning by day trading. (Figures verified against the paper 2026-09-06. An older draft quoted "1.1 percent beat the minimum wage, 0.5 percent beat a bank teller"; those numbers are superseded.)
 
 Why it matters for an agent-run shop: it tests persistence specifically, so it rules out the comforting story that people fail because they quit too early.
 
-**Flight reading** once you have the PDF.
+**Flight reading.**
 
 ---
 
@@ -348,7 +346,7 @@ Why it matters for an agent-run shop: it converts "are we overfitting" from a vi
 #### ... and the Cross-Section of Expected Returns
 Campbell R. Harvey, Yan Liu, Heqing Zhu, Review of Financial Studies, 2016.
 Local: `.../pdfs/Harvey_2016_CrossSectionExpectedReturns.pdf` (64 pages)
-Source: `https://faculty.fuqua.duke.edu/~charvey/Research/Published_Papers/P118_and_the_cross.pdf`
+Source: `https://people.duke.edu/~charvey/Research/Published_Papers/P118_and_the_cross.pdf` (the older faculty.fuqua.duke.edu host now fails certificate checks)
 
 Harvey and coauthors count the factors that academic finance has claimed predict stock returns, find 316 of them, and point out that with that many tests the conventional significance threshold is meaningless. Their recommendation is that a new factor should need a t-statistic above roughly 3.0, not 2.0, to be believed, and that even that is generous because unpublished failed tests are invisible. The title is a joke about how every paper announces one more factor.
 
@@ -358,25 +356,25 @@ Why it matters for an agent-run shop: it sets the evidential bar for accepting a
 
 #### Evaluating Trading Strategies
 Campbell R. Harvey and Yan Liu, Journal of Portfolio Management, 2014.
-Where to get it: `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2474755` (store link, free on SSRN in a browser).
-**Download failed.** SSRN blocks command line requests with a 403.
+Local: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/HarveyLiu_2014_EvaluatingTradingStrategies.pdf` (11 pages, typeset journal reprint, downloaded 2026-09-06)
+Source: `https://people.duke.edu/~charvey/Research/Published_Papers/P116_Evaluating_trading_strategies.pdf`. Also SSRN 2474755.
 
 The short, practical companion to the paper above, aimed at practitioners rather than academics. It lays out three multiple-testing corrections (Bonferroni, Holm, Benjamini Hochberg Yekutieli) and shows how to apply each to a set of candidate trading strategies. It also gives a simple haircut formula for Sharpe ratios based on the number of tests.
 
 Why it matters for an agent-run shop: it is the most implementable of the multiple-testing papers, so it is the one your agent should code first.
 
-**Flight reading** once downloaded. Around 20 pages.
+**Flight reading.** Eleven pages.
 
 #### The 10 Reasons Most Machine Learning Funds Fail
 Marcos López de Prado, Journal of Portfolio Management, 2018.
-Where to get it: `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3104816` (store link, free on SSRN in a browser).
-**Download failed.** SSRN blocks command line requests, and the author's own site at `https://www.quantresearch.org/` serves its publications page through frames with no extractable direct links.
+Local: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/LopezDePrado_2018_TenReasonsMLFundsFail.pdf` (21 pages, version dated 27 January 2018, downloaded 2026-09-06)
+Source: `https://www.garp.org/hubfs/Whitepapers/a1Z1W0000054x6lUAA.pdf`. Also SSRN 3104816.
 
 A list-shaped paper enumerating ten specific, common and fatal errors, including the sisyphus paradigm of having one person do every job, backtesting through resampling that ignores time ordering, using inappropriate performance metrics, and chasing false discoveries. It is written from the position of someone who has watched many funds die. Each item is a paragraph or two, so it reads fast.
 
 Why it matters for an agent-run shop: item one, the failure of the lone quant doing everything, is precisely the failure mode a multi-agent setup is supposed to fix, and the paper tells you what the specialised roles should be.
 
-**Flight reading** once downloaded.
+**Flight reading.**
 
 ---
 
@@ -398,6 +396,7 @@ Practical consequences to design for:
 - There is now a continuous check to implement: available withdrawal power against maintenance margin, evaluated after every fill, not at end of day.
 - The failure mode is now a 90 day freeze rather than a 90 day trade restriction, and 90 days of not being allowed to open short positions would end a strategy season. Treat any intraday margin deficit as a kill-switch event, not a warning.
 - The phase-in to October 2027 means Interactive Brokers may apply the old rules, the new rules, or its own stricter house rules during the transition. **Confirm with IBKR directly what applies to your account before you size anything.** Brokers are permitted to be stricter than FINRA and usually are.
+- Two softening provisions, added 2026-09-06 after reading the notice in full: an intraday margin deficit expires after the fifteenth business day if it has not been satisfied, and the 90 day freeze only applies to a customer who "makes a practice" of failing to meet deficits promptly. Deficits below the lesser of 5 percent of account equity or 1,000 dollars do not count towards that practice test. So a single small deficit is not a freeze under the rule. Treating it as a kill-switch event anyway is still the safer house policy, and the notice permits brokers to check the deficit once a day rather than continuously.
 
 **Flight reading.** It is short and it is the current law.
 
@@ -433,7 +432,7 @@ Why it matters for an agent-run shop: at your size impact is small, but the fram
 
 #### Algorithmic Trading and DMA: An Introduction to Direct Access Trading Strategies
 Barry Johnson, 2010.
-Where to get it: no free PDF. `https://www.algo-dma.com/` or Amazon.
+Where to get it: no free PDF. The book's own site, algo-dma.com, was down when checked on 2026-09-06 (server error, no HTTPS), so buy it on Amazon or secondhand. 4Myeloma Press, 574 pages.
 
 The most complete single reference on order types, market microstructure by asset class, and execution algorithms, written before the current era but still the standard. It explains what a broker's algo is actually doing when you select it, which no broker's own documentation will tell you. It is dated on venues and regulation, current on mechanics.
 
@@ -442,8 +441,8 @@ Why it matters for an agent-run shop: it is the book to consult when you need to
 **Reference only.** Dated in parts, expensive, still the standard.
 
 #### The Science of Algorithmic Trading and Portfolio Management
-Robert Kissell, 2013 (2nd edition 2021 as Algorithmic Trading Methods).
-Where to get it: no free PDF. Elsevier store, `https://www.elsevier.com/books/algorithmic-trading-methods/kissell/978-0-12-815630-8`.
+Robert Kissell, 2013 (2nd edition September 2020 as Algorithmic Trading Methods; year corrected 2026-09-06).
+Where to get it: no free PDF. Elsevier store, `https://shop.elsevier.com/books/algorithmic-trading-methods/kissell/978-0-12-815630-8`.
 
 Kissell is the standard reference on transaction cost analysis, meaning how you measure whether your execution was good or bad after the fact. The core concept is implementation shortfall, the difference between the price you decided to trade at and the price you actually got, decomposed into delay, impact, timing and opportunity cost. This decomposition is what turns "slippage" into four numbers you can each act on.
 
@@ -486,7 +485,7 @@ The three books above are not free, so buy the ebooks before you leave.
 
 Folder: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/reading_list_2026-09/pdfs/`
 
-Note that this folder is shared with other research agents working the same reading list, so it contains more files than the nine below. These nine are the ones this practitioner list cites.
+Note that this folder is shared with other research agents working the same reading list, so it contains more files than the fourteen below. These fourteen are the ones this practitioner list cites (nine from the original pass, five added on 2026-09-06).
 
 | File | Paper | Pages |
 |---|---|---|
@@ -499,19 +498,19 @@ Note that this folder is shared with other research agents working the same read
 | `Bailey_2017_ProbabilityBacktestOverfitting.pdf` | Bailey, Borwein, López de Prado, Zhu, The Probability of Backtest Overfitting | 34 |
 | `Harvey_2016_CrossSectionExpectedReturns.pdf` | Harvey, Liu, Zhu 2016, ... and the Cross-Section of Expected Returns | 64 |
 | `AlmgrenChriss_2000_OptimalExecution.pdf` | Almgren and Chriss 2000, Optimal Execution of Portfolio Transactions | short |
+| `Chague_2020_DayTradingForALiving.pdf` | Chague, De-Losso, Giovannetti, Day Trading for a Living? (added 2026-09-06) | 18 |
+| `HarveyLiu_2014_EvaluatingTradingStrategies.pdf` | Harvey and Liu 2014, Evaluating Trading Strategies (added 2026-09-06) | 11 |
+| `LopezDePrado_2018_TenReasonsMLFundsFail.pdf` | López de Prado 2018, The 10 Reasons Most Machine Learning Funds Fail (added 2026-09-06) | 21 |
+| `Asness_2014_FactFictionMomentum.pdf` | Asness, Frazzini, Israel, Moskowitz 2014, Fact, Fiction and Momentum Investing (added 2026-09-06) | 19 |
+| `Frazzini_2018_TradingCosts.pdf` | Frazzini, Israel, Moskowitz 2018, Trading Costs (added 2026-09-06) | 88 |
 
 Every one of these was opened and the first page checked against the expected title, so none are wrong-file downloads.
 
 ## Appendix B. Downloads that failed
 
-Four items could not be downloaded automatically. All four are free to download by hand in a browser.
+Updated 2026-09-06. All four items listed here in the original pass were found on open mirrors and downloaded (see Appendix A). Nothing on this list now needs a manual click.
 
-1. **Chague, De-Losso and Giovannetti, Day Trading for a Living?** SSRN returns 403 to command line requests. The FGV institutional repository sits behind an Anubis bot-protection wall. Neither OpenAlex nor Semantic Scholar lists an open-access copy. Get it at `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3423101`.
-2. **Harvey and Liu, Evaluating Trading Strategies.** SSRN 403. Get it at `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2474755`.
-3. **López de Prado, The 10 Reasons Most Machine Learning Funds Fail.** SSRN 403, and the author's own site serves its publications page through HTML frames with no extractable links. Get it at `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3104816`.
-4. **AQR research papers** including Fact, Fiction and Momentum Investing and Trading Costs. The aqr.com PDF paths return an HTML bot-block to command line requests. Browse to `https://www.aqr.com/Insights/Research` and download in a browser.
-
-FINRA Regulatory Notice 26-10 is also not stored locally for the same reason, but its content was fetched and verified in this session, so the summary in Section 5 is from the notice itself rather than from memory.
+FINRA Regulatory Notice 26-10 is not stored locally because FINRA blocks scripted downloads. Its content was fetched and verified twice, on 2026-09-06 from both the notice page and the PDF at `https://www.finra.org/sites/default/files/2026-04/Regulatory-Notice-26-10.pdf`, so the summary in Section 5 is from the notice itself.
 
 ## Appendix C. Link verification status
 
@@ -519,4 +518,4 @@ Checked live in this session and responding normally: `quantpedia.com/strategies
 
 Responded with a bot-block rather than content, meaning the site is live but would not talk to a script: `alphaarchitect.com/blog/`, SSRN, `repositorio.fgv.br`.
 
-**Not verified in this session, treat as unconfirmed:** the `ib_async` GitHub and docs URLs, the `robcarver17/advanced_futures_trading_strategies` GitHub URL, and all publisher store links for the books (Wiley, Harriman House, Cambridge, Elsevier, algo-dma.com). Those are written from knowledge, not checked, so a couple may have moved.
+**Checked 2026-09-06 with web access.** The `ib_async` GitHub and docs URLs resolve. All Wiley store links resolve except the Narang one, which was fixed above. Two Harriman House short links were dead and are fixed above. The Advanced Futures Trading Strategies GitHub repo does not exist and the claim was removed. The Elsevier and Cambridge links redirect and now point at their destinations. algo-dma.com is down. `pysystemtrade` moved to the pst-group organisation. Nothing in this file is now marked unverified.
