@@ -408,6 +408,8 @@ def test_stop_allows_exits_only(sandbox):
 
     # With the stop file there, the guardrails refuse an entry and allow an exit.
     guard = guard_for("B")
+    # shorts are off for month one; judge the closing sale as an exit, the test is about STOP
+    guard = dataclasses.replace(guard, universe=dataclasses.replace(guard.universe, allow_shorts=True))
     account_state = bs.account_state_for(state, gr, at(10, 0), "DUT077572",
                                          kill_switch_present=True,
                                          broker_positions={})
