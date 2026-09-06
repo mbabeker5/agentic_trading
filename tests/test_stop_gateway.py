@@ -3,8 +3,12 @@ import os
 import subprocess
 from pathlib import Path
 
-ROOT = Path(os.environ.get("AGENTIC_TRADING_ROOT",
-                           "/Users/mtalib/workspace_repos/personal_repo/agentic_trading"))
+# The project root, found the same way agent/paths.py finds it: the environment
+# variable when it is set, otherwise two folders above this file. A hard coded
+# fallback here would make this test fail on any other Mac, which would be a
+# rotten thing for a test whose whole job is to be run after a move.
+ROOT = Path(os.environ.get("AGENTIC_TRADING_ROOT")
+            or Path(__file__).resolve().parent.parent)
 SCRIPT = ROOT / "agent" / "stop_gateway.sh"
 
 
