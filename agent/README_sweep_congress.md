@@ -51,7 +51,7 @@ is better: the government's own systems.
 | **congress-legislators** on GitHub | Yes | 2026-09-03 | YAML | Yes, raw files over HTTPS |
 | House Stock Watcher, the S3 bucket | **No** | n/a | n/a | Answers HTTP 403 Access Denied. Its GitHub repository has been deleted. |
 | Senate Stock Watcher, the S3 bucket | **No** | n/a | n/a | Answers HTTP 403 Access Denied. Its GitHub repository last saw a change in March 2021. |
-| **Community mirror** of the House feed, `raw.githubusercontent.com/TattooedHead/house-stock-watcher-data` | Yes | 2026-09-01 | One JSON file, 23,969 records | Yes, raw file over HTTPS |
+| **Independent GitHub feed** (not a mirror: its own scraper reads the House Clerk directly), `raw.githubusercontent.com/TattooedHead/house-stock-watcher-data` | Yes | 2026-09-01 | One JSON file, 23,969 records | Yes, raw file over HTTPS |
 | Capitol Trades | **No** | n/a | n/a | The website answers every request, `robots.txt` included, with a bot challenge behind HTTP 429. Their own data service answers HTTP 503 on every path because something is misconfigured on their side. Not implemented, because it cannot be reached to test. |
 | Unusual Whales, Quiver, Finnhub, Financial Modeling Prep | Paid | n/a | n/a | All refuse without an API key. None were signed up for. |
 
@@ -62,7 +62,7 @@ not merely stale. The script does not use them and does not try.
 alternatives to each other, they cover different chambers, so the script runs
 both and uses whatever answers.
 
-**Fallback: a community mirror of the House feed.** Capitol Trades was meant to
+**Fallback: an independent GitHub feed that scrapes the House Clerk itself.** Capitol Trades was meant to
 be the fallback, but it cannot be reached at all, so writing code against it
 would mean shipping something untestable. Instead the fallback is a volunteer
 rebuild of the old House Stock Watcher feed: one JSON file on GitHub, refreshed
