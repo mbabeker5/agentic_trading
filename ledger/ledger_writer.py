@@ -35,6 +35,18 @@ of a call a few seconds after answering, so a 0 in hand at write time usually
 means "not settled yet" rather than "free", and writing that 0 would be a lie the
 month end cost comparison then repeats.
 
+log_trade takes two more, both optional, and both about measuring slippage:
+
+  decision_price  the price the model or the rule decided at
+  decision_time   when that decision was made, a datetime or a string
+
+The sheet does the arithmetic from there. Trades columns U and V hold the
+slippage in dollars and in basis points as live formulas, sitting ready in every
+row from 2 to 1000, so Python never writes them and must never write them: a
+blank sent to U or V would delete the formula in that row for good. That is also
+why a trade is appended over the range Trades!A:T rather than A:Z, and without
+insertDataOption=INSERT_ROWS. See _append below, where it is spelled out.
+
 Two promises every one of them keeps:
 
 1. It never raises. If the wifi is off, the token has expired or Google is
@@ -80,6 +92,13 @@ RULES_TAB = "Rules Log"
 
 # The Trades tab, left to right, with the friendlier names a caller may use
 # instead of the exact column heading.
+#
+# This list stops at column T, and "Slippage $" and "Slippage bps" are missing
+# from it on purpose. Those two are columns U and V, and they are formulas that
+# already live in the sheet, pre-filled down to row 1000 by
+# ledger/create_ledger_sheet.py. Adding them here would make every write send an
+# empty cell to U and V, which would wipe the formula out of that row and leave
+# the slippage blank forever after. So they must never be added.
 TRADES_COLUMNS: list[tuple[str, tuple[str, ...]]] = [
     ("Timestamp (ET)", ("timestamp", "timestamp_et", "ts")),
     ("Date", ("date",)),
@@ -99,7 +118,22 @@ TRADES_COLUMNS: list[tuple[str, tuple[str, ...]]] = [
     ("Model", ("model",)),
     ("Model Cost USD", ("model_cost_usd", "model_cost", "cost_usd")),
     ("Prompt Hash", ("prompt_hash", "hash")),
+    ("Decision Price", ("decision_price", "decided_price")),
+    ("Decision Time (ET)", ("decision_time", "decision_time_et", "decided_at")),
 ]
+
+# Which columns each tab's append is allowed to touch.
+#
+# Trades stops at T because U and V are the pre-filled slippage formulas. It is
+# not only that we must not write to them: Google works out where the bottom of
+# a table is by looking inside the range it is given, so an append over A:Z
+# would see the formulas reaching down to row 1000, call that the last row, and
+# start adding trades at row 1001, below every formula. A:T hides the formula
+# columns from that search, so an append lands on the first genuinely empty
+# trade row, which is a row that already has its formulas.
+TRADES_APPEND_COLUMNS = "A:T"
+# The Rules Log has no formulas anywhere, so it keeps the wide range.
+RULES_APPEND_COLUMNS = "A:Z"
 
 # The Daily tab is mostly formulas. These are the only columns the agent owns.
 # D, E, F, H, I and J work out daily and cumulative profit, SPY's return and
@@ -207,8 +241,24 @@ def _print_row(where: str, row: Sequence[Any]) -> None:
     print(f"DRY RUN would add to the ledger tab {where}: {printable}")
 
 
-def _append(tab: str, row: Sequence[Any], dry_run: bool) -> bool:
-    """Add one row to the bottom of a tab."""
+def _append(tab: str, row: Sequence[Any], dry_run: bool,
+            columns: str = RULES_APPEND_COLUMNS, insert_rows: bool = True) -> bool:
+    """Add one row to the bottom of a tab.
+
+    Two knobs, and both of them exist for the Trades tab's slippage formulas.
+
+    columns      the columns Google is allowed to look at when it works out
+                 where the bottom of the table is, and the columns this row is
+                 written into. Trades passes A:T so that the pre-filled
+                 formulas in U and V stay invisible to that search.
+    insert_rows  True asks Google to push a brand new row in. That is right for
+                 the Rules Log, which is plain rows all the way down. It is
+                 wrong for Trades, because a new row would be inserted with no
+                 slippage formulas in it and would shove the prepared rows
+                 further down the tab. Trades passes False, which is Google's
+                 default overwrite behaviour, so the values land in the blank
+                 row that is already waiting with its formulas intact.
+    """
     if dry_run:
         _print_row(tab, row)
         return True
@@ -218,9 +268,11 @@ def _append(tab: str, row: Sequence[Any], dry_run: bool) -> bool:
     session = _session()
     if session is None:
         return False
-    target = quote(f"{tab}!A:Z", safe="")
+    target = quote(f"{tab}!{columns}", safe="")
     url = (f"{SHEETS_API}/{sheet_id}/values/{target}:append"
-           "?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS")
+           "?valueInputOption=USER_ENTERED")
+    if insert_rows:
+        url += "&insertDataOption=INSERT_ROWS"
     try:
         response = session.post(
             url, json={"values": [[_safe_cell(cell) for cell in row]]}, timeout=HTTP_TIMEOUT)
@@ -238,6 +290,7 @@ def _append(tab: str, row: Sequence[Any], dry_run: bool) -> bool:
 
 def log_trade(row: dict, book_id: Any = None, model: Any = None,
               model_cost_usd: Any = None, prompt_hash: Any = None,
+              decision_price: Any = None, decision_time: Any = None,
               dry_run: bool = False) -> bool:
     """Record one fill on the Trades tab.
 
@@ -254,6 +307,16 @@ def log_trade(row: dict, book_id: Any = None, model: Any = None,
         log_trade({"symbol": "AAPL"}, book_id="A", model="claude-fable-5.1")
 
     An argument passed on its own wins over the same thing inside the dict.
+
+    decision_price and decision_time say what the model or the rule saw when it
+    made the call, and go the same way:
+
+        log_trade({"symbol": "AAPL", "decision_price": 231.10})
+        log_trade({"symbol": "AAPL"}, decision_price=231.10, decision_time=when)
+
+    Write those two and the sheet fills in the slippage in dollars and in basis
+    points on its own, in columns U and V. Leave them out and those two cells
+    stay blank, which is the honest answer rather than a guess.
 
     Anything left out is written as an empty cell. Notional is worked out from
     quantity times price when it was not supplied.
@@ -286,16 +349,23 @@ def log_trade(row: dict, book_id: Any = None, model: Any = None,
 
     for heading, argument in (("Book", book_id), ("Model", model),
                               ("Model Cost USD", model_cost_usd),
-                              ("Prompt Hash", prompt_hash)):
+                              ("Prompt Hash", prompt_hash),
+                              ("Decision Price", decision_price),
+                              ("Decision Time (ET)", decision_time)):
         if argument is not None:
             filled[heading] = argument
     filled["Model Cost USD"] = _cost_cell(filled["Model Cost USD"])
+    # A decision time may arrive as a datetime, so it goes through the same
+    # helper as the Timestamp column and lands as the same New York string.
+    if filled["Decision Time (ET)"]:
+        filled["Decision Time (ET)"] = _as_text(filled["Decision Time (ET)"])
 
     unknown = set(row) - {h for h, _ in TRADES_COLUMNS} - {a for _, al in TRADES_COLUMNS for a in al}
     if unknown:
         _warn(f"log_trade ignored fields it has no column for: {sorted(unknown)}")
 
-    return _append(TRADES_TAB, [filled[h] for h, _ in TRADES_COLUMNS], dry_run)
+    return _append(TRADES_TAB, [filled[h] for h, _ in TRADES_COLUMNS], dry_run,
+                   columns=TRADES_APPEND_COLUMNS, insert_rows=False)
 
 
 # ------------------------------------------------------------------ Rules Log
@@ -486,11 +556,14 @@ def _cli() -> int:
     # A stand in for the sha256 of a rendered system prompt.
     sample_hash = hashlib.sha256(b"sample system prompt").hexdigest()
     ok = [
+        # Decided at 765.20 and filled at 765.25, so the sheet should show five
+        # cents a share of slippage against us: $0.50 on ten shares, 0.65 bps.
         log_trade({"symbol": "SPY", "side": "BUY", "qty": 10, "price": 765.25,
                    "order_type": "LMT", "signal": "opening range break",
                    "reason": "sample row from the self test"},
                   book_id="A", model="openrouter/anthropic/claude-fable-5.1",
-                  model_cost_usd=0.0184, prompt_hash=sample_hash, dry_run=dry),
+                  model_cost_usd=0.0184, prompt_hash=sample_hash,
+                  decision_price=765.20, decision_time=now, dry_run=dry),
         log_decision(now, "SPY", "no entry", "sample row from the self test",
                      mode="dry-run", book_id="A",
                      model="openrouter/anthropic/claude-fable-5.1",

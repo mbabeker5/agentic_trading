@@ -71,6 +71,12 @@ FMT_DECIMAL = ("NUMBER", "0.00")
 # US trading is about 21 days, so 40 leaves plenty of room.
 DAILY_FORMULA_ROWS = 40
 
+# How many Trades rows get the two slippage formulas filled in ahead of time.
+# 999 rows means row 2 to row 1000, which is the whole Trades tab below its
+# header. The formulas have to be sitting there before a fill arrives, because
+# the agent writes values into a row rather than writing formulas of its own.
+TRADES_FORMULA_ROWS = 999
+
 # The five books the eval runs side by side inside the one paper account.
 # Book id, strategy, model. Every trade and every decision is stamped with the
 # book that made it, so the tabs can be sliced per book at the end of the month.
@@ -104,6 +110,14 @@ TRADES_HEADERS = [
     "Model",
     "Model Cost USD",
     "Prompt Hash",
+    # The four slippage columns are appended on the end on purpose. Every
+    # formula elsewhere in this sheet points at Trades columns A to R, so
+    # adding these anywhere but the end would move a column out from under
+    # them. Python fills in the first two, the sheet works out the last two.
+    "Decision Price",
+    "Decision Time (ET)",
+    "Slippage $",
+    "Slippage bps",
 ]
 
 DAILY_HEADERS = [
@@ -150,16 +164,19 @@ BOOKS_HEADERS = [
     "Model Cost USD",
     "Rule Triggers",
     "Missed Ticks",
+    "Slippage $",
+    "Avg Slippage bps",
 ]
 
 # Column widths in pixels, one entry per column, in order.
 TRADES_WIDTHS = [150, 95, 80, 70, 70, 95, 110, 100, 100, 110, 150, 240, 110, 240,
-                 60, 220, 125, 130]
+                 60, 220, 125, 130, 120, 150, 100, 110]
 DAILY_WIDTHS = [95, 120, 120, 110, 100, 135, 95, 105, 135, 145, 100, 170, 240, 125]
 SUMMARY_WIDTHS = [190, 130, 380]
 RULES_LOG_WIDTHS = [150, 170, 340, 260, 60, 220, 125, 130]
 CONFIG_WIDTHS = [170, 150, 260]
-BOOKS_WIDTHS = [60, 165, 150, 100, 110, 90, 90, 90, 90, 80, 115, 125, 110, 110]
+BOOKS_WIDTHS = [60, 165, 150, 100, 110, 90, 90, 90, 90, 80, 115, 125, 110, 110,
+                110, 130]
 
 SPY_CLOSE_NOTE = (
     "SPY Close is typed in by the agent each day from its own price source. "
@@ -186,7 +203,10 @@ TABS = [
         "id": 0,
         "title": "Trades",
         "headers": TRADES_HEADERS,
-        "rows": 500,
+        # 1000 rows so the slippage formulas in columns U and V have a home all
+        # the way down. The tab is one row per fill, so this is a month of
+        # trading many times over.
+        "rows": 1 + TRADES_FORMULA_ROWS,
         "widths": TRADES_WIDTHS,
     },
     {
@@ -305,10 +325,51 @@ def daily_formula_rows():
     return rows
 
 
+def trades_formula_rows():
+    """Build the two slippage cells for the Trades tab, row by row.
+
+    Slippage is the gap between the price the decision was made at and the
+    price the order actually filled at. In plain words:
+
+      BUY   Fill Price minus Decision Price, times the quantity. Paying more
+            than we decided at is a positive number, and positive is bad.
+      SELL  Decision Price minus Fill Price, times the quantity. Selling for
+            less than we decided at is also positive, and also bad.
+
+    So a positive figure in either column always means money lost to the gap.
+
+    The cells stay blank whenever Decision Price, Fill Price or Qty is missing,
+    which is most of the time: the row is pre-filled long before the fill that
+    will use it arrives. ABS is used on Qty so that a quantity written as a
+    negative number for a sell cannot silently flip the sign. The Side column
+    is what carries the direction in this ledger, not the sign of Qty.
+
+    Column letters on the Trades tab:
+      D Side, E Qty, F Fill Price, S Decision Price, U Slippage $,
+      V Slippage bps.
+    """
+    rows = []
+    for row in range(2, 2 + TRADES_FORMULA_ROWS):
+        # Slippage in dollars, direction decided by the Side column.
+        u = (f'=IF(OR(NOT(ISNUMBER($S{row})),NOT(ISNUMBER($F{row})),'
+             f'NOT(ISNUMBER($E{row}))),"",'
+             f'IF(UPPER($D{row})="BUY",($F{row}-$S{row})*ABS($E{row}),'
+             f'IF(UPPER($D{row})="SELL",($S{row}-$F{row})*ABS($E{row}),"")))')
+        # The same gap as a share of what the trade was worth at the decision
+        # price, in basis points, so a $5 slip on a $1,000 trade and a $50 slip
+        # on a $10,000 trade read as the same 50.
+        v = (f'=IF(OR(NOT(ISNUMBER($U{row})),NOT(ISNUMBER($S{row})),'
+             f'NOT(ISNUMBER($E{row})),$S{row}=0,$E{row}=0),"",'
+             f'$U{row}/($S{row}*ABS($E{row}))*10000)')
+        rows.append([u, v])
+    return rows
+
+
 def summary_rows():
     """The Summary tab, one metric per row, all of it read off Daily and Trades.
 
-    Trades columns used: A Timestamp, M Realised P&L.
+    Trades columns used: A Timestamp, M Realised P&L, U Slippage $,
+    V Slippage bps.
     Daily columns used: A Date, B Starting Equity, C Ending Equity,
     E Daily P&L %, G SPY Close.
 
@@ -389,6 +450,21 @@ def summary_rows():
             "Return per unit of wobble, scaled to a year. Needs at least two "
             "days before it shows anything.",
         ],
+        # These two go on the end, and must stay on the end. Total Return %,
+        # SPY Return % and Alpha are read by cell address ($B$4 to $B$7 here,
+        # and Summary!$B$7 over on the Books tab), so a row inserted above them
+        # would point every one of those formulas at the wrong number.
+        [
+            "Avg Slippage bps",
+            '=IF(COUNT(Trades!$V$2:$V)=0,"",AVERAGE(Trades!$V$2:$V))',
+            "Average gap between the price a trade was decided at and the "
+            "price it filled at, in basis points. Positive is worse for us.",
+        ],
+        [
+            "Slippage $ total",
+            '=IF(COUNT(Trades!$U$2:$U)=0,"",SUM(Trades!$U$2:$U))',
+            "What that gap has cost in dollars over the whole month.",
+        ],
     ]
 
 
@@ -399,13 +475,14 @@ def books_rows():
     book that made it, so the counting can be left to the spreadsheet. The
     columns those formulas read:
 
-      Trades     H Commission, O Book, Q Model Cost USD
+      Trades     H Commission, O Book, Q Model Cost USD,
+                 U Slippage $, V Slippage bps
       Rules Log  B Rule, E Book, G Model Cost USD
 
     Books tab column letters:
       A Book, B Strategy, C Model, D Capital, E Equity, F Return %, G SPY %,
       H Alpha, I Max DD, J Trades, K Commissions, L Model Cost USD,
-      M Rule Triggers, N Missed Ticks.
+      M Rule Triggers, N Missed Ticks, O Slippage $, P Avg Slippage bps.
 
     Equity, Max DD and Missed Ticks are left blank on purpose. The Daily tab
     tracks the one paper account, not a separate equity curve per book, so
@@ -436,8 +513,15 @@ def books_rows():
         # out of this count.
         m = (f"=COUNTIFS('Rules Log'!$E$2:$E,$A{row},"
              f"'Rules Log'!$B$2:$B,\"<>decision\")")
+        # What this book has lost to slippage. Trades column O is the Book
+        # column and Trades columns U and V are the two slippage columns, so
+        # this reads "sum this book's slippage" and then "average this book's
+        # slippage in basis points". AVERAGEIFS is wrapped in IFERROR because
+        # a book with no fills yet has nothing to average.
+        o = f"=SUMIFS(Trades!$U$2:$U,Trades!$O$2:$O,$A{row})"
+        p = f'=IFERROR(AVERAGEIFS(Trades!$V$2:$V,Trades!$O$2:$O,$A{row}),"")'
         rows.append([book_id, strategy, model, BOOK_CAPITAL, "", f, g, h, "",
-                     j, k, cost, m, ""])
+                     j, k, cost, m, "", o, p])
     return rows
 
 
@@ -480,9 +564,10 @@ def create_spreadsheet(session):
 
 
 def write_values(session, spreadsheet_id):
-    """Put the headers, the Daily formulas, Summary and Config content in place."""
+    """Put the headers, the formulas, and the Summary and Config content in place."""
     data = [
         {"range": "Trades!A1", "values": [TRADES_HEADERS]},
+        {"range": "Trades!U2", "values": trades_formula_rows()},
         {"range": "Daily!A1", "values": [DAILY_HEADERS]},
         {"range": "Daily!D2", "values": daily_formula_rows()},
         {"range": "Summary!A1", "values": [SUMMARY_HEADERS]},
@@ -604,6 +689,10 @@ def format_spreadsheet(session, spreadsheet_id):
         number_format_request(0, 5, 7, FMT_MONEY),  # Fill Price, Notional, Commission
         number_format_request(0, 12, 12, FMT_MONEY),  # Realised P&L
         number_format_request(0, 16, 16, FMT_MONEY_FINE),  # Model Cost USD
+        number_format_request(0, 18, 18, FMT_MONEY),  # Decision Price
+        number_format_request(0, 19, 19, FMT_DATETIME),  # Decision Time (ET)
+        number_format_request(0, 20, 20, FMT_MONEY),  # Slippage $
+        number_format_request(0, 21, 21, FMT_DECIMAL),  # Slippage bps
     ]
 
     # Daily tab number formats.
@@ -632,6 +721,8 @@ def format_spreadsheet(session, spreadsheet_id):
         11: FMT_MONEY,  # Avg Loss
         12: FMT_WHOLE,  # Number of Trades
         13: FMT_DECIMAL,  # Sharpe
+        14: FMT_DECIMAL,  # Avg Slippage bps
+        15: FMT_MONEY,  # Slippage $ total
     }
     for row_index, fmt in summary_formats.items():
         requests.append(
@@ -650,6 +741,8 @@ def format_spreadsheet(session, spreadsheet_id):
         number_format_request(5, 10, 10, FMT_MONEY),  # Commissions
         number_format_request(5, 11, 11, FMT_MONEY_FINE),  # Model Cost USD
         number_format_request(5, 12, 13, FMT_WHOLE),  # Rule Triggers, Missed Ticks
+        number_format_request(5, 14, 14, FMT_MONEY),  # Slippage $
+        number_format_request(5, 15, 15, FMT_DECIMAL),  # Avg Slippage bps
     ]
 
     # Notes that explain the three things a reader would otherwise guess wrong.
