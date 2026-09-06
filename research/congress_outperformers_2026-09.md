@@ -1,0 +1,326 @@
+# Do members of Congress beat the market, and can a book follow the ones who do?
+
+**This report lives at:** `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/congress_outperformers_2026-09.md`
+**Written:** 6 September 2026, by the research desk, for Book D (Congress trades), whose spec is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY_CONGRESS.md`
+**Why it exists:** an earlier note, `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06_reviews/06_congress_research.md`, recalled every number from memory after its web budget ran out. This report re-derives each one from a source. Every figure carries a URL, or is marked **unverified**. Section 6 scores the earlier note claim by claim.
+
+---
+
+## The short version
+
+The famous result, that members of Congress beat the market by about 12% a year, comes from one paper about senators in 1993 to 1998, rests on one way of weighting the trades, and has not been found again by anyone using the disclosure-era data. The best study of the STOCK Act period finds that what senators buy goes on to lag comparable stocks slightly. The yearly "Congress beat the market" leaderboards are real, but they rank estimates built from dollar bands, they count unrealised gains on positions bought years earlier, and their winners do not repeat. The one audited, real-money test of copying Congress, the NANC fund, has beaten the S&P 500 by about two points a year since 2023 and lost to a plain Nasdaq 100 fund by about five points a year over the same window, and its own manager credits a technology overweight, not congressional skill, every time it wins.
+
+The three numbers that matter most:
+
+| | Figure | Source |
+|---|---|---|
+| The live test | NANC 23.11% a year since 7 Feb 2023 against 20.85% for the S&P 500 total return index, at NAV to 31 Aug 2026; about 30 points behind QQQ cumulatively | [fund page](https://subversiveetfs.com/nanc/), [TotalRealReturns](https://totalrealreturns.com/n/NANC,GOP,SPY,QQQ) |
+| The soft numbers | Pelosi's 2024 return is 70.9% (Unusual Whales), 54% (Autopilot's live tracker) or 48.4% (Quiver), for the same trades in the same year | [Fortune](https://fortune.com/2025/01/08/congress-stock-trading-pelosi-2024), [Autopilot](https://x.com/pelositracker/status/1874859312616759754), [Quiver](https://quiverquant.beehiiv.com/p/corporate-insider-buying-and-congress-biotech-moves-2159c86847242496) |
+| The academic baseline | Senate purchases 2012 to 2020 underperform matched stocks by 11 basis points at one month, 28 at three months and 17 at six; members' portfolios 2004 to 2008 lagged the market by about 2.8% a year | [Belmont et al, NBER 26975](https://www.nber.org/system/files/working_papers/w26975/w26975.pdf), [Eggers and Hainmueller](https://j-hai.github.io/assets/pdf/capitol.pdf) |
+
+**Verdict for Book D:** "follow the top five" is a bet that last year's leaderboard predicts next year's, and the record says it does not. Keep the broad sweep the spec already describes. The three caveats that matter most, in section 5, are after-the-fact selection, estimates built from bands, and a copyable edge that is small and may be legislated away: the House passed a purchase ban on 22 July 2026, and Pelosi's own filings stop when her term ends on 3 January 2027.
+
+---
+
+## 1. What the academic record says
+
+The story most people carry around is that Congress beats the market by about 12% a year. That number is real, but it comes from one paper about senators in the 1990s, it depends on one particular way of weighting the trades, and every serious study of the disclosure era since 2012 has failed to find it again. Here is the record, paper by paper, with the free copy for each.
+
+| Paper | Who and when | Headline | Benchmark | Free PDF (tested) |
+|---|---|---|---|---|
+| Ziobrowski, Cheng, Boyd and Ziobrowski (2004), Journal of Financial and Quantitative Analysis 39(4): 661-676 | Senate, 1993 to 1998, about 5,700 transactions | Purchases beat the market by 85 basis points a month; the long-buys short-sells portfolio by 97 basis points a month, about 12% a year | Fama-French three factor and CAPM, calendar-time portfolios | [gwern.net](https://gwern.net/doc/economics/2004-ziobrowski.pdf) |
+| Ziobrowski, Boyd, Cheng and Ziobrowski (2011), Business and Politics 13(1), article 4 | House, 1985 to 2001, over 16,000 transactions by about 300 members, odd years only | Purchases beat the market by 55 basis points a month, "over 6 percent per year" | same | [gwern.net](https://gwern.net/doc/economics/2011-ziobrowski.pdf) |
+| Eggers and Hainmueller (2013), "Capitol Losses", Journal of Politics 75(2): 535-551 | 422 members, 2004 to 2008, 48,309 transactions | Members underperform by 0.23 percentage points a month, about 2.8% a year; 100 dollars invested like the average member became 69 dollars by end 2008 against 80 dollars in an index fund | market and factor adjusted, actual reconstructed portfolios | [j-hai.github.io](https://j-hai.github.io/assets/pdf/capitol.pdf) |
+| Eggers and Hainmueller (2014), "Political Capital", Quarterly Journal of Political Science 9(2): 169-202 | same data | Members' local and donor-connected holdings beat their other holdings; long local, short the rest earns 0.48% a month | same | [j-hai.github.io](https://j-hai.github.io/assets/pdf/polcapital.pdf) |
+| Belmont, Sacerdote, Sehgal and Van Hoek (2022), Journal of Public Economics 207: 104602; NBER working paper 26975 (2020) | Senate, 2012 to March 2020, 4,378 buys and 3,881 sells (the journal version adds the House) | Stocks bought underperform matched portfolios by 11 basis points at one month, 28 at three months, 17 at six months; no committee-related stock-picking skill | industry and size matched portfolios; Carhart four factor | [NBER](https://www.nber.org/system/files/working_papers/w26975/w26975.pdf) |
+| Karadas (2019), The Financial Review 54(1): 85-131 | 61,998 transactions by 403 members, 2004 to 2010 | Powerful Republicans' buy-minus-sell portfolios earn over 35% annualised at a one-week holding period, fading to nothing past three months and vanishing after the STOCK Act | CAPM, Fama-French, Carhart, plus liquidity factor | dissertation version at [Wayback](https://web.archive.org/web/20240514231559if_/https://researchrepository.wvu.edu/cgi/viewcontent.cgi?article=1424&context=etd); journal copy paywalled |
+| Karadas (2018), Journal of Economics and Finance 42(2): 211-248 | 22,159 spouse and child transactions, 2004 to 2010 | Spouses' portfolios earn over 12% annualised at one week, 5.6% to 8.0% at three months for spouses of powerful members; children's accounts underperform | same | same dissertation link; journal copy paywalled |
+
+Sources for the citations and numbers: the papers themselves, read from the PDFs linked, and for Karadas the Crossref and EconPapers records ([2018](https://econpapers.repec.org/article/sprjecfin/v_3a42_3ay_3a2018_3ai_3a2_3ad_3a10.1007_5fs12197-017-9384-z.htm), [2019](https://econpapers.repec.org/article/blafinrev/v_3a54_3ay_3a2019_3ai_3a1_3ap_3a85-131.htm)).
+
+**The 12% figure is fragile, and the people who found it said so.** Ziobrowski's Senate paper reports that in 1997 and 1998 trading fell sharply and no abnormal returns appear at all, and warns the reports are unaudited and filled in with care that "varies widely". Eggers and Hainmueller then showed two things about the earlier work. For the Senate, the 12% is the largest of eight estimates and is significant in at most three of the eight; it appears only when members are weighted by portfolio size and trades by dollar value, and other weightings give roughly half the excess return and nothing distinguishable from zero. For the House, the 6% is the return on the buy side alone, and the stocks members sold did just as well as the ones they bought, so on the standard long-minus-short measure the House paper "provides no evidence of trading acumen at all." Belmont and co-authors endorse that reading in the STOCK Act paper.
+
+**In the disclosure era the sign is negative.** Belmont, Sacerdote, Sehgal and Van Hoek, working from every Senate filing from 2012 to March 2020, find that what senators buy lags matched stocks by about a quarter of a percent over three months, that what they sell does about the same, and that "we find no evidence that senators have industry specific stock picking ability related to their committee assignments." The one place they see both timing and picking is the window after the 24 January 2020 COVID briefing, when stocks senators sold went on to underperform by a significant 9%. Their working paper title says it plainly: "Relief Rally: Senators As Feckless As the Rest of Us at Stock Picking."
+
+**Karadas is the dissent, and it does not help a copier.** His abnormal returns are large but live for a week and are gone within three months, are confined to powerful Republicans in 2004 to 2010 data, and disappear after the STOCK Act. He writes himself that "it is not feasible to construct trading strategies based on congressional trading due to substantial lags between when these transactions take place and when the public become aware of them (5 to 17 months)" in his sample period. His later papers with Schlosky and Hall (2021, [free at EconStor](https://www.econstor.eu/bitstream/10419/239672/1/1763179915.pdf); 2022; 2024) are about whether aggregate congressional buying predicts the market and about when members trade, not about stock-picking returns. He has no paper on the 2020 pandemic trades.
+
+**One recent paper cuts the other way, narrowly.** Wei and Zhou, NBER working paper 34524, November 2025 ([PDF](https://www.nber.org/system/files/working_papers/w34524/w34524.pdf)), find that members who rise to leadership positions outperform by 47 percentage points a year after ascension, while their Congress-wide results match Belmont and co-authors. That is a small subset, identified after the fact, and it is a leadership effect rather than a leaderboard effect.
+
+**The two newest papers point in opposite directions, and neither gives a size.** Chen and Sacerdote, "Capital in the Capitol: Congressional Trades Resemble Uninformed Retail Trading", NBER working paper 35041, April 2026 ([NBER](https://www.nber.org/papers/w35041)), cover every member and their families from 2012 to 2023 and find portfolios that "underperform or, at best, match market benchmarks after the STOCK Act", with timing that "largely reflects prevailing market sentiment, estimated from retail investors' social media posts". Li, Michelson, Mollica and Zhou, "Inside the Beltway: Senator Trading and Legislative Gains", Journal of Business Ethics 204(2): 413-435, 2025 (DOI 10.1007/s10551-025-06108-4), date legislative milestones with text analysis and find that senators' trades placed before critical legislative events earn significant abnormal returns, more so for influential senators. Neither abstract states a percentage, so both magnitudes are **unverified**, and the Li paper's PDF sits behind a login.
+
+What the whole record adds up to: the average member has no edge in the disclosure era, a few sub-groups (leaders, powerful committee members, well-timed trades before votes) show short-lived abnormal returns in some samples, and nobody has shown that a copier acting on the public filing date captures them, with the partial exception of Wei and Zhou's leadership result.
+
+
+## 2. The leaderboards, 2021 to 2025
+
+All five annual reports come from Unusual Whales, published each January for the year just ended. The site renders as a JavaScript app, so most of the member level figures were read from same-week press re-reports, which are cited under each table. The S&P 500 column is the index total return with dividends reinvested, from the sources in the table above it.
+
+### The market each year
+
+| Year | S&P 500 total return | S&P 500 price return | Source |
+|---|---|---|---|
+| 2021 | +28.7% | +26.9% | [Wikipedia S&P 500 annual returns table](https://en.wikipedia.org/wiki/S%26P_500), [ChartRow](https://chartrow.com/sp500/returns) |
+| 2022 | -18.1% | -19.4% | same |
+| 2023 | +26.3% | +24.2% | same |
+| 2024 | +25.0% | +23.3% | same |
+| 2025 | +17.9% | +16.4% | [First Trust, 8 Jan 2026](https://www.ftportfolios.com/Commentary/EconomicResearch/2026/1/8/the-sp-500-index-2025-recap); [DQYDJ](https://dqydj.com/2025-sp-500-return/) gets 15.96% price and 17.44% total by measuring from the 2 January open |
+| 2026 to 4 Sep | +13.6% (SPY) | +13.0% (SPY) | [ChartRow](https://chartrow.com/sp500/year-by-year) |
+
+### Who came first, and how Pelosi did
+
+| Year | Number one, per Unusual Whales | Pelosi | Members beating the index, as the report counts it | Report |
+|---|---|---|---|---|
+| 2021 | Austin Scott (R, GA), a FuelCell Energy bet; Brian Mast (R, FL) second on a Tilray sale at +563% | 6th, "+39% on the options book" | 35 of 147 filers (19 Democrats, 16 Republicans) | [report](https://unusualwhales.com/blog/congressional-trading-2021), [InvestorPlace](https://investorplace.com/2022/01/austin-scott-stocks-reddit-post-about-members-of-congress-who-beat-spy-in-2021-spurs-searches/), [Benzinga](https://www.benzinga.com/news/22/02/25337519/10-best-stock-traders-in-congress-in-2021-spoiler-nancy-pelosi-isnt-no-1) |
+| 2022 | Mike Kelly (R, PA) +239% | -20.8% for the year, -19.8% on 2022 trades | not published; 131 filers, Democrats about -2%, Republicans about +0.4% on 2022 trades | [report mirror](https://unusual-whales.ghost.io/unusual_blog/post/2022-congress-report/), [InvestorPlace](https://investorplace.com/2023/01/5-politicians-who-beat-the-stock-market-and-nancy-pelosi-in-2022/) |
+| 2023 | Brian Higgins (D, NY) +238.9% | 9th, +65.5% | 33 of 100 scored members | [report](https://unusualwhales.com/politics/article/congress-trading-report-2023), [Benzinga via TradingView](https://www.tradingview.com/news/benzinga:f23d14b81094b:0-10-best-stock-traders-in-congress-in-2023-spoiler-nancy-pelosi-has-reentered-the-chat/) |
+| 2024 | David Rouzer (R, NC) +149.0% (Fortune prints 104.1% for the same man) | 10th, +70.9% | "only half" of about 100 active traders | [report](https://unusualwhales.com/congress-trading-report-2024), [Substack edition](https://unusualwhales.substack.com/p/the-official-2024-congressional-trading), [Benzinga](https://web.archive.org/web/2025/https://www.benzinga.com/25/01/42860759/10-best-stock-traders-in-congress-in-2024-where-do-nancy-pelosi-pete-sessions-susan-collins-marjorie-taylor-greene-rank), [Fortune](https://fortune.com/2025/01/08/congress-stock-trading-pelosi-2024/) |
+| 2025 | Warren Davidson (R, OH) +78.8% | 28th, +20.1% | 100 of 311 portfolios (32%) | [report](https://unusualwhales.com/congress-trading-report-2025), [Substack, 11 Jan 2026](https://unusualwhales.substack.com/p/congressional-trading-report-2025), [Benzinga via Finviz](https://finviz.com/news/279401/top-10-congress-stock-traders-2025-nancy-pelosi-marjorie-taylor-greene-both-bet-big-on-nvda-but-who-came-out-on-top), [Motley Fool](https://www.fool.com/research/congressional-stock-trading-who-trades-and-makes-the-most/) |
+
+### The top five each year
+
+| Rank | 2022 | 2023 | 2024 | 2025 |
+|---|---|---|---|---|
+| 1 | Mike Kelly (R, House) 239% | Brian Higgins (D, House) 238.9% | David Rouzer (R, House) 149.0% | Warren Davidson (R, House) 78.8% |
+| 2 | David Trone (D, House) 198.8% | Mark Green (R, House) 122.2% | Debbie Wasserman Schultz (D, House) 142.3% | Donald Norcross (D, House) 70.8% |
+| 3 | Roger Marshall (R, Senate) 106.1% | Garret Graves (R, House) 107.6% | Ron Wyden (D, Senate) 123.8% | Terri Sewell (D, House) 67.9% |
+| 4 | James Comer (R, House) 81% | David Rouzer (R, House) 105.6% | Roger Williams (R, House) 111.2% | Bryan Steil (R, House) 62.5% |
+| 5 | Susie Lee (D, House) 64.6% | Seth Moulton (D, House) 80.0% | Morgan McGarvey (D, House) 105.8% | Alex Padilla (D, Senate) 61.7% |
+
+Sources: the same URLs as the table above. The 2021 report gave a ranked list of trades rather than of members, so it has no comparable column; the Benzinga 2021 article linked above lists the ten members it named. Party labels for 2022 were not printed beside the names in the source and are taken from the members' public affiliations.
+
+The pattern in these tables matters more than any single number in them.
+
+**The winners do not repeat, and some leave.** Only Rouzer appears in two top fives (fourth in 2023, first in 2024), and Unusual Whales says of him that he "mainly holds ETFs" and "is not an active trader"; his chief of staff told The Independent that "using a methodology that predicts unrealized gains creates a deceptive view of reality" and that he "has not purchased or sold a single stock asset since 2022" ([The Independent, 12 Jan 2025](https://www.newsbreak.com/the-independent-517119/3757139189024-dozens-of-congress-members-outperformed-the-stock-market-in-2024-here-s-who-gained-the-most-and-why)). Warren Davidson, first in 2025, was the worst performer of 2022 at -93.1% ([InvestorPlace](https://investorplace.com/2023/01/5-politicians-who-beat-the-stock-market-and-nancy-pelosi-in-2022/)). Higgins, first in 2023, resigned from Congress on 2 February 2024 ([Roll Call](https://rollcall.com/2023/11/12/higgins-to-resign-in-february-calls-pace-of-congress-frustrating/)). Mark Green, second in 2023, resigned with effect from 20 July 2025 ([CNBC](https://www.cnbc.com/2025/07/05/rep-mark-green-announces-resignation.html)).
+
+**The report undercuts its own leaderboard.** The 2022 edition says the top names "were based on less than 5 trades each and were all unrealized gains due to stock buys dating back to 2020" ([report mirror](https://unusual-whales.ghost.io/unusual_blog/post/2022-congress-report/)). The 2024 edition says sixth-placed Larry Bucshon's "only active stock position is DWAC (now DJT)" and is "actually only break even" ([Substack](https://unusualwhales.substack.com/p/the-official-2024-congressional-trading)).
+
+**Two trackers, two different lists.** For 2025 the Quiver Quantitative top ten, as printed by the New York Post and Yahoo Finance, is Tim Moore +52%, Ted Cruz +50%, Lisa McClain +37%, Pete Ricketts +37%, Thomas Suozzi +35%, Lisa Murkowski +35%, Marjorie Taylor Greene +33%, Shri Thanedar +29%, Mitch McConnell +29%, John Kennedy +29% ([Yahoo Finance, 7 Jan 2026](https://finance.yahoo.com/news/move-over-pelosi-congress-member-233111954.html)). Not one name overlaps with the Unusual Whales top ten above. Greene is +11.7% and 38th on one list and +33% and 7th on the other.
+
+### How the returns are computed from disclosure bands
+
+Members disclose each trade in a dollar band (1,001 to 15,000; 15,001 to 50,000; 50,001 to 100,000; 100,001 to 250,000; 250,001 to 500,000; 500,001 to 1,000,000; 1,000,001 to 5,000,000; 5,000,001 to 25,000,000; and up), never the amount. Unusual Whales explains its method only in the Substack edition of the 2024 report ([link](https://unusualwhales.substack.com/p/the-official-2024-congressional-trading)), quoted here:
+
+- **Band midpoint, priced on the trade date.** "We estimated the number of shares using the average of the amount range disclosed and the stock price at the time of purchase." No cap is stated for the open ended top band.
+- **Whole visible portfolio, marked at both year ends.** "We estimated each member's stock portfolio performance in 2024 by calculating the value of each stock held at the beginning of 2024 and then again at the end of 2024." Positions still open at year end are marked to market, so the percentages include unrealised paper gains, which is how a member who has not traded in years can top the list.
+- **Options: no published rule.** The analysis "mostly focused on stock trades and option trades", but no page says how a call purchase, exercise or expiry is valued. The 2021 edition admitted it did not account "for possible option executions" ([Florida Politics, 18 Jan 2022](https://floridapolitics.com/archives/487252-brian-mast-ends-2021-with-second-best-stock-record-in-congress-with-help-from-unusual-trade/)).
+- **The method changed.** The 2022 edition matched each sale to the closest prior buy back to 2020; the 2024 edition marks the whole portfolio between year ends; the 2025 edition adds annual Financial Disclosure reports to the Periodic Transaction Reports. The five years are not one clean series.
+- **Their own words:** the figures "should be treated as approximations only based on the data available. We do not have access to a member's personal financial records", and "Congress generally discloses BAD data when it comes to their financial holdings."
+
+Quiver Quantitative measures something else: it takes each disclosed trade, fetches "the stock's performance in the time following the transaction", and sums a cumulative trade level return from the transaction date ([Quiver](https://www.quiverquant.com/congresstrading/)). It publishes no band convention and no options rule, and warns "these are only rough estimates, and the data may be inaccurate or incomplete." Capitol Trades publishes volumes, not an annual performance ranking.
+
+The academic critique of both is in Eggers and Hainmueller's Capitol Losses ([free PDF](https://j-hai.github.io/assets/pdf/capitol.pdf)): these are "synthetic portfolios built solely from their transactions; since no one actually held the portfolios being analyzed, members' financial gain may be quite different from that implied", and with median turnover of 23% a year "most of members' holdings do not appear in their transactions in a given year." Belmont and co-authors use the low end of each band instead of the midpoint ([NBER working paper](https://www.nber.org/system/files/working_papers/w26975/w26975.pdf)). One Pelosi tracking site puts the error on a single 5 to 25 million dollar band at plus or minus 10 million dollars ([nancypelosistocktracker.org](https://nancypelosistocktracker.org/articles/estimating-trade-values)).
+
+The cleanest demonstration that the numbers are soft: for Pelosi's 2024, Unusual Whales says +70.9%, Quiver's year end "wrapped" says +48.4% ([Quiver newsletter, 10 Dec 2024](https://quiverquant.beehiiv.com/p/corporate-insider-buying-and-congress-biotech-moves-2159c86847242496)), and Autopilot's Pelosi Tracker, which actually held the positions after the filing lag, "officially finishes 2024 up 54%" ([Autopilot on X](https://x.com/pelositracker/status/1874859312616759754)).
+
+
+## 3. Pelosi
+
+Nancy Pelosi does not trade. Her husband Paul Pelosi does, and the STOCK Act makes her file the reports, marked "SP" for spouse. Her office has always disputed the attribution rather than the arithmetic: "The Speaker does not own any stocks" and has "no prior knowledge or subsequent involvement in any transactions" ([Fox Business, 21 July 2022](https://www.foxbusiness.com/politics/pelosi-says-husband-never-made-stock-purchased-based-info)). Every "Pelosi returned X%" headline is a measurement of Paul Pelosi's account, built from the bands on her filings.
+
+### Estimated return by year
+
+| Year | Unusual Whales estimate | Other trackers | S&P 500 total return | Source |
+|---|---|---|---|---|
+| 2021 | Ranked 6th; "+39% on the options book", about +40% average stock return | none found | +28.7% | [Benzinga](https://www.benzinga.com/news/22/02/25337519/10-best-stock-traders-in-congress-in-2021-spoiler-nancy-pelosi-isnt-no-1) |
+| 2022 | -20.8% for the year, -19.8% on trades made in 2022 | "around -20%" | -18.1% | [InvestorPlace](https://investorplace.com/2023/01/5-politicians-who-beat-the-stock-market-and-nancy-pelosi-in-2022/), [Wccftech](https://wccftech.com/nancy-pelosi-has-lost-her-stock-picking-mojo-with-a-loss-of-20-percent-in-2022-republican-us-house-members-eke-out-average-gains-of-0-4-percent-vs-a-loss-of-1-76-percent-for-the-democrats/) |
+| 2023 | +65.5%, 9th | about 66% credited to Quiver, low confidence | +26.3% | [Benzinga via TradingView](https://www.tradingview.com/news/benzinga:f23d14b81094b:0-10-best-stock-traders-in-congress-in-2023-spoiler-nancy-pelosi-has-reentered-the-chat/), [Yahoo Finance](https://finance.yahoo.com/markets/stocks/articles/nancy-pelosi-beat-stock-market-070110170.html) |
+| 2024 | +70.9%, 10th, measured 29 Dec 2023 to 30 Dec 2024 | Quiver +48.4%; Autopilot's live Pelosi Tracker +54% | +25.0% | [Fortune](https://fortune.com/2025/01/08/congress-stock-trading-pelosi-2024), [Quiver newsletter](https://quiverquant.beehiiv.com/p/corporate-insider-buying-and-congress-biotech-moves-2159c86847242496), [Autopilot on X](https://x.com/pelositracker/status/1874859312616759754) |
+| 2025 | +20.1%, 28th | about 18% credited to Quiver, low confidence | +17.9% | [Benzinga via Finviz](https://finviz.com/news/279401/top-10-congress-stock-traders-2025-nancy-pelosi-marjorie-taylor-greene-both-bet-big-on-nvda-but-who-came-out-on-top) |
+| 2026 to date | not published; due January 2027 | none credible | +13.6% (SPY, to 4 Sep) | Sites advertising "+102%" or "+207.5%" for 2026 are quoting per-trade averages or since-inception cumulative figures, not a calendar-year return |
+
+Quiver's own Pelosi strategy page shows a 21.41% compound annual growth rate since a backtest start of 16 May 2014 and 25.43% over the trailing year ([Quiver](https://www.quiverquant.com/strategies/s/Nancy%20Pelosi/)). The Independent Institute, working from her annual disclosures, puts the household book at 610,000 to 785,000 dollars in 1987 and 133.7 million in 2025, about 14.5% a year compounded ([Independent Institute, 16 Feb 2026](https://www.independent.org/article/2026/02/16/congress-beat-stock-market-2025/)).
+
+The 2024 spread, 70.9% against 54% against 48.4%, is a method difference. Unusual Whales marks the whole disclosed book to market with options at traded value, which flatters a portfolio built on deep in-the-money long-dated calls. Autopilot holds shares after the filing lag, so its figure is the one a copier could actually have had.
+
+### The signature trades
+
+Every trade below was read from the Periodic Transaction Report PDF on the House Clerk's site, linked in the first column, and priced from [StockAnalysis](https://stockanalysis.com/stocks/nvda/history/) history pages, split-adjusted to today's basis (so a Nvidia price of 15.88 dollars in 2022 is 158.80 dollars as it traded). "Follower" means someone who bought the common stock at the close on the day the filing appeared. Note that the disclosed band on a call option is the premium paid, not the exposure, so these tables answer "what would a stock copier have made", not "what did the Pelosis make".
+
+| Trade (filing) | What was disclosed | Band | Filed, lag | Follower at 3 months | 6 months | 12 months or exit |
+|---|---|---|---|---|---|---|
+| 22 Dec 2020 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2021/20018011.pdf)) | Bought 25 Tesla calls, 500 strike, Mar 2022 expiry; same filing had 100 Apple calls, 100 Disney calls, 20,000 AllianceBernstein shares | 500,001 to 1,000,000 | 21 Jan 2021, 30 days | -11.9% | -22.4% | +11.7% |
+| 19 Mar 2021 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2021/20018539.pdf)) | Exercised 250 Microsoft calls (130 and 140 strikes) into 25,000 shares on expiry day. Not a purchase, as often reported. The Army's 21.88 billion dollar IVAS award came 31 March ([Army](https://www.peosoldier.army.mil/News/Article-Display/Article/2556870/ivas-production-contract-award/)) | two lines, 1 to 5 million each | 9 Apr 2021, 21 days | +8.6% | +15.2% | +16.1% |
+| 17 to 21 Dec 2021 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2021/20020106.pdf)) | Bought calls on Alphabet (10 at 2,000), Micron (100 at 50), Roblox (100 at 100), Salesforce (130 at 210), Disney (50 at 130) | 100,001 to 1,000,000 per line | 29 Dec 2021, 8 to 12 days | Alphabet -2.2%, Micron -14.7%, Roblox -47.7%, Salesforce -13.1%, Disney -8.1% | -23.4%, -41.7%, -65.1%, -33.0%, -38.2% | -39.3%, -47.3%, -72.2%, -47.9%, -43.7% |
+| 17 Jun 2022 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2022/20021374.pdf)) | Exercised 200 Nvidia calls into 20,000 shares at a 100 dollar strike, expiry day, six weeks before the CHIPS Act vote | 1 to 5 million | 14 Jul 2022, 27 days | -26.9% | +10.0% | +195.8% |
+| 26 Jul 2022 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2022/20021438.pdf)) | Sold 25,000 Nvidia shares at an average 165.05 dollars, the filing itself stating "a total loss of $341,365", the day before the Senate CHIPS vote | 1 to 5 million | same day, 0 days | stock -22.0% | +19.8% | +175.0% (the sale gave up a near-triple) |
+| 22 Nov 2023 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2023/20024186.pdf)) | Bought 50 Nvidia calls, 120 strike, 20 Dec 2024 expiry | 1 to 5 million | 21 Dec 2023, 29 days | +86.6% | +158.4% | +175.0% at the exit |
+| 20 Dec 2024 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2025/20026590.pdf)) | Exercised those calls, now 500 contracts at 12 dollars after the split, into 50,000 shares on expiry day. The often-repeated June 2024 exercise did not happen; June 2024 was a straight purchase of 10,000 shares | 500,001 to 1,000,000 | 17 Jan 2025, 28 days | | | 600,000 dollars of strike for stock worth 6.73 million at that close |
+| 12 and 21 Feb 2024 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2024/20024542.pdf)) | Bought 70 Palo Alto Networks calls at 200, the second lot on the day the stock fell 28.4% | 500,001 to 1,000,000 and 100,001 to 250,000 | 23 Feb 2024, 2 to 11 days | +10.4% | +24.3% | +35.4%; exercised 20 Dec 2024 into 14,000 shares |
+| 24 Jun to 26 Jul 2024 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2024/20025368.pdf), [PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2024/20025535.pdf)) | Bought 20 Broadcom calls at 800 (Jun 2025 expiry); bought 10,000 Nvidia shares twice; sold 2,500 Tesla, 2,000 Visa, 5,000 Microsoft. No Apple or Nvidia sale occurred in mid-2024, contrary to the usual account | 1 to 5 million per Nvidia and Broadcom line | 2 and 30 Jul 2024, 1 to 8 days | | | Broadcom +62.8%, Nvidia +28.2% and +72.8%; the three sales were each "wrong" by 21% to 37% a year later |
+| 31 Dec 2024 and 14 Jan 2025 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2025/20026590.pdf)) | Sold 31,600 Apple (her largest single line) and 10,000 Nvidia; bought 50 one-year calls each on Alphabet (150), Amazon (150), Nvidia (80), Tempus AI (20), Vistra (50) | Apple 5 to 25 million; calls 50,001 to 1,000,000 | 17 Jan 2025, 3 to 17 days | Alphabet -22.9%, Amazon -23.6%, Nvidia -26.3%, Tempus +15.1%, Vistra -32.4% | -6.3%, -0.9%, +25.6%, +72.5%, +6.5% | +68.4%, +5.8%, +35.2%, +100.1%, -2.5%; all five exercised 16 Jan 2026 |
+| 20 Jun 2025 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2025/20030630.pdf)) | Exercised 200 Broadcom calls (the 20 bought in June 2024, split ten for one) into 20,000 shares at 80 | 1 to 5 million | 9 Jul 2025, 19 days | +24.2% | +24.1% | +44.3% |
+| 24 to 30 Dec 2025 and 16 Jan 2026 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20033725.pdf)), after the retirement announcement | Sold 45,000 Apple, 20,000 Nvidia, 20,000 Amazon, 10,000 Disney, 5,000 PayPal; gave 28,200 Apple and 7,704 Alphabet to a donor-advised fund; bought 20 January 2027 calls each on Apple (100), Alphabet (150), Nvidia (100), Amazon (120); bought 25,000 AllianceBernstein | Apple 5 to 25 million; new calls 100,001 to 500,000 | 23 Jan 2026, 7 to 30 days | Apple +10.2%, Nvidia +6.4%, Alphabet +3.3%, Amazon +6.7% | +29.7%, +11.2%, -3.1%, -2.3% | not yet reached |
+| 29 May 2026 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20034836.pdf)) | Bought 200 Intel calls and 200 Uber calls, both 50 strike, Mar 2027 expiry | Intel 1 to 5 million; Uber 500,001 to 1 million | 23 Jun 2026, 25 days | Intel -27.6% and Uber +8.7% to 4 Sep 2026 | | |
+| 24 and 28 Jul 2026 ([PTR](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035143.pdf)) | Bought 15,000 Bloom Energy shares plus 200 calls at 100 (Jun 2027); 10,000 Intel shares plus 50 calls at 50 (Jun 2027) | Bloom Energy 1 to 5 million on the largest line | 21 Aug 2026, 24 to 28 days | Bloom Energy +25.5% and Intel +6.4% to 4 Sep 2026 | | |
+
+The PDFs correct the popular account in several places. The Microsoft trade of March 2021 was an exercise of expiring calls, which is routine mechanics rather than a market call. The Nvidia calls bought in November 2023 were exercised on 20 December 2024, their expiry day, not in June 2024. And there was no Apple or Nvidia sale in mid-2024; those sales came on 31 December 2024, and the 2,000 share sale that summer was Visa. The 2022 Nvidia episode is often misdated too: the exercise was 17 June 2022, disclosed 14 July, and the 25,000 share sale at a stated loss of 341,365 dollars was 26 July 2022, filed the same day, against her usual habit of filing weeks later.
+
+Her recent lags: 3 days for the January 2025 basket, 7 to 30 days for the January 2026 filing, 24 to 28 days for the 2026 Intel and Bloom Energy buys. Her positions bought in 2026 expire in 2027, after her term ends on 3 January 2027, so how they end will never appear in a filing.
+
+
+### The filings since January 2025, read from the House Clerk PDFs
+
+The most recent record is the cleanest, because a helper read the six Periodic Transaction Reports she filed between January 2025 and August 2026 straight from the Clerk's site (index files [2025FD.ZIP](https://disclosures-clerk.house.gov/public_disc/financial-pdfs/2025FD.ZIP) and [2026FD.ZIP](https://disclosures-clerk.house.gov/public_disc/financial-pdfs/2026FD.ZIP)), and priced each line from [StockAnalysis](https://stockanalysis.com/stocks/tem/history/) history pages cross-checked against the Nasdaq API. Returns are for a copier buying the common stock at the close on the day the filing appeared.
+
+| Filed | Lag | Trade | Band | Follower at 3 months | at 6 months | at 12 months |
+|---|---|---|---|---|---|---|
+| 17 Jan 2025 ([PDF](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2025/20026590.pdf)) | 3 to 28 days | Exercised 500 Nvidia calls (bought 22 Nov 2023) for 50,000 shares at 12 dollars; exercised 140 Palo Alto calls for 14,000 shares; sold 31,600 Apple and 10,000 Nvidia; bought 50 one-year calls each on Alphabet (150 strike), Amazon (150), Nvidia (80), Tempus AI (20) and Vistra (50) | 250,001 to 500,000 dollars per call line; Apple sale 5 to 25 million | Nvidia -26.3%, Alphabet -22.9%, Amazon -23.6%, Vistra -32.4%, Tempus +15.1% | Nvidia +25.6%, Tempus +72.5%, Vistra +6.5%, Alphabet -6.3% | Nvidia +35.2%, Alphabet +68.4%, Tempus +100.1%, Amazon +5.8%, Vistra -2.5% |
+| 9 Jul 2025 ([PDF](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2025/20030630.pdf)) | 19 days | Exercised 200 Broadcom calls (bought 24 Jun 2024) for 20,000 shares at 80 dollars | 1 to 5 million | +24.2% | +24.1% | +44.3% |
+| 24 Oct 2025 ([PDF](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2025/20033337.pdf)) | 2 days | 382 Apple shares given to a university | 100,001 to 250,000 | -5.6% | +3.1% | |
+| 23 Jan 2026 ([PDF](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20033725.pdf)), after the retirement announcement | 7 to 30 days | Sold 45,000 Apple, 20,000 Nvidia, 20,000 Amazon, 10,000 Disney, 5,000 PayPal; gave 28,200 Apple and 7,704 Alphabet to a donor-advised fund; bought 20 January 2027 calls each on Apple (100 strike), Alphabet (150), Nvidia (100), Amazon (120); exercised the five January 2025 calls; bought 25,000 AllianceBernstein units | Apple sale 5 to 25 million; new calls 100,001 to 500,000 each | Apple +10.2%, Nvidia +6.4%, Amazon +6.7%, Alphabet +3.3%, Tempus -21.2% | Apple +29.7%, Nvidia +11.2%, Alphabet -3.1%, Amazon -2.3%, Tempus -29.6% | not yet reached |
+| 23 Jun 2026 ([PDF](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20034836.pdf)) | 25 days | Bought 200 Intel calls (50 strike, Mar 2027) and 200 Uber calls (50 strike, Mar 2027) | Intel 1 to 5 million; Uber 500,001 to 1 million | not yet reached | | |
+| 21 Aug 2026 ([PDF](https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035143.pdf)) | 24 to 28 days | Bought 10,000 Intel shares plus 50 calls; bought 15,000 Bloom Energy shares plus 200 calls over 24 and 28 July | Bloom Energy 1 to 5 million on the 24 July line | not yet reached | | |
+
+The Tempus AI filing moved the stock: it closed at 35.15 dollars on Friday 17 January 2025, and on Tuesday 21 January, the first session after the holiday weekend, it closed at 47.64, up 35.5% ([StockAnalysis TEM history](https://stockanalysis.com/stocks/tem/history/)), so a copier trading on the news got a worse price than the disclosure-day close in the table. And December 2025 was not a wind-down: alongside 45,000 Apple shares sold and 28,200 given away, she bought fresh January 2027 calls on Apple, Alphabet, Nvidia and Amazon, then in 2026 opened new positions in Intel, Uber and Bloom Energy. It reads as a rotation out of megacap tech into semiconductors and energy.
+
+### The reporting lag
+
+The rule, in the House Ethics Committee's words ([memo of 11 June 2020](https://ethics.house.gov/wp-content/uploads/2020/04/STOCK-Act-6.11.2020-Final.pdf)): a Periodic Transaction Report for any securities transaction over 1,000 dollars "within 30 days of notice of the transaction, but in no case later than 45 days after the transaction." Spouse and dependent-child trades count, options count, and the late fee is "$200, up to as much as $200 per late transaction," with a 30 day grace period before it is charged.
+
+Pelosi files well inside the limit. Across the six filings above the lag ran from 2 to 30 days. GovGreed computes her average filing gap at 22.2 days with none of 176 trades late, against a Congress-wide average of 49 days and 12.1% of trades late ([GovGreed](https://www.govgreed.com/data/pelosi-stock-trades)); Kadoa counts 7 of 185 disclosed trades past the deadline ([Kadoa](https://www.kadoa.com/congress/filer/house_nancy_pelosi)). The two trackers disagree and neither shows its working, so treat "seven late filings" as unverified. The primary record is the Clerk's database at [disclosures-clerk.house.gov](https://disclosures-clerk.house.gov/FinancialDisclosure). Unusual Whales republishes filings 24 to 48 hours behind the Clerk ([Unusual Whales](https://unusualwhales.com/lp/how-to-follow-nancy-pelosi-stock-trades)).
+
+### What a follower captures
+
+A helper took every buy signal in the tables above, nineteen positions from December 2020 to August 2026, and measured a follower who bought the common stock at the disclosure-day close ([prices from StockAnalysis](https://stockanalysis.com/stocks/nvda/history/)).
+
+| Horizon | Mean | Median | Positions up |
+|---|---|---|---|
+| 3 months | -2.7% | -8.1% | 7 of 19 |
+| 12 months | +31.5% | +28.2% | 13 of 19 |
+
+**In the short run it does not work.** At three months the average copier is down and two thirds of the positions are losing. **In the long run it works, and the reason is Nvidia.** The five Nvidia lines average +101.4% at twelve months; the other fourteen average +6.5%, median +8.8%, which lags the index in every one of those years. Drop the two best trades and the mean falls from +31.5% to +13.4%. The best outcome in the record is Nvidia after the June 2022 exercise, +195.8% in a year. The worst is the December 2021 basket, every name negative at every horizon, Roblox -72.2%, a filing that on its own would have erased several years of the gains. The three mid-2024 sell signals were worse than useless: Tesla, Visa and Microsoft rose 36.5%, 32.1% and 21.4% in the year after she sold.
+
+Why does a share buyer capture so much less than the filer? Mostly because of what she is actually buying.
+
+1. **Leverage.** She buys deep in-the-money calls a year or more out. The November 2023 Nvidia line cost a premium in the 1 to 5 million dollar band and controlled 50,000 shares worth 6.73 million dollars at exercise. A share buyer gets the 175% move and nothing more.
+2. **The entry price is gone.** Most filings arrive 19 to 30 days after the trade. Tesla rose 32% between trade and filing in December 2020, Intel 15% in June 2026.
+3. **Time.** Her calls run twelve to fourteen months, which is what let the January 2025 basket survive a quarter in which four of five names fell more than 20% and still finish with Alphabet up 68% and Tempus up 100%. Copy products rebalance far more often.
+4. **The exits are invisible in advance.** She holds to expiry and exercises on the last day, in 2022, 2024 and January 2026. A copier learns the position closed weeks later.
+
+There is also a crowding cost, and it lands on the smallest name in the filing. On 21 January 2025 Tempus AI traded 33.9 million shares against a 4.0 million average over the prior 32 sessions, about eight times normal, while Nvidia traded 0.95 times its average, Alphabet 1.1, Amazon 1.2 and the NANC fund 2.7 (computed from [StockAnalysis](https://stockanalysis.com/stocks/tem/history/) daily data). Not all of that was Pelosi: Tempus launched its "olivia" health app the same morning ([Tempus](https://investors.tempus.com/news-releases/news-release-details/tempus-announces-national-launch-olivia-its-ai-enabled-personal)) and the press split on which mattered.
+
+**Published results from copying her.** Autopilot's Pelosi Tracker, a retail app that mirrors her disclosed stock trades, launched in July 2023, reports "+54% in 2024" and "up 42% for the year" as of March 2025 ([Yahoo Finance](https://finance.yahoo.com/news/nancy-pelosi-outperformed-nearly-every-180016264.html), [Salon](https://www.salon.com/2025/03/17/pelosi-tracker-shows-us-how-to-trade-stocks-like-politicians/)), and held about 400 million of Autopilot's 750 million dollars by May 2025 ([InvestmentNews](https://www.investmentnews.com/fintech/autopilot-surges-to-750m-aum-touts-ria-growth-as-users-copy-pelosi-buffett-trades/260729)). It publishes no since-inception return anywhere that could be found, and its site returned an access block to every fetch, so treat its figures as self-reported and **unverified**. Quiver's Pelosi strategy, 21.41% compound annual growth since May 2014, is labelled by Quiver itself as a hypothetical backtest ([Quiver](https://www.quiverquant.com/strategies/s/Nancy%20Pelosi/)); its page also describes the Broadcom stock rising 33.48% inside the 19 day lag on the June 2025 exercise, which the daily closes do not support (249.99 to 277.90 dollars is +11.2%), so its lag figures should not be taken at face value either. Wei and Zhou's leadership paper is the one academic result that says an alpha survives when portfolios are built from public disclosure dates rather than trade dates ([CEPR column](https://cepr.org/voxeu/columns/political-power-and-profitable-trades-us-congress)); Chen and Sacerdote's 2026 paper says legislators as a whole "underperform or, at best, match market benchmarks".
+
+Pelosi announced on 6 November 2025 that she will not run again; her term and her filing obligation end on 3 January 2027 ([CNN](https://www.cnn.com/2025/11/06/politics/nancy-pelosi-congress-retirement)). Whatever a Pelosi-following book is worth, it has about four months of signal left.
+
+
+## 4. The copy-trade ETFs: NANC and KRUZ (now GOP)
+
+Two funds have copied congressional disclosures with real money since 7 February 2023, so they are the only audited, SEC-standardised test of the idea. Two corrections to the brief first. KRUZ was renamed **GOP** on 21 March 2025 ([SEC filing](https://www.sec.gov/Archives/edgar/data/1742912/000199937125002790/kruz-497_031825.htm)), and both funds dropped "Unusual Whales" from their names: they are now the Subversive Congressional Democrats Trading ETF and the Subversive Congressional Republicans Trading ETF. The website is [subversiveetfs.com](https://subversiveetfs.com/nanc/), the adviser is Tidal Investments LLC, and the expense ratio is 0.73% on both (fact sheets dated 30 June 2026: [NANC](https://subversiveetfs.com/nanc/fact-sheet), [GOP](https://subversiveetfs.com/gop/fact-sheet)).
+
+| | NANC | GOP (was KRUZ) |
+|---|---|---|
+| Assets | 293 million dollars (3 Sep 2026) | 94 million dollars (4 Sep 2026) |
+| Holdings | 89 | 136 |
+| Top 10 as share of fund | 46.7% | 35.7% |
+| Largest positions | Nvidia 8.8%, Microsoft 6.7%, Alphabet 5.9%, Amazon 5.0%, Apple 4.4% | Comfort Systems USA 7.2%, Intel 5.0%, JPMorgan 4.6%, iShares Bitcoin Trust 3.7%, Nvidia 3.5% |
+
+Sources: fund pages [NANC](https://subversiveetfs.com/nanc/) and [GOP](https://subversiveetfs.com/gop/); holdings files [NANC](https://subversiveetfs.com/wp-content/uploads/data/TidalFG_Holdings_NANC.csv) and [GOP](https://subversiveetfs.com/wp-content/uploads/data/TidalFG_Holdings_GOP.csv), both dated 4 September 2026; SPY's top ten is 37.3% of that fund ([StockAnalysis](https://stockanalysis.com/etf/spy/holdings/)).
+
+### Performance since launch
+
+The funds' own standardised table, net asset value, total return, as of 31 August 2026 ([NANC page](https://subversiveetfs.com/nanc/), [GOP page](https://subversiveetfs.com/gop/)). Periods over one year are annualised.
+
+| | 1 year | 3 years | Since inception, 7 Feb 2023 |
+|---|---|---|---|
+| NANC | 19.32% | 22.67% | **23.11% a year** |
+| GOP | 27.34% | 20.94% | **18.20% a year** |
+| S&P 500 total return index | 20.38% | 21.04% | **20.85% a year** |
+
+Calendar years, market price total return, from [TotalRealReturns](https://totalrealreturns.com/n/NANC,GOP,SPY,QQQ) over 7 February 2023 to 4 September 2026 (the 2023 SPY and QQQ partial-year figures are worked back from the source's matched cumulative numbers, because it prints their full calendar year; NANC's 2024 and 2025 match [FinanceCharts](https://www.financecharts.com/etfs/NANC/performance)):
+
+| Window | NANC | GOP | SPY | QQQ |
+|---|---|---|---|---|
+| 2023 from 7 Feb | +20.8% | +10.2% | +16.2% | +33.1% |
+| 2024 | +26.8% | +14.4% | +24.9% | +25.6% |
+| 2025 | +18.5% | +17.1% | +17.7% | +20.8% |
+| 2026 to 4 Sep | +13.7% | +22.4% | +13.5% | +17.3% |
+| **Cumulative since launch** | **+106.5%** | **+80.7%** | **+94.0%** | **+136.8%** |
+| **Annualised** | **+22.5%** | **+18.0%** | **+20.4%** | **+27.3%** |
+
+So NANC beat the S&P 500 by about 12 points cumulatively, or about 2 points a year. GOP trailed it by about 13 points, despite a strong 2026. And NANC lost to a plain Nasdaq 100 fund by about 30 points, or almost 5 points a year, while charging 0.73% against QQQ's 0.18% ([StockAnalysis QQQ](https://stockanalysis.com/etf/qqq/)). A cross-check from 24/7 Wall St on 20 April 2026 had the same ordering: NANC +88.5%, GOP +64.3%, S&P 500 +74.7% since launch ([24/7 Wall St](https://247wallst.com/investing/2026/04/20/if-you-invested-in-these-congressional-trading-etfs-at-launch-heres-what-youd-have-today/)).
+
+What NANC captured looks like a large-cap technology tilt rather than a Congress edge. Its five megacaps weigh 30.7% against SPY's 29.8%, almost the same; the difference is the second tier, Applied Materials 3.8%, CrowdStrike 3.8%, Salesforce 2.9%, Netflix 2.5%, Micron 2.4%, which barely register in SPY (computed from the holdings files above). A Kennesaw State University commentary from October 2025 made the same point in different words: in September 2025 the two funds were beating Vanguard's S&P 500 fund but trailing four ordinary funds, which "means either that the Unusual Whales funds lack an accurate algorithm for tracking congressional stock trades or that reports of outsized congressional returns are exaggerated" ([Kennesaw State PDF](https://campus.kennesaw.edu/colleges-departments/coles/centers/markets-economic-opportunity/docs/2025-october-commentary.pdf)).
+
+### How the funds are built, and who builds them
+
+The prospectus ([subversiveetfs.com/prospectus](https://subversiveetfs.com/prospectus)), Principal Investment Strategies section, is the rulebook. The adviser uses only Periodic Transaction Reports, looking back three years, and ignores annual disclosures and anything a member held before taking office. Buys and sells both count and are netted. Position size starts from "the midpoint of these ranges" and is then tilted: "large purchases, recurring purchases and purchases from multiple Democratic U.S. Congresspeople" are overweighted, "small purchases, recent sales and one-off trades" are excluded or underweighted, and the adviser may exclude names at its discretion. Options are stripped out ("the Fund will also exclude transactions in the securities underlying of any reported options contract trades"), broad index funds are excluded but sector funds are kept, which is how GOP holds a bitcoin trust. There is no rebalancing schedule; the word does not appear in the prospectus, and turnover in the year to 30 September 2025 was 10% for NANC and 16% for GOP. The stated range is 100 to 200 holdings; NANC held 89 on 4 September 2026. The prospectus names the lag as a risk ("the Fund may purchase a security at a higher price or sell a security at a lower price than it would have") and flags that the Ethics in Government Act bars using the reports "for any commercial purpose", with no definitive ruling that an ETF is allowed. It says nothing about how imprecise a midpoint of a 5 to 25 million dollar band is.
+
+Who runs it has changed twice. Subversive Capital Advisor was the adviser from launch with Tidal Investments as sub-adviser; they swapped on 2 August 2024, and Tidal, a white-label ETF platform in Milwaukee, now picks the stocks. Unusual Whales was a paid data licensor that "plays no role in the construction or implementation of each Fund's portfolio", and a prospectus supplement dated 31 July 2026 removed it entirely: "The Funds are no longer utilizing the services of Unusual Whales, Inc. ... The Adviser now directly obtains information from PTRs." The same supplement struck "Unusual Whales" from both fund names. In August 2024, as Tidal took over, "the Fund eliminated 582 very small positions and re-allocated the proceeds towards stocks which appeared to show a pattern of net investment by Members of Congress", focusing NANC on about 170 holdings ([FY2024 annual report](https://www.sec.gov/Archives/edgar/data/1650149/000183988224044132/whales-ncsr_93024.htm)). So the track record above is two different portfolios under two different managers, and the first one, the one the "Congress beats the market" story sold, is gone.
+
+### What the fund itself says drove the returns
+
+The audited annual reports run to 30 September. In the first partial year NANC returned 7.72% at NAV against 5.47% for the S&P 500, and technology hurt: "Information Technology and Consumer Discretionary detracted -1.39% and -0.69%" ([FY2023 report](https://www.sec.gov/Archives/edgar/data/1650149/000089853123000485/uwsctetf-ncsra.htm)). KRUZ returned -1.30% because "the holdings of Republican members of congress are focused on energy and manufacturing which have lagged the A.I. driven outperformance." In the year to September 2024 NANC returned 40.10% against 36.35%, and the report credits "significant outperformance by large cap technological stocks in the Fund; specifically, Nvidia", with the contributors listed as sector overweights, not stock picks ([FY2024 report](https://www.sec.gov/Archives/edgar/data/1650149/000183988224044132/whales-ncsr_93024.htm)). In the year to September 2025 NANC returned 20.04% against 17.60%, "weighted about 94% towards large cap stocks", with Nvidia "about 10% of the portfolio" and Microsoft "nearly 8%"; GOP returned 16.65% against 17.60%, led by Comfort Systems and the bitcoin trust ([FY2025 report](https://www.sec.gov/Archives/edgar/data/1742912/000199937125019807/suw-ncsr_093025.htm)). In three years of reports the manager never once credits congressional stock-picking for the gap over the index. The reason it gives, each time it beats, is a megacap technology overweight.
+
+### Money in, money out
+
+| As of | NANC net assets | GOP net assets | Source |
+|---|---|---|---|
+| 31 Mar 2023 | 6.3 million dollars | 4.9 million | [semi-annual report](https://www.sec.gov/Archives/edgar/data/1650149/000089853123000252/uwsctetf-ncsrs.htm) |
+| 30 Sep 2023 | 9.4 million | 4.9 million | [FY2025 report, financial highlights](https://www.sec.gov/Archives/edgar/data/1742912/000199937125019807/suw-ncsr_093025.htm) |
+| 30 Sep 2024 | 175.7 million | 33.7 million | same |
+| 30 Sep 2025 | 255.2 million | 59.1 million | same |
+| 31 Mar 2026 | 238.9 million | 68.8 million | [semi-annual report](https://www.sec.gov/Archives/edgar/data/1742912/000199937126012243/unusual-ncsrs_033126.htm) |
+| 30 Jun 2026 | 282.2 million | 88.5 million | fact sheets linked above |
+| 3 to 4 Sep 2026 | 293.4 million | 93.8 million | fund pages linked above |
+
+NANC spent its first eight months under 10 million dollars, then took in 151.2 million dollars of net new money in the year to 30 September 2024, about sixteen times its starting size, per the capital share transactions line of the [FY2024 report](https://www.sec.gov/Archives/edgar/data/1650149/000183988224044132/whales-ncsr_93024.htm). Between September 2025 and March 2026 its assets fell while its price rose, so that half year saw net redemptions.
+
+### Everything else is self-reported or hypothetical
+
+NANC and GOP are the only Congress copy-trade products with audited, SEC-standardised returns. Quiver Quantitative's strategy pages are headed "Backtested trading strategies" and show a backtest start date rather than an inception date: Pelosi 21.41% compound annual growth since 16 May 2014, "Congress Buys" 38.93% and "US House Long-Short" 40.18% since 1 April 2020, with the disclaimer that results "are hypothetical in nature" ([Quiver](https://www.quiverquant.com/strategies/)). pelositracker.app shows +25.2% for its Pelosi portfolio with no window stated ([pelositracker.app](https://pelositracker.app/portfolios/nancy-pelosi)). Autopilot publishes no since-inception return; its app listing claims "over $1 billion invested" and "200,000+ investors" ([App Store](https://apps.apple.com/us/app/autopilot-automated-investing/id1613625799)). Dub publishes no figure. The product the press called the Pelosi ETF, Tuttle Capital's Congressional Trading ETF, ticker NPEL, went effective on 13 December 2024 and never traded: no portfolio or shareholder report has been filed since ([SEC filing index](https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=S000086728&type=&dateb=&owner=include&count=40)).
+
+One date to settle: the audited filings give the funds' inception as 6 February 2023 ([FY2023 report](https://www.sec.gov/Archives/edgar/data/1650149/000089853123000485/uwsctetf-ncsra.htm)); the fact sheets say 7 February. Every return window in this section starts from the first trading day.
+
+
+## 5. Verdict on "follow the top five" as a book
+
+"Follow the top five" means: each January, take the five members at the top of the Unusual Whales leaderboard for the year just ended, and for the next twelve months buy whatever they disclose buying, on the day the filing appears. Here is what the verified record says about that plan.
+
+**It is a bet that last year's leaderboard predicts next year's.** The record says it does not. The number one name has been different every year: Austin Scott's single FuelCell trade topped the 2021 report (which ranked trades, not members), then Mike Kelly in 2022, Brian Higgins in 2023, David Rouzer in 2024 and Warren Davidson in 2025, who had been the worst performer of 2022. Two of the people at the top left Congress within a year of getting there: Higgins resigned in February 2024, Mark Green in July 2025. Unusual Whales says in its own 2022 report that the top names that year "were based on less than 5 trades each and were all unrealized gains due to stock buys dating back to 2020", and its 2024 report says Rouzer "mainly holds ETFs" and owed his year to Nvidia, Mastercard, Visa and an airline ETF "he made these buys years ago". A leaderboard built that way rewards whoever happened to be sitting on one big old winner. It is not a list of skilled traders, and a follower who copies their new purchases is copying something different from what produced the ranking.
+
+**The return you can copy is not the return on the leaderboard.** Three gaps sit between the two. The first is leverage: Pelosi's numbers come from deep in-the-money call options that a shares-only copier cannot hold. The same 2024 Pelosi portfolio is +70.9% on the Unusual Whales method and +54% on Quiver's stock-only rebuild. The second is the lag: the filing arrives 3 to 45 days after the trade, and in the meantime the price has moved, sometimes the wrong way (Nvidia bought at 137.71 on disclosure day in January 2025 was 101.49 three months later). The third is the crowd: Tempus AI rose 35.5% in the first session after Pelosi's filing named it, so the follower's entry is already marked up by the other followers. The live experiment is NANC, which has copied the Democratic side since February 2023 and beaten the S&P 500 by about 2.1 points a year, but trailed a plain Nasdaq 100 fund by about 4.8 points a year over the same window. What NANC captured looks like a large-cap technology tilt, not a Congress edge. The Republican fund, GOP, has trailed the S&P 500 since launch.
+
+**The academic record for the disclosure era says the average member has no edge.** Belmont, Sacerdote, Sehgal and Van Hoek, using every Senate filing from 2012 to March 2020, find that what senators buy lags matched stocks by 11 to 28 basis points over one to six months, and Chen and Sacerdote's 2026 paper on all members to 2023 finds portfolios that "underperform or, at best, match market benchmarks". The two Ziobrowski papers that started the story cover 1985 to 2001, before the STOCK Act, and Eggers and Hainmueller found members lagging the market in 2004 to 2008. The edge that the leaderboards show up every year is what you get when you rank a few hundred noisy portfolios and read off the top of the list.
+
+### The three caveats that matter most
+
+1. **After-the-fact selection.** The top five are chosen with the year's returns already known, from estimates dominated by one or two positions and unrealised gains. Their identities barely repeat, and some leave office. A whitelist of five names is five bets on luck persisting.
+2. **The numbers are estimates from bands.** Trades are disclosed in ranges (1,001 to 15,000 dollars, up to 1,000,001 to 5,000,000 and beyond), options are approximated, and open positions are marked at year end. Two trackers give the same portfolio returns 17 points apart. Treat every leaderboard figure as a rough order of magnitude.
+3. **The copyable edge is small and may be legislated away.** Even NANC's real, audited beat over the S&P 500 is about two points a year before asking whether it was just a tech tilt. The House passed a purchase ban, H.R. 7008, on 22 July 2026; if the Senate follows, the signal this book runs on stops, and Pelosi's own filings end with her term on 3 January 2027 regardless.
+
+### What this means for Book D
+Keep the broad sweep the spec already describes (all members, scored by band, crowding, committee link and run-up) rather than a five-name whitelist. If a member filter is wanted, rank on consistency across the five yearly lists (members who beat the S&P 500 in at least three of the five years) rather than on last year's rank, and refresh it every January. Treat Pelosi as a dated special case: buy the underlying share only when the lag is short and the run-up is inside the 15% skip rule, and plan for the feed to stop in January 2027.
+
+
+## 6. What the earlier note got right and wrong
+
+The note being checked is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06_reviews/06_congress_research.md`, written from memory. Scored against the sources above.
+
+| Claim in the note | Verdict | What the sources say |
+|---|---|---|
+| Ziobrowski 2004: senators +85 basis points a month, 1993 to 1998 | Right | Purchases beat the market by 85 basis points a month; the long-buys short-sells portfolio by 97, about 12% a year. Eggers and Hainmueller showed the 12% is the largest of eight estimates and depends on one weighting |
+| Ziobrowski 2011: House +55 basis points a month | Right, but incomplete | 55 basis points a month on purchases, "over 6 percent per year". The stocks members sold did as well as the ones they bought, so on the standard long-minus-short measure there is no edge |
+| Eggers and Hainmueller 2013: members lag by 2 to 3% a year, 2004 to 2008 | Right | Members underperformed by 0.23 percentage points a month, about 2.8% a year, 2004 to 2008 |
+| Belmont et al 2022: average member matches or slightly lags | Right | Senate purchases 2012 to 2020 lag matched stocks by 11 to 28 basis points over one to six months; no committee-related skill |
+| Karadas: small abnormal returns in senior committee and leadership | Half right | Karadas's headline is not small: above 35% annualised for powerful Republicans, but only at a one-week holding period, fading within three months, in 2004 to 2010 data, and gone after the STOCK Act. He says himself the disclosure lag made it uninvestable. |
+| Pelosi 2024 about +71 vs S&P +25 | Right | +70.9% vs 24.9% (SPY) |
+| Pelosi 2023 about +65 vs +26 | Right | +65.5% vs about 24.8% (SPY) |
+| Higgins 2023 about +239 | Right | +238.9% |
+| Rouzer 2023 about +129 | Wrong year and number | Rouzer was +105.6% in 2023 and +149.0% in 2024 |
+| Wasserman Schultz 2024 about +142 | Right | +142.3% |
+| Mark Green 2023 about +122 | Right | +122.2% |
+| Wyden 2024 about +124 | Right | +123.8% |
+| McCaul 2021 about +59, Crenshaw +42, Tuberville +37, Khanna +27 | Unverified | The 2021 report ranked individual trades, not members, and the member percentages live in a chart image. 35 members beat SPY that year. None of these four figures could be read on any page |
+| Gottheimer 2022 about -3 vs -18 | Unverified | Not in any 2022 list retrieved; Gottheimer appears in the 2022 report as the largest options trader, not with a return figure |
+| Pelosi 2021 about +69, 2022 about -20 | Half right | 2022 is right (-20.8%). For 2021 the report ranks her sixth and quotes "+39% on the options book"; no +69% figure was found |
+| "50,000 NVDA via 100 USD calls exercised 22 Dec 2021, disclosed mid-Jan 2022, 25,000 sold July 2022 at about 341k loss" | Wrong on the dates | The Nvidia exercise was 17 June 2022 (200 calls into 20,000 shares at a 100 dollar strike), disclosed 14 July 2022; the 25,000 share sale at a stated loss of 341,365 dollars was 26 July 2022, filed the same day. December 2021 was the Alphabet, Micron, Roblox, Salesforce and Disney call basket, filed 29 December 2021 |
+| "Buying shares instead of her calls captures maybe a third of the headline gain" | Broadly right in direction | Same 2024 portfolio: +70.9% on the options-inclusive estimate, +54% for the Autopilot tracker that holds shares after the lag, +48.4% for Quiver |
+| "NANC and KRUZ have tracked the S&P closely since Feb 2023" | Wrong | NANC is about 12 points ahead of SPY cumulatively and about 30 points behind QQQ; GOP (the renamed KRUZ) is about 13 points behind SPY |
+| "Top five chosen after the fact and names barely repeat" | Right | Only Rouzer appears in two top fives; two number ones have since left Congress; the 2025 number one was the worst performer of 2022 |
+
+---
+
+## Working files and provenance
+
+The agent notes this report condenses sit in the session scratchpad and will not survive a reboot: the academic, leaderboard, Pelosi and ETF notes, plus the downloaded papers (Ziobrowski 2004 and 2011, Capitol Losses, Political Capital, NBER 26975, Karadas's dissertation, the EconStor copy of Karadas, Schlosky and Hall 2021, the NANC and GOP prospectus, fact sheets and annual reports). Every link in this report was fetched during the session unless marked untested. Pages that refused automated fetching and were read through re-reports or archives: unusualwhales.com report pages (JavaScript shells), slickcharts.com, joinautopilot.com, capitoltrades.com, SSRN, MDPI, ScienceDirect, cnn.com. Two sub-agents ran out of web search budget near the end, so the negatives in section 4 (no press piece running NANC against QQQ, no Autopilot since-inception figure) are strong but not exhaustive.
