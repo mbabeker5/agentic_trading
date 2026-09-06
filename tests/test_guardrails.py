@@ -222,10 +222,10 @@ def test_shipped_config_loads_with_the_proposed_numbers():
     assert loaded.account.gateway_port == 4002
 
     assert loaded.money.starting_equity == 100000
-    assert loaded.money.max_position_pct == 10
+    assert loaded.money.max_position_pct == 15
     assert loaded.money.max_open_positions == 5
     assert loaded.money.max_daily_loss_pct == 2
-    assert loaded.money.max_order_notional == 10000
+    assert loaded.money.max_order_notional == 15000
 
     assert loaded.risk.stop_loss_pct == 1.5
     assert loaded.risk.use_opening_range_low_if_tighter is True

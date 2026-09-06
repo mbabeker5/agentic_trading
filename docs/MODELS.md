@@ -2,6 +2,14 @@
 
 Each strategy book names its model in one line of its yaml. The code in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/models.py` turns that line into a working connection. Two providers are wired up.
 
+## Month one decision (Mo, 2026-09-06)
+
+Every model call in month one goes through OpenRouter, one provider for all books, so cost and latency are measured the same way everywhere. The Anthropic-direct adapter stays in the code but is not used. The two ids in play:
+
+- Claude Fable 5.1: `openrouter/anthropic/claude-fable-5.1` (books A, C, D)
+- GPT-6 Astra: `openrouter/openai/gpt-6-astra` (book E)
+- Book B uses no model at all.
+
 ## How to name a model
 
 | You want | Write in the book's yaml |

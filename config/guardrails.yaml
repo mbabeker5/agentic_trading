@@ -23,12 +23,12 @@ account:
 
 money:
   starting_equity: 100000     # what the paper account is reset to on day one
-  max_position_pct: 10        # no single stock may be more than this percent
+  max_position_pct: 15        # no single stock may be more than this percent
                               # of the account. 10 percent of 100k is 10k.
   max_open_positions: 5       # at most this many stocks held at the same time
   max_daily_loss_pct: 2       # lose this percent of the day's opening balance
                               # and the agent stops opening new trades that day
-  max_order_notional: 10000   # no single buy order may be worth more than this
+  max_order_notional: 15000   # no single buy order may be worth more than this
                               # many dollars
 
 risk:

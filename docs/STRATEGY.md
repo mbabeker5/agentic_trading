@@ -1,6 +1,6 @@
 # Strategy spec: opening momentum, month one
 
-Status: draft for Mo's approval, written 2026-09-02, shorting added the same day at Mo's request. Nothing here trades until Mo says the numbers are right.
+Status: draft for Mo's approval, written 2026-09-02, shorting added the same day at Mo's request, position cap raised to 15% on 2026-09-06. Nothing here trades until Mo says the numbers are right. This strategy runs as three of the five month-one books: A (hybrid, Claude Fable via OpenRouter), B (rules only, no model), E (hybrid, GPT-6 Astra via OpenRouter).
 
 ## The idea in one paragraph
 
@@ -28,8 +28,8 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | Parameter | Proposed | Notes |
 |---|---|---|
 | Paper starting balance | $100,000 | Paper account reset to this on day one |
-| Max per position | 10% of equity | About $10,000 at the start |
-| Max open positions | 5 | So at most half the account is at risk at once |
+| Max per position | 15% of book equity (Mo, 2026-09-06) | About $15,000 at the start |
+| Max open positions | 5 | So at most 75% of the book is deployed at once |
 | Stop loss | 1.5% below entry, or the opening range low if closer | Hard, attached to the order as a bracket |
 | Daily loss cap | 2% of equity | Hit it and the code halts new trades for the day, closes what is open |
 | Flat by | 3:55 PM Eastern | Market orders |
@@ -40,7 +40,7 @@ The code does the boring, rule-bound work and enforces every hard limit. Claude 
 | Volume floor | 1,000,000 shares average daily | |
 | Shortlist size | 20 at most | |
 | Shorting | Allowed (Mo, 2026-09-02) | Same caps as longs, stop 1.5% above entry or the range high if closer, easy-to-borrow names only, price floor $10 |
-| Gross exposure cap | 100% of equity | Longs plus shorts added together may never exceed the account value. No margin borrowing for longs. Proposed backstop; 50% is the tighter alternative |
+| Gross exposure cap | 100% of book equity | Longs plus shorts added together may never exceed the book's value. No margin borrowing for longs. With 5 positions at 15% the natural ceiling is 75%, so this is a backstop |
 | Options | Not in month one | |
 | Order types | Limit entries, bracket stops, market exits at close | |
 
