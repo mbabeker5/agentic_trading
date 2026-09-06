@@ -22,7 +22,7 @@ The official sources are free but painful. The House Clerk's site publishes PTRs
 
 1. **House Stock Watcher and Senate Stock Watcher.** Community projects that parse the official filings into clean JSON, published on GitHub and refreshed roughly daily. First stop. Their weakness is that they are volunteer-run and have had gaps; the code checks the last-updated date and flags staleness beyond three days.
 2. **Capitol Trades.** A free website with a clean, searchable table updated through the day, useful for cross-checking and for committee metadata. It has no public API, so the code reads it only as a fallback and never depends on it.
-3. **Paid fallback, if the free mirrors fail during the month:** Quiver Quantitative offers a congressional trading API on a paid plan in the tens of dollars a month, updated within hours of a filing. Finnhub has a similar endpoint. Neither is switched on until needed.
+3. **Paid option, behind a config flag, off until Mo buys it:** Quiver Quantitative (API Hobbyist $30 a month, Trader $75, official MCP, no quotes), updated within hours of a filing. Finnhub has a similar endpoint. Free official sources stay primary. Note from the 2026-09-06 build: both Stock Watcher mirrors were dead and Capitol Trades unreachable, so the sweep parses the official House and Senate sources directly and uses a community mirror only as a degraded fallback.
 
 Whatever the source, the code records both dates for every trade: the date the member traded and the date the filing appeared. The gap between them is the strategy's central problem.
 

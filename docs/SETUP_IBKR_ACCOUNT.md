@@ -25,7 +25,7 @@ You do not need to fund the account to paper trade. Fund it only when we decide 
 ## 3. Market data subscription (after paper login exists, 5 minutes)
 
 1. Client Portal, Settings, User Settings, **Market Data Subscriptions**.
-2. Subscribe to **US Securities Snapshot and Futures Value Bundle**. $10 a month, waived in any month you pay $30 or more in commissions. This is the consolidated national best bid and offer the agent prices from.
+2. Subscribe to the **streaming NBBO by network**: Network A (NYSE), Network B (NYSE Arca and regionals) and Network C (Nasdaq), $1.50 each, $4.50 a month in total. This is the consolidated national best bid and offer the agent prices from, streaming rather than snapshot. The $10 "US Securities Snapshot and Futures Value Bundle" is the alternative if you also want futures; the hub's research of 2026-09-06 recommends the $4.50 route (`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/data_sources/quote_feeds_2026-09-06.md`).
 3. If the strategy trades options, also add **OPRA Top of Book (L1)**, $1.50 a month.
 
 ## 4. Hand the login to the agent
@@ -42,6 +42,7 @@ That folder is gitignored, so it never reaches GitHub. Do not paste the credenti
 ## 4b. Market data: three things to know
 
 - **Sharing is on.** On 2026-09-02 Mo set "Share real-time market data subscriptions with paper trading account" to Yes for paper username futzmp555 (account DUT077572), sharing from live username mbabeker5. IBKR applies it overnight, so the first real-time check is the morning of 2026-09-03 after 9:30 AM Eastern. Note the auto-login still uses the live username mbabeker5 with the paper button; that logs into the same paper account and has worked.
+- **Paper fills use IBKR's own quotes.** Whatever feed we buy, the simulator fills against IBKR's data, so the agent decides on IBKR quotes and the ledger's slippage column tracks any gap between decided price and fill.
 - **Only one login can hold market data at a time.** IBKR allows one market data session per user, and live and paper share it. While Gateway runs the paper account during market hours, do not keep a quote screen, Client Portal watchlist or the mobile app streaming prices on the live login. It will steal the data session from the agent and its quotes will go stale (Gateway reports error 10197).
 - **Subscriber status.** Mo's status showed Professional on 2026-09-02 and IBKR asked for the Non-Professional questionnaire. Professional status triples data fees and can change which feeds are shared to paper. Complete the questionnaire on the live login under Settings, User Settings, Market Data Subscriptions. The smoke test on 2026-09-03 records whether quotes come back flagged professional.
 

@@ -22,7 +22,7 @@ SEC EDGAR is free, needs no account, and publishes a filing to its feeds within 
 2. **The Form 4 XML document** inside each filing. It is structured, not a PDF, so transaction code, price, share count, the 10b5-1 checkbox, the insider's title and post-trade holdings all parse cleanly.
 3. **The submissions API** at data.sec.gov for each company, to fetch recent history and count the cluster.
 
-EDGAR allows ten requests a second with a descriptive User-Agent header. The free OpenInsider screener shows the same purchases and is a handy cross-check, but it is a website, not an API, so the code does not depend on it.
+Optional paid signal source, off until Mo buys it: Quiver Quantitative (API Hobbyist $30 a month, Trader $75, has an official MCP, no quotes) behind a config flag. Free official sources stay primary. EDGAR allows ten requests a second with a descriptive User-Agent header. The free OpenInsider screener shows the same purchases and is a handy cross-check, but it is a website, not an API, so the code does not depend on it.
 
 ## The day
 
