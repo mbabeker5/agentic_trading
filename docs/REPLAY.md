@@ -287,71 +287,52 @@ needs a scenario where it blocks an order, and the block has to show up in the
 ledger with that rule id on it. A guardrail that never fires during the whole
 harness has not been tested, it has just not been reached.
 
-`paper_only`, `wrong_account`, `wrong_book`, `kill_switch`, `symbol_exclusive`,
-`halted`, `sec_type`, `currency`, `blacklist`, `whitelist`, `no_shorts`,
-`short_price_floor`, `shortable_required`, `entry_window`,
-`outside_market_hours`, `flatten_time`, `daily_loss_cap`, `max_order_notional`,
-`max_position_pct`, `max_open_positions`, `gross_exposure_cap`,
-`entries_per_day`.
-
-Twenty two of them, not the twenty this list started with: `symbol_exclusive`
-and `halted` arrived with commit `e653508`. That list is not maintained by hand
-any more. `test_the_gate_covers_every_rule_id_the_guardrails_can_emit` in
+The list of rule ids is not written down here any more, because it moved three
+times on 2026-09-06 alone: twenty at breakfast, twenty two after commit
+`e653508`, twenty seven by the afternoon. `GUARDRAIL_RULE_IDS` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/scenarios.py`
+holds the current list, and
+`test_the_gate_covers_every_rule_id_the_guardrails_can_emit` in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_replay_gate.py`
 reads the `decision.add(...)` calls straight out of
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/guardrails.py`
-and fails if the gate's list and the module have drifted apart, because a rule
-the gate does not know about is a rule the gate would silently report as
-covered.
+and goes red when the two disagree. A rule the gate does not know about is a
+rule the gate would otherwise report as covered.
 
 **A rule the loop can only reach with help is worth less than one it reaches on
-its own.** The gate says which is which. Seven rule ids are reached by the
-loop's own order flow. The rest are backstops behind a door the loop keeps shut:
-it will not build an entry outside the entry window, it will not build one while
-the stop file is there, it sizes every entry through `max_shares_for` so it
-cannot ask for more than the caps allow, and it always builds a dollar
-denominated share order tagged for the right book. Those are proven by pushing a
-crafted order through `agent/loop.py`'s own `consider()`, with the real
-guardrails and the real ledger writing, and the report labels them as probes.
+its own, and one it cannot reach at all is worth nothing.** The gate sorts every
+rule into those three piles and says which is which.
 
-### The named scenarios
+Reached on its own means the loop's own order flow got there during the day.
+Reached by a probe means the gate pushed a crafted order at it through
+`agent/loop.py`'s own `consider()`, with the real guardrails, the real book
+state and the real ledger writing. Some of those are backstops behind a door the
+loop keeps shut, which is fine: it will not build an entry outside the entry
+window, it will not build one while the stop file is there, and it sizes every
+entry through `max_shares_for` so it cannot ask for more than the caps allow.
 
-4. **Daily loss cap trips.** Drive a book into a 2 percent loss on the day. New
-   trades must halt, open positions must close, and `daily_loss_cap` must appear
-   in the ledger. Then check the obvious failure mode: the halt must not block
-   the closing orders themselves.
-5. **The 3:55 flatten happens.** Every momentum book is flat by 15:55 with market
-   orders. Check it with positions still open at 15:50, and check it again when a
-   position is already flat, because a flatten that sends an order for zero shares
-   is a bug.
-6. **Reconciliation halts the day on a phantom position.** Inject
-   `phantom_position` mid morning. The loop must notice that the account holds
-   something no book claims, halt, and alert. It must not carry on trading around
-   it and it must not try to close it, because a position nobody understands is
-   not one to act on blind.
-7. **The kill switch bites.** Create the stop file at
-   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/STOP`
-   mid day. No new entries, no new resting stop orders, and closing an existing
-   position still allowed. That asymmetry is deliberate and is the thing to check.
-8. **The day trade counter counts.** Books C and D are held to three day trades
-   per five business days. Drive book C to four round trips and confirm the fourth
-   is refused. Confirm the momentum books are not blocked but that every trade the
-   pattern day trader rule would have blocked is logged, so the live money cost of
-   the rule is measured rather than guessed.
-9. **Gateway goes down mid day.** Inject `gateway_down` at 11:00 and clear it at
-   11:20. The loop must survive four dead ticks, must not conclude it holds
-   nothing just because it cannot read the account, must not double up on orders
-   when the connection comes back, and must reconcile before it trades again.
-10. **A competing session appears.** Inject `competing_session`, which raises with
-    IBKR code 10197. This is what happens when someone logs into TWS on another
-    machine with the same login. The loop must halt and alert rather than trade on
-    stale numbers.
-11. **Data goes delayed.** Inject `delayed_data` so every snapshot reports market
-    data type 3. The loop must notice the data is delayed and either refuse to
-    open new positions or record loudly that it opened them on delayed prices.
-    Quietly trading on delayed quotes is the failure.
-12. **An order comes back rejected.** Inject `reject_next_order`. The loop must
-    not treat a rejection as a fill, and must not retry it in a loop.
+The third pile is the one to read. As of 2026-09-06 seven rules can only be
+reached by a probe because the fact each of them checks is a field the loop
+never fills, and every one of those fields defaults to a value meaning all
+clear:
+
+| Rule | Reads | Set by |
+|---|---|---|
+| `symbol_exclusive` | `AccountState.symbols_held_elsewhere` | nothing |
+| `halted` | `OrderIntent.halted`, `OrderIntent.limit_state` | nothing |
+| `weekly_loss_cap` | `AccountState.week_pnl` | nothing |
+| `monthly_loss_cap` | `AccountState.month_pnl` | nothing |
+| `losing_streak_pause` | `AccountState.consecutive_losing_days` | nothing |
+| `sector_cap` | `OrderIntent.sector` | nothing |
+| `account_symbol_cap` | `AccountState.symbol_exposure_all_books`, `account_equity` | nothing |
+
+They work when a probe hands them the facts. They cannot fire in production
+however the day goes. What looks like twenty seven guardrails is twenty, and one
+of the seven is worse than dormant: `sector_cap` refuses any entry whose
+industry it was not told, so with nothing setting `OrderIntent.sector` it
+currently refuses every entry every momentum book works out. The clean day
+scenario reports any rule that refused ten or more orders as a stopped machine
+rather than a guardrail doing its job, which is how that turned up.
 
 ### Which scenario is which
 
@@ -556,6 +537,18 @@ also means the stop fires without asking anything. The day trade scenario shows
 book C's fourth round trip refused by `pdt_limit` and then happening anyway,
 because the stop was already resting. Any rule that works by refusing the loop's
 own closing order is weaker than it reads.
+
+**Nothing stops the loop sending the same order twice.** Found by running the
+gate rather than by reading the code. A book short a name whose price rises all
+day gets a fade exit on every manage tick, and every tick sends a fresh limit
+order to cover. Nothing in `agent/loop.py` reads `open_orders()` before sending,
+and nothing cancels, so seventy two identical orders for the whole position were
+resting at the broker by the close. On a paper replay that is a curiosity. In a
+live account it is the position committed once for every five minutes of the
+day, and all of it filling together on the first dip. The `_stacked_orders`
+check in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/scenarios.py`
+watches for it now, but only in the scenarios that call it.
 
 **Nothing here proves the scanner works.** The gate builds its shortlist out of
 the recorded bars, ranked by the size of the move and what traded, because the
