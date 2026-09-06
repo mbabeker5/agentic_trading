@@ -4,7 +4,10 @@
 # Stop with:
 #   /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/stop_mcp.sh
 set -euo pipefail
-PROJECT="/Users/mtalib/workspace_repos/personal_repo/agentic_trading"
+# Where the project lives. AGENTIC_TRADING_ROOT wins when it is set; otherwise
+# this script works it out from its own location, so a plain clone anywhere on
+# any Mac just works with nothing configured.
+PROJECT="${AGENTIC_TRADING_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 ENV_FILE="$PROJECT/config/mcp_ibkr.env"
 BIN="$PROJECT/venv312/bin/mcp-ibkr"
 LOG_DIR="$PROJECT/output/mcp_logs"

@@ -30,7 +30,10 @@
 
 set -uo pipefail
 
-PROJECT="/Users/mtalib/workspace_repos/personal_repo/agentic_trading"
+# Where the project lives. AGENTIC_TRADING_ROOT wins when it is set; otherwise
+# this script works it out from its own location, so a plain clone anywhere on
+# any Mac just works with nothing configured.
+PROJECT="${AGENTIC_TRADING_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VENV="$PROJECT/venv312"
 LOG_DIR="$PROJECT/output"
 LOG="$LOG_DIR/tick_$(date +%Y-%m-%d).log"

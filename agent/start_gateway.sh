@@ -8,14 +8,34 @@
 #   /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/stop_gateway.sh
 set -euo pipefail
 
-PROJECT="/Users/mtalib/workspace_repos/personal_repo/agentic_trading"
+# Where the project lives. AGENTIC_TRADING_ROOT wins when it is set; otherwise
+# this script works it out from its own location, so a plain clone anywhere on
+# any Mac just works with nothing configured.
+PROJECT="${AGENTIC_TRADING_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 SECRETS="$PROJECT/.secrets/ibkr_paper.env"
 IBC_DIR="$PROJECT/ibc"
 IBC_INI="$PROJECT/config/ibc.ini"
-TWS_MAJOR_VRSN="10.45"
-TWS_PATH="$HOME/Applications"
 SETTINGS_DIR="$PROJECT/output/jts"
 LOG_DIR="$PROJECT/output/ibc_logs"
+
+# Which Gateway version, from config/gateway.env, which agent/paths.py reads too.
+# One number in one file for both languages.
+GATEWAY_ENV="$PROJECT/config/gateway.env"
+if [[ -f "$GATEWAY_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$GATEWAY_ENV"
+  set +a
+fi
+TWS_MAJOR_VRSN="${IB_GATEWAY_VERSION:-10.45}"
+
+# Where Gateway is installed. IB's macOS installer makes one folder per version
+# under ~/Applications, so that is the default. IB_GATEWAY_DIR overrides it for a
+# machine that keeps Gateway in /Applications instead. IBC rebuilds the folder
+# name itself from TWS_PATH and the version, so an override still has to end in
+# "IB Gateway <version>".
+GATEWAY_DIR="${IB_GATEWAY_DIR:-$HOME/Applications/IB Gateway $TWS_MAJOR_VRSN}"
+TWS_PATH="$(dirname "$GATEWAY_DIR")"
 
 if [[ ! -f "$SECRETS" ]]; then
   echo "Missing $SECRETS"
@@ -26,8 +46,10 @@ if [[ ! -d "$IBC_DIR/scripts" ]]; then
   echo "IBC not found at $IBC_DIR. Run $PROJECT/agent/install_ibc.sh first."
   exit 1
 fi
-if [[ ! -d "$TWS_PATH/IB Gateway $TWS_MAJOR_VRSN" ]]; then
-  echo "IB Gateway $TWS_MAJOR_VRSN not found under $TWS_PATH"
+if [[ ! -d "$GATEWAY_DIR" ]]; then
+  echo "IB Gateway $TWS_MAJOR_VRSN not found at $GATEWAY_DIR"
+  echo "Install that version, or change IB_GATEWAY_VERSION in $GATEWAY_ENV,"
+  echo "or set IB_GATEWAY_DIR to where it actually is."
   exit 1
 fi
 
