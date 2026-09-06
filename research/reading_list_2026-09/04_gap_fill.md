@@ -1,4 +1,4 @@
-# 04. Gap fill: what a second pass with web search found
+# 04. Verified findings: what the papers actually say once you open them
 
 Written 2026-09-06, the same day as the first three lists, but with one difference that matters: this pass had web search and could open the papers. The first three lists were written by agents working from memory, and they said so. This file is what happened when someone went and checked.
 
