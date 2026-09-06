@@ -39,6 +39,9 @@ mkdir -p "$LOG_DIR"
 
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] $*" >> "$LOG"; }
 
+# Kill switch. agent/kill_switch.sh writes this file; while it exists no tick runs at all.
+[[ -f "$LOG_DIR/LOOP_DISABLED" ]] && { say "LOOP_DISABLED exists, so this tick did nothing. Clear it with $PROJECT/agent/reenable.sh"; exit 0; }
+
 say "----- tick starting, mode $MODE -----"
 
 # A live port here would mean real money. Refuse outright.
