@@ -261,6 +261,7 @@ class BookPlan:
     sweep_script: str | None = None
     shortlist_prefix: str = "shortlist"
     runs_scanner: bool = False
+    vwap_fade_closes: int = 0
 
 
 def family_for(book: gr.BookConfig) -> str:
@@ -275,6 +276,22 @@ def family_for(book: gr.BookConfig) -> str:
 
 def _clock(text: Any) -> clock_time:
     return datetime.strptime(str(text).strip(), "%H:%M").time()
+
+
+def vwap_fade_closes_for(book: gr.BookConfig) -> int:
+    """How many closes the wrong side of VWAP this book calls a fade.
+
+    One number in one place. risk.vwap_fade_closes in the book's strategy.yaml
+    is both what the code fires on and what {{vwap_fade_closes}} renders into
+    the prompt, so the sentence the model reads and the rule the code applies
+    cannot drift apart. A book with no such key, which is every book except the
+    momentum three, gets zero and the fade rule is off for it.
+    """
+    try:
+        params, _ = decide_mod.load_params(project_root() / str(book.strategy_dir))
+        return max(0, int(params.get("vwap_fade_closes") or 0))
+    except Exception:                            # noqa: BLE001
+        return 0
 
 
 def plan_for(book: gr.BookConfig, guard: gr.Guardrails) -> BookPlan:
@@ -312,6 +329,7 @@ def plan_for(book: gr.BookConfig, guard: gr.Guardrails) -> BookPlan:
         sweep_script=script,
         shortlist_prefix=prefix,
         runs_scanner=(family == MOMENTUM),
+        vwap_fade_closes=(vwap_fade_closes_for(book) if family == MOMENTUM else 0),
     )
 
 
@@ -1149,6 +1167,14 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
             candidate["last_close"] = price
 
         if plan.family == MOMENTUM:
+            # Out of the packet, not just out of the message. The scanner has no
+            # news feed behind it, so a headline on a momentum row is either
+            # empty or something that drifted in from elsewhere, and a packet is
+            # meant to be exactly what was known at the time. Leaving an
+            # unreliable field in it would make the review of a decision worse,
+            # not better. See MOMENTUM_CANDIDATE_KEYS in agent/decide.py.
+            for unreliable in ("headline", "news"):
+                candidate.pop(unreliable, None)
             try:
                 bars = broker_mod.bars_5m_today(broker, contract_for(candidate))
             except Exception as exc:         # noqa: BLE001
@@ -1518,9 +1544,34 @@ def fill_levels(state: bs.BookState, symbol: str, short: bool, price: float,
                   [f"{levels.reject}, so the rule stop {rule:.2f} is used instead"])
 
 
+def count_vwap_closes(state: bs.BookState, symbol: str, position: bs.Position,
+                      last_close: float | None, vwap: float | None) -> int:
+    """How many five minute closes in a row have finished the wrong side of VWAP.
+
+    Kept in the book's own file, next to the trigger record for the same name,
+    because a fade is a run of bars and a run cannot be counted inside one tick.
+    Any close back on the right side puts it to zero, so it is consecutive
+    closes and never a total for the day. A tick with no price and no VWAP
+    leaves the count where it was rather than resetting it, because nothing was
+    observed.
+    """
+    raw = state.triggered.get(symbol) if isinstance(state.triggered, dict) else None
+    row = dict(raw) if isinstance(raw, dict) else {}
+    so_far = int(_number(row.get("vwap_closes_through")))
+    if not vwap or not last_close:
+        return so_far
+
+    through = (last_close > vwap) if position.is_short else (last_close < vwap)
+    count = so_far + 1 if through else 0
+    row["vwap_closes_through"] = count
+    state.triggered[symbol] = row
+    return count
+
+
 def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
                     today: date_type, last_close: float,
-                    vwap: float | None) -> tuple[str | None, str]:
+                    vwap: float | None,
+                    closes_through_vwap: int = 0) -> tuple[str | None, str]:
     """Should this position be closed, and in plain words why.
 
     Every way out of a position, in the order the strategies put them:
@@ -1530,9 +1581,13 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
         trailing    the price came back through the trailing stop, which follows
                     the best price the position has seen since it was opened
         time        the position has run out of trading days
-        fade        momentum books only: the five minute close is back through
-                    the day's volume weighted average price, which is the
-                    standard tell that an opening push is over
+        fade        momentum books only: enough five minute closes in a row have
+                    finished back through the day's volume weighted average
+                    price, which is the standard tell that an opening push is
+                    over. How many is "enough" is risk.vwap_fade_closes in the
+                    book's own strategy.yaml, carried here on the plan, and it
+                    is the same number the prompt tells the model. One weak bar
+                    is not a fade, which is why the count is not one.
 
     Kept as its own function, with no broker and no clock in it, so every rule
     can be checked on paper.
@@ -1587,10 +1642,12 @@ def exit_reason_for(position: bs.Position, plan: BookPlan, guard: gr.Guardrails,
                             f"out of the {guard.risk.time_stop_trading_days} trading "
                             "days this book gives one")
 
-    if plan.family == MOMENTUM and vwap:
-        if (not short and last_close < vwap) or (short and last_close > vwap):
-            return "fade", (f"momentum faded, the five minute close {last_close:.2f} is "
-                            f"back through the day's vwap {vwap:.2f}")
+    if plan.family == MOMENTUM and vwap and plan.vwap_fade_closes:
+        if closes_through_vwap >= plan.vwap_fade_closes:
+            bars = "close" if closes_through_vwap == 1 else "closes in a row"
+            return "fade", (f"momentum faded, {closes_through_vwap} five minute {bars} "
+                            f"back through the day's vwap {vwap:.2f}, and this book "
+                            f"calls a fade at {plan.vwap_fade_closes}")
     return None, ""
 
 
@@ -1701,12 +1758,18 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
     if not positions:
         tick.say("Nothing is open.")
 
+    # The fade count is worked out once, here, before the packet is written, so
+    # the number the model is shown is the same one the code will fire on.
+    vwap_closes: dict[str, int] = {}
     rows_for_packet = []
     for symbol, position in positions.items():
         last_close, vwap = prices.get(symbol, (None, None))
+        vwap_closes[symbol] = count_vwap_closes(state, symbol, position, last_close,
+                                                vwap)
         row = _position_row(position)
         row["last_close"] = last_close
         row["session_vwap"] = vwap
+        row["closes_below_vwap"] = vwap_closes[symbol]
         rows_for_packet.append(row)
 
     packet = {
@@ -1773,14 +1836,22 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
                               account_state)
         state.put_position(position)
 
-        trigger, why = exit_reason_for(position, plan, guard, today, last_close, vwap)
+        trigger, why = exit_reason_for(position, plan, guard, today, last_close, vwap,
+                                       closes_through_vwap=vwap_closes.get(symbol, 0))
         view = model_view.get(symbol) or {}
         model_says = str(view.get("action") or "").lower()
         model_reason = str(view.get("rationale") or "")
 
-        if trigger is None and model_says == "exit":
-            trigger = "model"
-            why = f"the model asked to close it: {model_reason}"
+        # "fade" is an answer, not a shrug. The manage prompt offers hold, fade
+        # and exit, and says in as many words that code treats a fade as a
+        # reason to close now, so a fade that was written down and then ignored
+        # would be the prompt lying to the model. Both close the position with
+        # purpose exit; what differs is the reason written into the record.
+        if trigger is None and model_says in ("exit", "fade"):
+            trigger = f"model_{model_says}"
+            what = ("asked to close it now" if model_says == "exit"
+                    else "called the momentum gone")
+            why = (f"the model {what}: {model_reason or 'no reason given'}")
         elif trigger is not None and model_reason:
             why = f"{why}. The model said {model_says or 'nothing'}: {model_reason}"
 

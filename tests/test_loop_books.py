@@ -575,8 +575,12 @@ def test_the_stop_the_target_and_the_fade_each_close_a_long():
     assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 98.0, None)[0] == "stop"
     assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 103.5,
                                 None)[0] == "target"
-    assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5,
-                                101.0)[0] == "fade"
+    # A fade needs risk.vwap_fade_closes closes in a row the wrong side of VWAP,
+    # which is 2 for this book, so one close below is still a hold.
+    assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5, 101.0,
+                                closes_through_vwap=1)[0] is None
+    assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5, 101.0,
+                                closes_through_vwap=2)[0] == "fade"
     assert loop.exit_reason_for(_position(), plan, guard, TUESDAY, 100.5,
                                 100.0)[0] is None
 
@@ -587,8 +591,12 @@ def test_a_short_is_the_mirror_image():
     short = _position(qty=-100, side="short", entry=100.0, stop=101.5, target=97.0)
     assert loop.exit_reason_for(short, plan, guard, TUESDAY, 102.0, None)[0] == "stop"
     assert loop.exit_reason_for(short, plan, guard, TUESDAY, 96.5, None)[0] == "target"
-    # For a short, being back above the vwap is the fade.
-    assert loop.exit_reason_for(short, plan, guard, TUESDAY, 99.0, 98.0)[0] == "fade"
+    # For a short, being back above the vwap is the fade, and it still takes
+    # risk.vwap_fade_closes of them in a row.
+    assert loop.exit_reason_for(short, plan, guard, TUESDAY, 99.0, 98.0,
+                                closes_through_vwap=1)[0] is None
+    assert loop.exit_reason_for(short, plan, guard, TUESDAY, 99.0, 98.0,
+                                closes_through_vwap=2)[0] == "fade"
 
 
 def test_the_insider_book_has_a_time_stop_and_no_fade():

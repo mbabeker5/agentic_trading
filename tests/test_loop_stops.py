@@ -672,3 +672,238 @@ def test_the_replay_fake_broker_places_every_leg():
     assert [leg["purpose"] for leg in answer["legs"]] == ["entry", "target", "stop"]
     assert all(leg["order_ref"] == "BOOK_A" for leg in answer["legs"])
     assert len(broker.orders) == 3
+
+
+# ---------------------------------------------------------------------------
+# The VWAP fade: one number in the yaml, and the code fires on exactly it
+# ---------------------------------------------------------------------------
+
+
+def test_every_momentum_book_reads_its_fade_count_from_its_own_yaml():
+    for book_id in ("A", "B", "E"):
+        registry = gr.load_books(BOOKS_YAML)
+        made = loop.plan_for(registry.get(book_id), guard_for(book_id))
+        assert made.family == loop.MOMENTUM
+        assert made.vwap_fade_closes == 2, (
+            f"book {book_id} has no risk.vwap_fade_closes in its strategy.yaml")
+
+
+def test_a_book_that_does_not_trade_the_opening_push_has_no_fade_rule():
+    registry = gr.load_books(BOOKS_YAML)
+    for book_id in ("C", "D"):
+        made = loop.plan_for(registry.get(book_id), guard_for(book_id))
+        assert made.vwap_fade_closes == 0
+
+
+def test_one_close_below_vwap_is_not_a_fade():
+    position = long_position()
+    position.trailing_high_or_low = 100.0
+    trigger, _ = loop.exit_reason_for(position, plan(), guard_for("A"), TUESDAY,
+                                      100.4, vwap=101.0, closes_through_vwap=1)
+    assert trigger is None
+
+
+def test_the_fade_fires_on_exactly_the_count_the_yaml_names():
+    position = long_position()
+    position.trailing_high_or_low = 100.0
+    trigger, why = loop.exit_reason_for(position, plan(), guard_for("A"), TUESDAY,
+                                        100.4, vwap=101.0, closes_through_vwap=2)
+    assert trigger == "fade"
+    assert "2 five minute closes in a row" in why
+    assert "calls a fade at 2" in why
+
+
+def test_the_fade_count_climbs_and_resets(sandbox):
+    state = fresh_state(sandbox)
+    position = long_position()
+
+    assert loop.count_vwap_closes(state, "AAPL", position, 100.4, 101.0) == 1
+    assert loop.count_vwap_closes(state, "AAPL", position, 100.2, 101.0) == 2
+    # One close back above VWAP puts it to zero. It counts a run, not a total.
+    assert loop.count_vwap_closes(state, "AAPL", position, 101.5, 101.0) == 0
+    assert loop.count_vwap_closes(state, "AAPL", position, 100.1, 101.0) == 1
+
+
+def test_a_tick_with_no_price_leaves_the_fade_count_alone(sandbox):
+    state = fresh_state(sandbox)
+    position = long_position()
+    loop.count_vwap_closes(state, "AAPL", position, 100.4, 101.0)
+    assert loop.count_vwap_closes(state, "AAPL", position, None, None) == 1
+    assert loop.count_vwap_closes(state, "AAPL", position, None, 101.0) == 1
+
+
+def test_the_short_fade_counts_closes_above_vwap(sandbox):
+    state = fresh_state(sandbox)
+    position = short_position()
+    assert loop.count_vwap_closes(state, "AAPL", position, 101.5, 101.0) == 1
+    assert loop.count_vwap_closes(state, "AAPL", position, 100.4, 101.0) == 0
+
+
+def test_the_fade_count_survives_a_round_trip_through_the_book_file(sandbox):
+    state = fresh_state(sandbox)
+    loop.count_vwap_closes(state, "AAPL", long_position(), 100.4, 101.0)
+    bs.save_state(state, root=sandbox)
+
+    reloaded = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000, root=sandbox)
+    assert loop.count_vwap_closes(reloaded, "AAPL", long_position(), 100.2,
+                                  101.0) == 2
+
+
+def test_the_prompt_renders_the_same_fade_count_the_code_fires_on():
+    """The whole point of the yaml key: one number, two readers, no drift."""
+    from agent import decide as decide_mod
+
+    strategy_dir = REAL_ROOT / "strategies" / "momentum_hybrid"
+    params, _ = decide_mod.load_params(strategy_dir)
+    rendered = decide_mod.render_prompt(strategy_dir, "manage", params)
+
+    plan_count = loop.plan_for(gr.load_books(BOOKS_YAML).get("A"),
+                               guard_for("A")).vwap_fade_closes
+    assert "{{vwap_fade_closes}}" not in rendered
+    assert f"{plan_count} closes in a row the wrong side of VWAP" in rendered
+
+
+# ---------------------------------------------------------------------------
+# The model's "fade" answer closes a position, the same as "exit"
+# ---------------------------------------------------------------------------
+
+
+class StubDecision:
+    """What decide() hands back, with whatever exits a test wants in it."""
+
+    def __init__(self, exits):
+        self.picks: list = []
+        self.skips: list = []
+        self.exits = list(exits)
+        self.notes: list = []
+        self.ok = True
+        self.error = None
+        self.model = "stub"
+        self.cost_usd = 0.0
+        self.prompt_hash = "stubhash"
+
+
+def manage_once(sandbox, monkeypatch, exits, price=100.5, vwap=100.0,
+                position=None):
+    """One manage tick over one open position, with the model's answer stubbed."""
+    state = fresh_state(sandbox)
+    guard = guard_for("A")
+    book = book_for("A", "dry_run")
+    tick = loop.BookTick(book, at(10, 5), "testhash", write_ledger=False, quiet=True)
+    state.put_position(position or long_position())
+    broker = RecordingBroker(price=price)
+    account_state = bs.account_state_for(state, gr, at(10, 5), "DUT077572", False, {})
+
+    monkeypatch.setattr(loop.decide_mod, "decide",
+                        lambda *a, **k: StubDecision(exits))
+    monkeypatch.setattr(loop.broker_mod, "bars_5m_today",
+                        lambda *a, **k: [{"time": "2026-09-08 10:05:00",
+                                          "close": price, "high": price,
+                                          "low": price, "open": price,
+                                          "volume": 1000}])
+    monkeypatch.setattr(loop.broker_mod, "session_vwap", lambda bars: vwap)
+    monkeypatch.setattr(loop.ledger_writer, "log_decision", lambda *a, **k: None)
+    monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: None)
+
+    loop.do_manage(tick, state, plan(), guard, broker, account_state,
+                   loop.read_guards())
+    return state, tick
+
+
+def decisions_about(state, symbol="AAPL"):
+    return [row for row in state.decisions
+            if str(row.get("symbol") or "") == symbol]
+
+
+def test_a_model_fade_closes_the_position(sandbox, monkeypatch):
+    state, _ = manage_once(sandbox, monkeypatch, [
+        {"symbol": "AAPL", "action": "fade",
+         "rationale": "two bars of nothing on dying volume"}])
+
+    closing = [row for row in decisions_about(state)
+               if "would place SELL" in str(row["decision"])]
+    assert closing, "the model's fade did not close anything"
+    assert "would place SELL 100 AAPL" in closing[-1]["decision"]
+    assert "purpose: exit" in closing[-1]["decision"]
+    assert "called the momentum gone" in closing[-1]["decision"]
+    assert "dying volume" in closing[-1]["decision"]
+
+
+def test_a_model_exit_closes_the_position(sandbox, monkeypatch):
+    state, _ = manage_once(sandbox, monkeypatch, [
+        {"symbol": "AAPL", "action": "exit", "rationale": "get out now"}])
+
+    closing = [row for row in decisions_about(state)
+               if "would place SELL" in str(row["decision"])]
+    assert closing
+    assert "asked to close it now" in closing[-1]["decision"]
+
+
+def test_a_model_hold_closes_nothing(sandbox, monkeypatch):
+    state, _ = manage_once(sandbox, monkeypatch, [
+        {"symbol": "AAPL", "action": "hold", "rationale": "still working"}])
+
+    assert not [row for row in decisions_about(state)
+                if "would place" in str(row["decision"])]
+    assert any(row["decision"] == "hold" for row in decisions_about(state))
+
+
+def test_a_rule_that_already_fired_keeps_its_own_reason(sandbox, monkeypatch):
+    """A stop out is a stop out, even when the model called it a fade."""
+    state, _ = manage_once(sandbox, monkeypatch, [
+        {"symbol": "AAPL", "action": "fade", "rationale": "momentum gone"}],
+        price=98.0, vwap=99.0)
+
+    closing = [row for row in decisions_about(state)
+               if "would place SELL" in str(row["decision"])]
+    assert "went through the stop" in closing[-1]["decision"]
+    assert "momentum gone" in closing[-1]["decision"]
+
+
+def test_a_model_fade_still_sends_nothing_in_a_dry_run(sandbox, monkeypatch):
+    _, tick = manage_once(sandbox, monkeypatch, [
+        {"symbol": "AAPL", "action": "fade", "rationale": "gone"}])
+    assert tick.sent == 0
+
+
+# ---------------------------------------------------------------------------
+# Headline and news are out of the momentum packet, not just out of the message
+# ---------------------------------------------------------------------------
+
+
+def test_a_momentum_candidate_carries_no_headline_and_no_news(sandbox, monkeypatch):
+    state = fresh_state(sandbox)
+    guard = guard_for("A")
+    tick = loop.BookTick(book_for("A"), at(9, 36), "testhash", write_ledger=False,
+                         quiet=True)
+    broker = RecordingBroker()
+    monkeypatch.setattr(loop.broker_mod, "bars_5m_today", lambda *a, **k: [])
+
+    packet = loop.build_pick_packet(tick, state, plan(), guard, broker, [
+        {"symbol": "AAPL", "opening_range_high": 101.0, "opening_range_low": 99.0,
+         "headline": "a headline nobody checked", "news": "and some news",
+         "score": 9.0}])
+
+    candidate = packet["candidates"][0]
+    assert "headline" not in candidate
+    assert "news" not in candidate
+
+
+def test_the_momentum_keys_no_longer_offer_a_headline():
+    from agent import decide as decide_mod
+
+    assert "headline" not in decide_mod.MOMENTUM_CANDIDATE_KEYS
+    assert "news" not in decide_mod.MOMENTUM_CANDIDATE_KEYS
+    # The filings books keep both, because their sweeps read real text.
+    assert "headline" in decide_mod.SLOW_CANDIDATE_KEYS
+    assert "news" in decide_mod.SLOW_CANDIDATE_KEYS
+
+
+def test_the_momentum_prompt_no_longer_asks_for_a_catalyst():
+    from agent import decide as decide_mod
+
+    strategy_dir = REAL_ROOT / "strategies" / "momentum_hybrid"
+    params, _ = decide_mod.load_params(strategy_dir)
+    rendered = decide_mod.render_prompt(strategy_dir, "pick", params)
+    assert "carry no" in rendered and "headline and no news" in rendered
+    assert "A gap with a headline behind it beats a gap with none" not in rendered

@@ -61,7 +61,13 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-PROJECT = Path("/Users/mtalib/workspace_repos/personal_repo/agentic_trading")
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from paths import project_root  # noqa: E402
+
+PROJECT = project_root()
 STRATEGIES = PROJECT / "strategies"
 OUTPUT = PROJECT / "output"
 DOCS = PROJECT / "docs"
@@ -254,11 +260,12 @@ FALLBACK_PARAMS: dict[str, dict] = {
         "entries_until": "11:00", "flatten_at": "15:55", "price_floor": 5,
         "short_price_floor": 10, "min_avg_volume": 1000000, "rel_volume_min": 2.0,
         "allow_shorts": True, "gross_exposure_pct_max": 100, "target_r_multiple": 2,
-        "loop_minutes": 5,
+        "loop_minutes": 5, "vwap_fade_closes": 2,
     },
     "momentum_rules": {
         "entries_per_day_max": 3, "max_open_positions": 5, "max_position_pct": 15,
         "stop_loss_pct": 1.5, "target_r_multiple": 2, "max_order_notional": 15000,
+        "vwap_fade_closes": 2,
     },
     "insider": {
         "entries_per_day_max": 3, "max_open_positions": 10, "max_position_pct": 5,
@@ -354,10 +361,18 @@ def _compact_bars(bars: list, keep: int = BARS_KEPT) -> list:
     return out
 
 
+# No headline and no news, deliberately (2026-09-06). The momentum scanner reads
+# IBKR's raw scan lists and daily bars and has no news feed behind it, so a
+# headline field on a momentum row was either empty or carried whatever the
+# shortlist happened to have lying about. Handing a model a field it cannot
+# rely on and then asking it to weigh the story behind a gap invites it to
+# invent one, and an invented reason reads exactly like a real one in the
+# ledger. The insider and Congress rows below keep both keys, because their
+# sweeps read filings and the text is real.
 MOMENTUM_CANDIDATE_KEYS = (
     "symbol", "long_name", "stock_type", "last", "gain_pct", "opening_range_high",
     "opening_range_low", "rel_volume", "volume_today", "avg_volume_20d",
-    "session_vwap", "last_close", "score", "flagged_by", "headline", "news",
+    "session_vwap", "last_close", "score", "flagged_by",
     "shortable", "borrow_note",
 )
 MOMENTUM_POSITION_KEYS = (
@@ -397,7 +412,9 @@ def build_user_message(shape: str, packet: dict) -> str:
     and the scanner's internal bookkeeping go, because the model cannot act on them.
 
     What stays: the prices and volumes the judgment rules name, the opening range,
-    the session VWAP, the score, why the scanner flagged it, and any headline.
+    the session VWAP, the score, and why the scanner flagged it. A momentum row
+    also drops its headline and its news, for the reason written above
+    MOMENTUM_CANDIDATE_KEYS.
     """
     if shape not in SHAPES:
         raise ValueError(f"shape must be one of {SHAPES}, not {shape!r}")

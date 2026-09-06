@@ -56,6 +56,15 @@ risk:
   time_stop_trading_days: 1   # a position never lives past the close, so one
                               # trading day is the honest number. The 15:55
                               # flatten does the actual work.
+  vwap_fade_closes: 2         # how many five minute closes in a row back
+                              # through the session VWAP count as the opening
+                              # push being over. One weak bar is noise, so the
+                              # number is not 1. Book B calls no model, so here
+                              # this number has only one reader, agent/loop.py,
+                              # which fires on exactly this count. It matches
+                              # the number in momentum_hybrid because B is the
+                              # control and only the model may differ between
+                              # them. Set it to 0 to switch the rule off.
 
 universe:
   price_floor: 5              # ignore anything trading below this many dollars
