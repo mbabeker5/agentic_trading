@@ -383,6 +383,15 @@ price worked out by hand rather than by running the code and pasting the answer.
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/mcp_client.py`,
 plus the order half that file deliberately leaves out.
 
+It also satisfies the `Broker` protocol in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/broker.py`,
+checked with `isinstance` and by comparing every method signature one at a time.
+The only differences are additive: `portfolio`, `open_orders` and `executions`
+take one extra optional `order_ref`. So the loop can be handed a `FakeBroker`
+wherever it expects an `McpBroker` and needs no other change, and
+`account_values`, `bars_5m_today` and `session_vwap` from that module all work
+against it unaltered.
+
 Reads, identical in name and shape to the real client:
 
 ```python
