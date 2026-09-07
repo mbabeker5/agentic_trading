@@ -33,6 +33,7 @@ from agent.guardrails import (
     daily_loss_hit,
     entries_allowed_now,
     is_regular_hours,
+    is_trading_day,
     load_guardrails,
     max_shares_for,
     must_flatten_now,
@@ -616,6 +617,71 @@ def test_entry_window_boundaries(g: Guardrails, moment, expected):
 )
 def test_regular_hours_boundaries(g: Guardrails, moment, expected):
     assert is_regular_hours(g, moment) is expected
+
+
+#: The three US market closures left in 2026, as config/guardrails.yaml ships
+#: them: Labor Day, Thanksgiving and Christmas.
+HOLIDAYS_2026 = ["2026-09-07", "2026-11-26", "2026-12-25"]
+
+
+@pytest.fixture()
+def gh(tmp_path: Path) -> Guardrails:
+    """The proposed settings with the 2026 market holidays filled in.
+
+    The base settings these tests are built on leave schedule.holidays out, and
+    a rule about holidays cannot be tested against a file that has none.
+    """
+    return load_with(tmp_path, {"schedule": {"holidays": HOLIDAYS_2026}})
+
+
+@pytest.mark.parametrize(
+    "moment, expected",
+    [
+        (et(1, 10, 0), True),    # Tuesday, an ordinary trading day
+        (et(8, 10, 0), True),    # Tuesday
+        (et(5, 10, 0), False),   # Saturday
+        (et(6, 10, 0), False),   # Sunday
+        (et(7, 10, 0), False),   # Monday 2026-09-07, Labor Day
+        (et(7, 3, 0), False),    # the small hours of the holiday, still shut
+        (et(7, 23, 0), False),   # and the late evening of it
+        (et(26, 10, 0, month=11), False),   # Thanksgiving
+        (et(25, 10, 0, month=12), False),   # Christmas
+        (et(24, 10, 0, month=12), True),    # Christmas Eve, a Thursday, open
+    ],
+)
+def test_is_trading_day_knows_the_holidays(gh: Guardrails, moment, expected):
+    """A holiday is a closed day, the same as a Saturday. Backlog item 9.
+
+    Until 2026-09-07 nothing in this file read schedule.holidays, so Labor Day
+    was an ordinary Monday to every time rule in it.
+    """
+    assert is_trading_day(gh, moment) is expected
+
+
+def test_with_no_holidays_listed_only_the_weekend_is_shut(g: Guardrails):
+    """An empty list is the ordinary case and it must not close anything extra."""
+    assert g.schedule.holidays == ()
+    assert is_trading_day(g, et(7, 10, 0)) is True
+    assert is_trading_day(g, et(5, 10, 0)) is False
+
+
+def test_regular_hours_are_shut_all_day_on_a_holiday(gh: Guardrails):
+    """09:30 to 16:00 on Labor Day is shut, and the Tuesday after it is open."""
+    assert is_regular_hours(gh, et(7, 9, 30)) is False
+    assert is_regular_hours(gh, et(7, 12, 0)) is False
+    assert is_regular_hours(gh, et(7, 15, 59)) is False
+    assert is_regular_hours(gh, et(8, 9, 30)) is True
+
+
+def test_the_holiday_is_read_in_new_york_not_in_the_caller_s_timezone(gh: Guardrails):
+    """03:00 UTC on the 8th is still the evening of Labor Day in New York."""
+    assert is_trading_day(gh, datetime(2026, 9, 8, 3, 0, tzinfo=timezone.utc)) is False
+    assert is_trading_day(gh, datetime(2026, 9, 8, 13, 0, tzinfo=timezone.utc)) is True
+
+
+def test_a_time_with_no_timezone_is_refused_by_is_trading_day(gh: Guardrails):
+    with pytest.raises(GuardrailUsageError, match="carries no timezone"):
+        is_trading_day(gh, datetime(2026, 9, 7, 10, 0))
 
 
 @pytest.mark.parametrize(

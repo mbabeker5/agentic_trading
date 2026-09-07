@@ -92,6 +92,8 @@ __all__ = [
     "entries_allowed_now",
     "must_flatten_now",
     "is_regular_hours",
+    "is_trading_day",
+    "is_trading_date",
     "stop_price_for",
     "atr_stop_distance",
     "shares_for_risk",
@@ -514,9 +516,11 @@ class ScheduleConfig:
     day. None means the only limit is max_open_positions.
 
     holidays is the list of days the US market is shut that are not weekends.
-    It is empty in the shipped settings, and it is used by the day trade counter
-    in agent/pdt.py to work out what a business day is. Nothing else in this
-    file has ever known about holidays, and that has not changed.
+    The shipped settings name the closures left in 2026. It is read by the day
+    trade counter in agent/pdt.py to work out what a business day is, by
+    is_trading_day() below, and through that by is_regular_hours() and by the
+    phase the loop puts each book in. Until 2026-09-07 nothing in this file knew
+    about it, so the order checks called Labor Day an ordinary Monday.
 
     Momentum v2, approved by Mo on 2026-09-06, split the close in two and made
     the cadence data driven:
@@ -2367,18 +2371,50 @@ def _eastern(g: Guardrails, moment: datetime, label: str = "now") -> datetime:
 
 
 def _is_weekday(moment: datetime) -> bool:
-    """Monday to Friday. Market holidays are the calendar's job, not this file's."""
+    """Monday to Friday, and nothing about holidays.
+
+    Kept because most of the time rules below only ever needed the weekday half
+    of the question. is_trading_day() is the one that also reads
+    schedule.holidays, and that is what is_regular_hours() asks.
+    """
     return moment.weekday() < 5
 
 
-def is_regular_hours(g: Guardrails, now: datetime) -> bool:
-    """True when the US market is open: a weekday, from scan_start up to market_close.
+def is_trading_date(day: date, holidays: tuple[date, ...] = ()) -> bool:
+    """True when the US market trades on this calendar date.
 
-    The start of the day is included and the close is not, so 09:30 counts as
-    open and 16:00 counts as shut.
+    A weekday that is not one of the market holidays. This is the ONE answer to
+    that question in the project. is_trading_day() below asks it with a settings
+    object in hand, and agent/loop.py asks it with the holidays it carries on
+    each book's plan, so the loop and the order checks cannot drift apart about
+    what a closed day is.
+
+    holidays is the tuple of dates off schedule.holidays, or any other container
+    of dates. Empty is the ordinary case and means weekends only.
+    """
+    return day.weekday() < 5 and day not in (holidays or ())
+
+
+def is_trading_day(g: Guardrails, now: datetime) -> bool:
+    """True when the US market trades on the day this moment falls on.
+
+    A weekday that is not in schedule.holidays, read in the schedule's own
+    timezone so a late evening London moment is asked about the New York day it
+    belongs to.
     """
     local = _eastern(g, now)
-    if not _is_weekday(local):
+    return is_trading_date(local.date(), g.schedule.holidays)
+
+
+def is_regular_hours(g: Guardrails, now: datetime) -> bool:
+    """True when the US market is open: a trading day, scan_start up to market_close.
+
+    The start of the day is included and the close is not, so 09:30 counts as
+    open and 16:00 counts as shut. A market holiday named in schedule.holidays
+    is shut all day, the same as a Saturday.
+    """
+    local = _eastern(g, now)
+    if not is_trading_day(g, local):
         return False
     return g.schedule.scan_start <= local.time() < g.schedule.market_close
 

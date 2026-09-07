@@ -477,6 +477,10 @@ class BookPlan:
     vwap_fade_acts: bool = False
     flatten_market_at: clock_time | None = None
     preopen_start: clock_time | None = None
+    #: The days the US market is shut that are not weekends, from
+    #: schedule.holidays in config/guardrails.yaml. Carried here rather than
+    #: looked up, so phase_for() stays a function of plain values.
+    holidays: tuple[date_type, ...] = ()
 
 
 def family_for(book: gr.BookConfig) -> str:
@@ -567,6 +571,7 @@ def plan_for(book: gr.BookConfig, guard: gr.Guardrails) -> BookPlan:
         vwap_fade_acts=(vwap_fade_acts_for(book) if family == MOMENTUM else True),
         flatten_market_at=schedule.flatten_market_at,
         preopen_start=(schedule.preopen_start if family == MOMENTUM else None),
+        holidays=tuple(schedule.holidays or ()),
     )
 
 
@@ -609,6 +614,24 @@ def sweep_due(now: datetime, plan: BookPlan, swept_at: dict | None) -> str | Non
     return None
 
 
+def is_trading_day(now: datetime, plan: BookPlan) -> bool:
+    """Does the US market trade today? A weekday that is not a market holiday.
+
+    THE BUG THIS CLOSES, backlog item 9. phase_for() used to ask nothing but
+    now.weekday(), so Monday 2026-09-07, Labor Day, was an ordinary trading day
+    to the loop: book D ran its 07:30 Congress sweep, and the momentum books
+    would have run the pre-open, the opening range and the 09:35 pick against a
+    shut market. schedule.holidays had named the day since commit 96c50c7 and
+    only agent/deadman.py and agent/pdt.py were reading it.
+
+    The answer itself lives in agent/guardrails.py, which is also what
+    is_regular_hours() asks, so the phase the loop picks and the order checks
+    cannot disagree about what a closed day is. This wrapper exists only so
+    phase_for() can stay a function of plain values with no settings object.
+    """
+    return gr.is_trading_date(now.date(), plan.holidays)
+
+
 def phase_for(now: datetime, plan: BookPlan, *, pick_done: bool = False,
               last_manage_at: str | datetime | None = None,
               swept_at: dict | None = None) -> tuple[str, str]:
@@ -622,6 +645,13 @@ def phase_for(now: datetime, plan: BookPlan, *, pick_done: bool = False,
 
     if now.weekday() >= 5:
         return CLOSED, "it is the weekend, the US market is shut"
+
+    # A market holiday is a closed day for every book, and it is checked before
+    # the sweeps so a holiday morning does not sweep either. There is nothing
+    # to sweep towards: the pick it would feed cannot happen.
+    if not is_trading_day(now, plan):
+        return CLOSED, (f"{now.date():%Y-%m-%d} is a US market holiday, one of the "
+                        "dates in schedule.holidays, so the market is shut all day")
 
     slot = sweep_due(now, plan, swept_at)
     if slot is not None:
@@ -1587,6 +1617,10 @@ class BookTick:
         self.notes: list[str] = []
         self.model_cost = 0.0
         self.phase = IDLE
+        # The sentence phase_for() gave for that phase. It goes on this book's
+        # line in output/loop.log, so a line can be read on its own months
+        # later without working the clock out again.
+        self.phase_reason = ""
         # How long until this book wants looking at again, in seconds. Thirty
         # between 09:35 and 11:00 while it is holding something, five minutes
         # otherwise (item A14, Mo 2026-09-06). run_book fills it in at the end
@@ -4487,6 +4521,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     phase, why = phase_for(now, plan, pick_done=state.picked_at is not None,
                            last_manage_at=state.last_manage_at, swept_at=state.swept_at)
     tick.phase = phase
+    tick.phase_reason = why
 
     if not quiet:
         facts = bs.facts_for(state)
@@ -4514,7 +4549,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         elif phase == FLATTEN:
             do_flatten(tick, state, plan, guard, broker, account_state, guards)
         elif phase == CLOSED:
-            if now.weekday() < 5 and now.time() >= plan.market_close \
+            if is_trading_day(now, plan) and now.time() >= plan.market_close \
                     and not state.daily_written:
                 write_daily(tick, state)
             else:
@@ -4677,7 +4712,7 @@ def tick_log_line(now: datetime, rules: str, book: gr.BookConfig, tick: BookTick
             f"approved={tick.approved} | refused={tick.refused} | sent={tick.sent} | "
             f"halted={'yes' if state.halted else 'no'} | "
             f"model_cost={tick.model_cost:.4f} | notes={len(tick.notes)} | "
-            f"next_tick={tick.next_tick_seconds}s")
+            f"next_tick={tick.next_tick_seconds}s | why={tick.phase_reason}")
 
 
 #: Where the loop writes how soon it wants waking again, in whole seconds.

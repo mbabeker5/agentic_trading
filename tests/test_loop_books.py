@@ -13,6 +13,8 @@ net that is only tested as a whole tells you nothing about which strand is
 holding.
 
 Dates: 2026-09-08 is a Tuesday and the market is open. 2026-09-12 is a Saturday.
+2026-09-07 is a Monday, Labor Day, and the market is shut: it is one of the three
+dates in schedule.holidays in config/guardrails.yaml.
 
 Run them with:
     /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
@@ -818,3 +820,143 @@ def test_one_book_can_be_run_on_its_own(sandbox):
 
 def test_an_unknown_book_is_refused(sandbox):
     assert loop.main(["--book", "Z"], broker=CountingBroker()) == 2
+
+
+# ---------------------------------------------------------------------------
+# Market holidays: a closed day for every book, backlog item 9
+# ---------------------------------------------------------------------------
+
+#: Monday 2026-09-07 is Labor Day and the US market is shut. It is one of the
+#: three dates in schedule.holidays in config/guardrails.yaml, along with
+#: Thanksgiving and Christmas.
+LABOR_DAY = date(2026, 9, 7)
+
+#: Every phase helper the loop can hand a book's turn to. On a closed day none
+#: of them may be reached, so the holiday tests replace all of them with
+#: something that fails the test loudly rather than quietly doing the work.
+ACTING_HELPERS = ("do_preopen", "do_sweep", "do_scan", "do_pick", "do_manage",
+                  "do_flatten", "write_daily")
+
+
+@pytest.fixture
+def helpers_called(monkeypatch) -> list[str]:
+    """Every phase helper replaced by one that writes its name down and returns.
+
+    Recorded rather than raised on purpose. run_book() catches Exception around
+    the phase it dispatches to, so a helper that raised would be swallowed into
+    a note, the phase would still read closed, and a test that asserted on the
+    raise would pass whether or not the sweep had run. The list is the evidence.
+    """
+    seen: list[str] = []
+
+    def recorder(name):
+        def helper(*args, **kwargs):
+            seen.append(name)
+        return helper
+
+    for name in ACTING_HELPERS:
+        monkeypatch.setattr(loop, name, recorder(name))
+    return seen
+
+
+def test_the_plans_carry_the_holidays_from_the_shipped_settings():
+    for book_id in "ABCDE":
+        holidays = plan_for(book_id).holidays
+        assert LABOR_DAY in holidays, f"book {book_id} does not know about Labor Day"
+        assert date(2026, 11, 26) in holidays and date(2026, 12, 25) in holidays
+
+
+def test_every_book_is_closed_all_day_on_a_holiday():
+    """Not idle, not sweeping, not picking. Closed, and the reason names the day.
+
+    07:31 is inside book D's 07:30 Congress sweep window and 09:36 is the
+    momentum pick. Both of those really ran on the morning of 2026-09-07,
+    against a market that was shut, which is the bug this closes.
+    """
+    for book_id in "ABCDE":
+        plan = plan_for(book_id)
+        for hour, minute in ((6, 30), (7, 0), (7, 31), (9, 0), (9, 31), (9, 36),
+                             (12, 0), (15, 46), (15, 56), (16, 5)):
+            phase, why = loop.phase_for(at(hour, minute, LABOR_DAY), plan)
+            assert phase == loop.CLOSED, \
+                f"book {book_id} at {hour:02d}:{minute:02d} on Labor Day said {phase}"
+            assert "2026-09-07" in why and "holiday" in why, why
+
+
+def test_the_same_minutes_on_the_tuesday_are_untouched():
+    """The control. Take the holiday away and every phase is what it always was."""
+    assert loop.phase_for(at(7, 31), plan_for("D"))[0] == loop.SWEEP
+    assert loop.phase_for(at(7, 0), plan_for("C"))[0] == loop.SWEEP
+    assert loop.phase_for(at(9, 0), plan_for("A"))[0] == loop.PREOPEN
+    assert loop.phase_for(at(9, 31), plan_for("A"))[0] == loop.SCAN
+    assert loop.phase_for(at(9, 36), plan_for("A"))[0] == loop.PICK
+
+
+def test_a_holiday_is_a_closed_day_even_with_a_sweep_not_yet_run():
+    """The holiday is checked before the sweeps, so a holiday morning sweeps nothing.
+
+    There is nothing for a sweep to feed on a holiday: the pick it gathers for
+    cannot happen either.
+    """
+    plan = plan_for("D")
+    assert loop.sweep_due(at(7, 31, LABOR_DAY), plan, {}) == "07:30", \
+        "the slot really is due, so the closed phase is the holiday and not the clock"
+    assert loop.phase_for(at(7, 31, LABOR_DAY), plan, swept_at={})[0] == loop.CLOSED
+
+
+@pytest.mark.parametrize("when", ["2026-09-07 09:36", "2026-09-07 07:31"])
+def test_a_whole_tick_on_a_holiday_is_still_a_tick(sandbox, helpers_called, when):
+    """Nothing is decided and nothing moves, but the tick still counts as a tick.
+
+    The dead man's handle in agent/deadman.py flattens the account when the
+    heartbeat goes stale, so a holiday that withheld the heartbeat would be far
+    worse than one that traded.
+    """
+    broker = CountingBroker(price=100.0)
+
+    assert loop.main(["--now", when], broker=broker) == 0
+
+    assert helpers_called == [], \
+        f"the market is shut and these ran anyway: {sorted(set(helpers_called))}"
+    written = sorted(p.name for p in (sandbox / "output").glob("state_BOOK_*.json"))
+    assert written == [f"state_BOOK_{book_id}_2026-09-07.json" for book_id in "ABCDE"]
+    assert (sandbox / "output" / "heartbeat").exists()
+    assert broker.order_calls == []
+
+    log = (sandbox / "output" / "loop.log").read_text()
+    lines = [line for line in log.splitlines() if line.strip()]
+    assert len(lines) == 5, "one line per book, however shut the market is"
+    for book_id, line in zip("ABCDE", lines):
+        assert f"book={book_id}" in line
+        assert "phase=closed" in line
+        assert "2026-09-07 is a US market holiday" in line
+        assert "sent=0" in line
+
+
+def test_the_same_tick_on_the_tuesday_still_sweeps(sandbox, helpers_called):
+    """The control for the test above, and what makes its empty list mean something.
+
+    07:31 on 2026-09-08 is inside book D's 07:30 Congress sweep window, so the
+    sweep really is reached on an ordinary Tuesday. If this stopped recording
+    anything, the holiday test would be passing because nothing ever runs at
+    07:31 rather than because the holiday stopped it.
+    """
+    assert loop.main(["--now", "2026-09-08 07:31"], broker=CountingBroker()) == 0
+    assert "do_sweep" in helpers_called
+    log = (sandbox / "output" / "loop.log").read_text()
+    assert "phase=sweep" in log
+    assert "holiday" not in log
+
+
+def test_a_holiday_writes_no_end_of_day_and_the_next_trading_day_does(sandbox,
+                                                                     monkeypatch):
+    """The write up belongs to a day that traded, so 16:05 on a holiday skips it."""
+    calls: list[str] = []
+    monkeypatch.setattr(loop, "write_daily",
+                        lambda tick, state: calls.append(tick.book.book_id))
+
+    assert loop.main(["--now", "2026-09-07 16:05"], broker=CountingBroker()) == 0
+    assert calls == [], "nothing to write up on a day the market never opened"
+
+    assert loop.main(["--now", "2026-09-08 16:05"], broker=CountingBroker()) == 0
+    assert calls == list("ABCDE")
