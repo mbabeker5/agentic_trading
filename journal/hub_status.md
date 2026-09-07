@@ -3,119 +3,118 @@
 Written 2026-09-06 by the momentum and brackets worker. Overwritten each time,
 so this file is always now and never a history. One line per question asked.
 
-1. **Native OCA brackets placed for every entry: YES.** Commit `7937e78`. A
-   limit parent plus a stop-limit child in one OCA group (`ocaType` 1), the
-   child carrying `parentId`, the parent sent untransmitted so the child's
-   transmit releases the pair. `submit()` in
+Suite: **1562 passed, 0 failed.** Replay gate: **11 pass, 0 fail, 2 slow
+skipped**, up from 5 pass and 4 fail this morning.
+
+## The six fixes: five done, one reverted by another session
+
+1. **Cancel every working order at the flatten: DONE.** Commit in this pass.
+   `cancel_working_orders` in
    `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`
-   routes an entry through `bracket_order` whenever it has a stop, and an entry
-   without a stop is refused upstream, so no entry can reach the broker naked.
-   Not via the server's `ibkr_bracket_order`, whose `takeProfitPrice` has no
-   default and which item A2 therefore made unusable; built from the plain order
-   tool instead, which is what IBKR does underneath. Never yet called against a
-   real account.
+   runs as the FIRST step of the 15:45 flatten and again at the 15:55 market
+   backstop, cancelling both bracket parents and resting stop children, and
+   removing each from the book's own `working_orders`. Cancel first, close
+   second, deliberately: closing first would leave a live stop that could fill
+   against a position that is already gone. Safe to call twice and safe with
+   nothing working. A new replay scenario, `nothing_left_working`, fails if any
+   order is still working after the flatten, and it asserts the ORDER of the two
+   steps rather than only the end state.
 
-2. **Stop and target set at fill time and clamped: YES, with one caveat.**
-   Commits `273e928` (the Momentum v2 stop and the removal of the target) on top
-   of `e093551` (setting them at fill time at all). `record_fill` calls
-   `fill_levels`, which re-measures against the price actually paid, not the
-   price planned, and clamps through `gr.stop_price_for`, so a model may tighten
-   a stop and can never widen one. Target is always 0 on the three momentum
-   books now, which is item A2. The caveat, because it is real: if the rule stop
-   itself raises, `fill_levels` returns a zero stop rather than inventing one.
-   That path is commented and looks unreachable with a positive fill price, but
-   it is not proved unreachable.
+2. **launchd template glob: DONE, and my earlier diagnosis was WRONG.** I told
+   you the three missing jobs were mis-named templates the generator could not
+   see. Half right and the wrong half mattered.
+   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py`
+   did only glob `*.template`, and it now reads `*.plist.tmpl` as well and
+   derives the job name correctly from both. But the three files are NOT
+   templates. They are finished plists, hand written before the generator
+   existed, each with `{ROOT}` written through it and a full schedule in XML,
+   and each one says inside itself that it is held back ON PURPOSE and lists the
+   three steps that arm it. So they still do not generate, and that is correct.
+   `--check` now FAILS naming any template without a plist and any plist whose
+   template has gone, which is the hole that let this survive.
 
-3. **Kill switch on live account ids behind a flag, and a heartbeat: YES to
-   both.** Live ids: commit `9e095d6`.
-   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/kill_switch.py`
-   refuses any account id not starting with DU unless BOTH the
-   `--live-account-ok` flag and the environment variable are set, deliberately
-   two because a flag alone is one typo. Heartbeat: commit `7937e78`. Every tick
-   that finishes touches `output/heartbeat`, written last so a tick that fell
-   over halfway cannot leave a fresh one behind saying all is well, and
-   `agent/deadman.py` (`b151446`) prefers that file over guessing from logs.
-   WARNING, see line 8: the dead man's handle is not a loaded launchd job, so
-   nothing is reading that heartbeat on a schedule today.
+3. **Unclaimed position halts every book and alerts: NOT IN EFFECT. TWO
+   SESSIONS WERE GIVEN OPPOSITE INSTRUCTIONS AND THIS NEEDS YOU TO ARBITRATE.**
+   I built it: `agent/reconcile.py` halted every book on an orphan nobody
+   claims, handed the alert back on the outcome rather than sending it (that
+   module touches nothing outside itself, and is better for it), and the loop
+   sent it once for the finding rather than once per book.
+   Another session then landed commit `c5c92a2`, "A position nobody claims still
+   halts nobody, and the forgiveness file is documented rather than required",
+   and that is what is at HEAD. I checked the live behaviour rather than the
+   commit message: an unexpected orphan today returns `books_to_halt = ()` and
+   raises **zero** alerts.
+   I have NOT re-applied my version. Two sessions taking turns reverting each
+   other is worse than either answer, and this is a real disagreement rather
+   than a mistake. **The argument on each side, so you can settle it in one
+   line:** halting is right because something in the account that no strategy
+   bought means a book has lost its record or somebody traded by hand, and every
+   book is then sizing against a picture that is not true. Not halting is right
+   because this account genuinely holds one unclaimed SPY share from the manual
+   test on 2026-09-02, so halting on an orphan halts all five books on every
+   tick of every day, and a safety rule that fires every five minutes forever is
+   noise with a halt attached.
+   **The forgiveness file is what reconciles the two, and it now exists either
+   way.** `output/expected_orphans.json` is `{"SPY": 1}`, the shape that forgives
+   exactly one share and complains if the number changes, with a committed copy
+   at `config/expected_orphans.example.json` and a note at
+   `config/README_expected_orphans.md` because `output/` is gitignored. With that
+   file in place, halting on an orphan costs nothing on an ordinary day and still
+   catches the case that matters. That is the version I would keep, and it is
+   your call.
+   **The quantity of 1 comes from the written record, not a live read: IB Gateway
+   would not answer a position read while this was written. Confirm on Tuesday.**
 
-4. **Replay gate re-run after the fixes: 5 pass, 4 fail, 3 slow skipped.**
-   Passing: `daily_loss_cap`, `kill_switch`, `gateway_down`, `rejected_order`,
-   `two_books_one_symbol`. Failing, all four real loop gaps and all four in
-   backlog item 0:
-   - `flatten_at_close`, and this one is NEW and the most serious. An entry now
-     goes out as a parent plus a resting stop child and NOTHING CANCELS EITHER
-     at the 15:45 flatten. `agent/loop.py` calls `cancel_order` in exactly two
-     places, moving a stop and the sixty second backstop, and neither runs at
-     the close. Live that is a stop resting overnight for a position that no
-     longer exists, plus an unfilled entry that could fill on the next open into
-     a book that believes it is flat. Not fixed here because another agent is
-     editing `agent/loop.py` right now.
-   - `phantom_position`: an unclaimed position halts nobody, because
-     `agent/reconcile.py` gives an orphan no book id.
-   - `day_trade_counter`: book C never opens a position, so its allowance is
-     never tested.
-   - `competing_session_delayed_data`: `snapshot_by_symbol` swallows every
-     snapshot failure into a note, so IBKR code 10197 reaches no log and no
-     alert, and no book halts.
-   Two of the four failures I found earlier were mine and were HIDING these: the
-   fake broker reported no halted tick and the replay's synthetic shortlist had
-   no industry, so the `halted` and `sector_cap` rules were refusing every entry
-   in every scenario and the gate was testing a missing field rather than the
-   loop. Both fixed in `0049aa9`.
+4. **Snapshot failures become events, alerts and halts: DONE.** IBKR code 10197
+   (another session has taken the account) now logs, alerts and halts the book
+   for the day, because prices we cannot trust are worse than none. A market
+   data type of 3 or 4 during market hours means the live subscription lapsed:
+   it logs, alerts once, and stops the book OPENING anything while still
+   allowing exits, since a stale price is fine to get out on and not fine to get
+   in on. Anything else stays a note, because one unreadable quote is not a
+   reason to stop the day.
 
-5. **rules_commit stamp moved to 03e5318: YES.** Commit `0049aa9`. Books A, B
-   and E. The rule is now written into
-   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml`:
-   before the first trade the stamp follows any commit that changes guardrail
-   behaviour, and after the first trade it becomes a version with its own
-   changelog entry. `promoted_on` is still empty on all five books and all five
-   are still `dry_run`.
+5. **Day trade counter scenario actually opens a position: DONE.** It was
+   asserting on a rule that never ran: book C never opened anything, so its
+   fourth round trip was never refused and the scenario was passing judgement on
+   nothing. Book C now genuinely opens, its fourth round trip in five business
+   days is genuinely refused, and book A's fourth is genuinely allowed and
+   flagged, which is the comparison the scenario exists to draw.
 
-6. **launchd one-minute pre-open wake-ups: DONE, by another agent, commit
-   `9d2dee7`.** I made no change and there was nothing blocking me. Verified
-   rather than trusted: `tick.template` carries
-   `every 1 minute from 09:00 to 09:26 on weekdays`, the generated plist holds
-   27 one-minute wake-ups from 09:00 to 09:26 and a five minute grid after, 110
-   wake-ups a day, and `gen_launchd.py --check` reports all six plists in step
-   with their templates.
+6. **launchd jobs LOADED: DONE, six of them.** Bootstrapped into `gui/501` as
+   user `mtalib`; `launchctl list | grep -i agentic` prints all six as
+   `-  0  com.mtalib.agentic-trading.<job>`, the `-` meaning waiting on schedule
+   which is correct. The exact commands are recorded in
+   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md`.
+   Loaded: `tick`, `preflight`, `watchdog`, `recorder`, `learning`, `weekly`.
 
-7. **SQLite system of record: BUILT.** Commit `c231d06`. `agent/db.py`,
-   `data/schema.sql`, `data/migrations/0001_initial.sql`, `data/trading.sqlite`,
-   plus `scripts/migrate_db.py` and `scripts/backup_db.sh`.
-   **Nightly Sheet sync: the script is built, the job is NOT.**
-   `ledger/sync_sheet.py` exists and a template exists at
-   `config/launchd/templates/sheet_sync.plist.tmpl`, but no plist was ever
-   generated from it, so nothing runs it on a schedule. The cause is a file
-   extension: `scripts/gen_launchd.py` line 438 globs `*.template`, and three
-   templates are named `*.plist.tmpl` instead, so the generator has never seen
-   them. See line 8, because one of the three is the dead man's handle.
+## Still open before Tuesday
 
-8. **Still open before Tuesday, worst first.**
-   - **NO LAUNCHD JOB IS LOADED AT ALL.** `launchctl list` shows nothing
-     matching `agentic`. Six plists are generated and in step, and zero are
-     bootstrapped, so on Tuesday morning nothing wakes up: no tick, no
-     pre-flight, no watchdog. The load command is in `docs/LAUNCHD.md` and it is
-     a Tuesday runbook step, not a code change.
-   - **Three launchd jobs cannot even be generated,** for the extension reason
-     in line 7: `sheet_sync`, `backup_db` and `deadman`. The last one is the
-     dead man's handle that pulls the kill switch when the loop dies holding a
-     position, so the heartbeat in line 3 currently has no reader. Either rename
-     the three templates to `*.template` or widen the glob in
-     `scripts/gen_launchd.py`. I have not touched it: it is one line either way,
-     but it is somebody else's file and it deserves a test.
-   - **The bracket's working orders are not cancelled at the flatten,** line 4.
-     This is the one I would fix first in the code.
-   - **Book D's data question is a statute, not a licence,** and it is Mo's to
-     decide. Every byte comes from the House Clerk and the Senate eFD, so no
-     third party licence applies anywhere. What applies is 5 U.S.C. 13107(c):
-     unlawful to use the filings for "any commercial purpose, other than by news
-     and communications media". Undefined term, no carve-out for personal
-     investment, and the sweep already POSTs the Senate's
-     `prohibition_agreement` on every run, so an unaware position is not
-     available. The deciding fact is whether anything derived ever leaves Mo's
-     own account. Nothing does today.
-   - **A10 shorting is still pending Mo's decision** and stays switched off.
-   - **The stamp may need moving again** if anything lands before Tuesday that
-     changes guardrail behaviour, per the rule in line 5.
+- **THE DEAD MAN'S HANDLE IS NOT ON WATCH.** `deadman` is one of the three
+  unarmed jobs. The loop writes `output/heartbeat` at the end of every finished
+  tick and nothing reads it, so if the loop dies holding a position nothing
+  pulls the kill switch. This is the one gap I would close before Tuesday and I
+  did not close it, because `agent/deadman.py --really` is the only job in this
+  project that can place an order. It is a protective order and it is still an
+  order, and the file itself says it waits on Mo. **One word from you and it is
+  three minutes' work.**
+- The other two unarmed jobs: `sheet_sync` has never run against the real Google
+  Sheet, so its first scheduled run would be its first run against Mo's live
+  sheet, and `backup_db` has never run on a schedule. Both are safe to arm and
+  neither is urgent.
+- Confirm the real SPY orphan quantity on Tuesday's pre-flight, per item 3.
+- **IB Gateway is answering slowly.** Position and open order reads timed out at
+  45 seconds twice today with the market shut. The loop degrades cleanly and
+  says so, but if that persists into Tuesday the 09:35 pick will be working from
+  less than it should.
+- A10 shorting is still pending Mo's decision and stays off.
+- The `rules_commit` stamp is `51da883` on books A, B and E, moved there by
+  another session, and it is already behind again: this pass changed guardrail
+  behaviour after it. Per the rule in `config/books.yaml` it needs moving once
+  more before the first trade, and whoever settles item 3 should be the one to
+  move it, since that decision changes a guardrail.
 
-Suite at the time of writing: 1527 passed, 0 failed.
+## Not done, by your instruction
+
+Item 7, Monday's dress rehearsal, is not started. You said to write the journal
+and stop after 1 to 6, and to hand this file to a fresh worker for Tuesday.

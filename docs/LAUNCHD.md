@@ -586,3 +586,65 @@ working on its own.
 Everything about what the guards do, what an alert looks like and what to do
 when you get one is in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/OPERATIONS.md`.
+
+---
+
+## What was actually loaded, and when (2026-09-06)
+
+Mo approved unattended operation, so the six generated jobs were bootstrapped
+on this Mac rather than left as a hand step in the Tuesday runbook. Recorded
+here because "it is loaded" is not a fact you can read off a plist.
+
+The exact commands, run from
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading`:
+
+```
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.learning.plist
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.preflight.plist
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.recorder.plist
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.tick.plist
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.watchdog.plist
+launchctl bootstrap gui/$(id -u) /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.weekly.plist
+```
+
+All six returned nothing, which is launchctl saying it worked. Confirmed with:
+
+```
+launchctl list | grep -i agentic
+```
+
+which printed all six, each as `-  0  com.mtalib.agentic-trading.<job>`. The `-`
+is the process id column and means the job is not running this second, which is
+correct for a job waiting on its schedule. The `0` is the last exit status.
+
+To check one in detail, or after it has fired:
+
+```
+launchctl print gui/$(id -u)/com.mtalib.agentic-trading.tick
+```
+
+`state = waiting` is what you want, plus `last exit code` once it has run.
+
+### The three jobs that were NOT loaded, and why
+
+`backup_db`, `sheet_sync` and `deadman` are not loaded, because they are not
+generated. They are hand written plists from before this generator existed, each
+one carrying `{ROOT}` and a full schedule and each one saying inside itself that
+it is held back on purpose and listing the three steps that arm it.
+`gen_launchd.py --check` now names all three rather than passing over them in
+silence, which is how they went unnoticed until 2026-09-06.
+
+Arming them is a decision for Mo and not a rename, for one reason each:
+
+- `deadman` is the ONLY job in this project that can place an order. It runs
+  `agent/deadman.py --really`, which pulls the kill switch and flattens the
+  account when the loop dies holding a position. That is a protective action
+  and it is still an order.
+- `sheet_sync` has never run against the real Google Sheet, so its first
+  scheduled run would be its first run, against Mo's live sheet.
+- `backup_db` has never run on a schedule.
+
+**`deadman` is the one that matters for unattended operation.** The loop now
+writes `output/heartbeat` at the end of every tick that finished, and with
+`deadman` unloaded nothing reads it. So the dead man's handle exists, is tested,
+and is not on watch.
