@@ -40,10 +40,21 @@ The four rules, and one thing that is reported rather than refused
 3. Book orders. Every working order a book believes in has to actually exist at
    the broker.
 
-4. Orphans. A position at the broker that no book claims at all is an orphan.
-   The paper account already holds 1 share of SPY left over from a manual test,
-   so the trading loop passes expected_orphans={"SPY": 1} and that one share is
-   not treated as a problem until it is sold.
+4. Orphans. A position at the broker that no book claims at all is an orphan,
+   and an orphan nobody wrote down in advance stops EVERY book. Hub ruling,
+   2026-09-07, recorded in journal/2026-09-07.md and docs/BACKLOG.md item 0b.
+
+   The reasoning is that a holding nobody can account for means either a book
+   has lost its own record or somebody traded the account by hand, and in both
+   of those cases all five books are sizing their next order against a picture
+   that is not true. There is nobody to blame for it, so there is nobody to
+   single out either, which leaves stopping all of them.
+
+   The one way out is the forgiveness file. The paper account already holds 1
+   share of SPY left over from a manual test, so the trading loop passes
+   expected_orphans={"SPY": 1}, and an orphan matching that exactly gets its
+   line in the report and stops nobody. That file is therefore no longer a
+   convenience: it is what has to be right before the first tick of the day.
 
 Two books may hold the same ticker
 ----------------------------------
@@ -86,12 +97,16 @@ sentence naming all of them. Each of those books gets its own Mismatch, so each
 of them lands in books_to_halt, but the identical sentence is only written into
 lines once, because it is one thing for a person to read.
 
-An orphan is not a mismatch. It has no book to blame, so it halts nobody, but an
-unexpected one still makes ok False. Expected orphans, such as that share of
-SPY, get a line saying plainly that they were expected and are fine.
+An orphan is not a mismatch and never becomes one, because a Mismatch names the
+book to blame and an orphan has none. It still stops every book, and it does
+that by putting each book in books_state into books_to_halt directly. So a book
+can be in books_to_halt with no Mismatch against its name, and mismatches_for()
+will come back empty for it. That is the orphan case and it is the only one.
+Expected orphans, such as that share of SPY, get a line saying plainly that they
+were expected and are fine, and they stop nobody.
 
-Written 2026-09-06. Every number lives in the data the caller hands in, not
-here.
+Written 2026-09-06, orphans changed to stop every book on 2026-09-07. Every
+number lives in the data the caller hands in, not here.
 """
 
 from __future__ import annotations
@@ -170,7 +185,10 @@ class Orphan:
     expected is True when the caller told us about this one in advance, for
     example the single share of SPY left behind by a manual test. An expected
     orphan is not a problem and still gets a line, so a reader can see it was
-    noticed and understood.
+    noticed and understood, and it stops nobody.
+
+    An orphan that is NOT expected stops every book. Hub ruling, 2026-09-07,
+    recorded in journal/2026-09-07.md and docs/BACKLOG.md item 0b.
     """
 
     symbol: str
@@ -231,8 +249,10 @@ class ReconcileReport:
     mismatches    every disagreement, sorted so the same input always gives the
                   same order.
     orphans       every position no book claims, expected ones included.
-    books_to_halt every book with at least one mismatch against its name, in
-                  alphabetical order and each named once.
+    books_to_halt every book that stops trading, in alphabetical order and each
+                  named once. A book lands here for either of two reasons: it
+                  has at least one mismatch against its name, or an orphan
+                  nobody expected turned up, which stops all of them at once.
     lines         every sentence, ready to be written straight into a log.
     shared        every ticker more than one book holds, in alphabetical order.
                   Reporting, not a problem. See the Shared class above.
@@ -328,10 +348,17 @@ def reconcile(
         key=lambda orphan: orphan.symbol,
     )
 
-    books_to_halt = tuple(
-        sorted({m.book_id for m in mismatches if m.book_id is not None})
-    )
+    halting = {m.book_id for m in mismatches if m.book_id is not None}
     unexpected = [orphan for orphan in orphans if not orphan.expected]
+    if unexpected:
+        # A holding nobody claims stops all five books. Hub ruling, 2026-09-07,
+        # recorded in journal/2026-09-07.md and docs/BACKLOG.md item 0b. Nobody
+        # can be blamed for an orphan, so nobody can be singled out either, and
+        # the alternative is every book sizing its next order against a picture
+        # of the account that is missing a holding. The way out is the
+        # forgiveness file the caller passes in as expected_orphans.
+        halting.update(claims)
+    books_to_halt = tuple(sorted(halting))
 
     # A shared ticker that adds up gets a sentence, because the daily report
     # should say "two books hold NVDA and the numbers add up" rather than being
@@ -537,7 +564,12 @@ def _find_orphans(
     broker_cost: dict[str, float],
     expected: tuple[dict[str, int] | None, set[str]],
 ) -> list[Orphan]:
-    """Rule four: a holding at the broker that no book has put its name to."""
+    """Rule four: a holding at the broker that no book has put its name to.
+
+    Finding one is all that happens here. Who stops for it is decided in
+    reconcile() above, where an orphan that is not expected puts every book into
+    books_to_halt.
+    """
     expected_quantities, expected_symbols = expected
     claimed = _claimed_symbols(claims)
     found: list[Orphan] = []
@@ -659,16 +691,23 @@ def _orphan_line(
             f"{opening}, which is exactly what we expect to be left over there, so "
             "nothing is wrong and no book stops trading."
         )
+    forgive = (
+        f'Write {{"{symbol}": {qty}}} into output/expected_orphans.json once '
+        "somebody has looked at it and it is understood."
+    )
     if expected_quantities is not None and symbol in expected_quantities:
         return (
             f"{opening}. We expected {_shares(expected_quantities[symbol])} of "
             f"{symbol} to be sitting there unclaimed, so the amount has changed and "
-            "somebody has to look at it. No book is stopped, because no book owns "
-            f"{them}."
+            f"somebody has to look at it. Every book stops trading until then, "
+            f"because nobody owns {them} and nobody can say what else is wrong. "
+            f"{forgive}"
         )
     return (
-        f"{opening}, so nobody knows where {they} came from. No book is stopped, "
-        f"because no book owns {them}, but somebody has to look at it."
+        f"{opening}, so nobody knows where {they} came from. Every book stops "
+        f"trading until someone looks, because a holding nobody can account for "
+        "means either a book has lost its own record or somebody traded this "
+        f"account by hand. {forgive}"
     )
 
 

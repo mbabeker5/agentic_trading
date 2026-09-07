@@ -188,6 +188,12 @@ def test_a_short_position_the_broker_disagrees_about_is_caught_too():
 
 # ---------------------------------------------------------------------------
 # Rule four: positions nobody claims
+#
+# An orphan nobody wrote down in advance stops EVERY book. Hub ruling,
+# 2026-09-07, recorded in journal/2026-09-07.md and docs/BACKLOG.md item 0b.
+# Nobody can be blamed for an orphan, so nobody can be singled out either, and
+# the alternative is five books sizing their next order against a picture of the
+# account that is missing a holding. The one way out is the forgiveness file.
 # ---------------------------------------------------------------------------
 
 
@@ -198,8 +204,8 @@ def test_a_position_at_the_broker_that_no_book_claims_is_an_orphan():
         books_state={"A": book({"AAPL": 100})},
     )
     assert report.ok is False
-    assert report.books_to_halt == (), "nobody claims it, so nobody can be stopped"
-    assert report.mismatches == ()
+    assert report.books_to_halt == ("A",), "an orphan stops every book there is"
+    assert report.mismatches == (), "and it does it without blaming any of them"
 
     assert len(report.orphans) == 1
     orphan = report.orphans[0]
@@ -214,6 +220,93 @@ def test_a_position_at_the_broker_that_no_book_claims_is_an_orphan():
     assert report.unexpected_orphans == (orphan,)
     assert orphan.line in report.lines
     assert "GME" in orphan.line and "$31.50" in orphan.line
+    assert "Every book stops trading" in orphan.line
+    assert '{"GME": 20}' in orphan.line, "the line says how to forgive it"
+
+
+def test_an_orphan_nobody_expected_halts_every_one_of_the_five_books():
+    """The ruling, on the five books that actually run.
+
+    Book A is the only one holding anything and every one of its own numbers is
+    right. It stops anyway, and so do B, C, D and E, because a holding nobody
+    can account for means nobody knows what else is missing.
+    """
+    report = reconcile(
+        broker_positions=[held("AAPL", 100), held("GHOST", 40, avg_cost=12.0)],
+        broker_open_orders=[],
+        books_state={
+            "A": book({"AAPL": 100}),
+            "B": book(),
+            "C": book(),
+            "D": book(),
+            "E": book(),
+        },
+    )
+    assert report.ok is False
+    assert report.books_to_halt == ("A", "B", "C", "D", "E")
+    assert report.mismatches == ()
+    assert report.mismatches_for("A") == (), (
+        "a book halted for an orphan has no mismatch against its name, because "
+        "there is nothing wrong with its own numbers")
+    assert report.summary == "1 problem across books A, B, C, D, E"
+
+
+def test_an_orphan_the_forgiveness_file_names_exactly_halts_nobody():
+    """{"SPY": 1} and the broker holds 1 share of SPY. Everybody carries on."""
+    report = reconcile(
+        broker_positions=[held("AAPL", 100), held("SPY", 1, avg_cost=612.4)],
+        broker_open_orders=[],
+        books_state={
+            "A": book({"AAPL": 100}),
+            "B": book(),
+            "C": book(),
+            "D": book(),
+            "E": book(),
+        },
+        expected_orphans=LEFTOVER_SPY,
+    )
+    assert report.ok is True
+    assert report.books_to_halt == ()
+    assert report.unexpected_orphans == ()
+    assert report.orphans[0].line in report.lines, "and it still gets its line"
+
+
+def test_a_forgiven_symbol_at_the_wrong_quantity_halts_every_book():
+    """We forgive exactly 1 share of SPY. A second one appearing stops everybody.
+
+    This is the whole point of the dict shape over the list shape: the thing
+    worth halting on is not the share that has sat there for a week, it is the
+    one that turned up this morning.
+    """
+    report = reconcile(
+        broker_positions=[held("SPY", 2, avg_cost=612.4)],
+        broker_open_orders=[],
+        books_state={"A": book(), "B": book(), "C": book(), "D": book(),
+                     "E": book()},
+        expected_orphans=LEFTOVER_SPY,
+    )
+    assert report.ok is False
+    assert report.orphans[0].expected is False
+    assert report.books_to_halt == ("A", "B", "C", "D", "E")
+
+
+def test_with_no_forgiveness_file_at_all_nothing_is_forgiven():
+    """A missing output/expected_orphans.json reaches reconcile() as None.
+
+    None forgives nothing, so the leftover share of SPY halts all five books.
+    That is the safe way round and it is why that file stopped being a
+    convenience on 2026-09-07: it has to be right before the first tick.
+    """
+    report = reconcile(
+        broker_positions=[held("SPY", 1, avg_cost=612.4)],
+        broker_open_orders=[],
+        books_state={"A": book(), "B": book(), "C": book(), "D": book(),
+                     "E": book()},
+        expected_orphans=None,
+    )
+    assert report.ok is False
+    assert report.orphans[0].expected is False
+    assert report.books_to_halt == ("A", "B", "C", "D", "E")
 
 
 def test_the_one_share_of_spy_from_the_manual_test_is_expected_and_is_fine():
@@ -248,9 +341,10 @@ def test_an_expected_orphan_whose_quantity_has_changed_is_not_expected_any_more(
     assert report.ok is False
     assert report.orphans[0].expected is False
     assert report.unexpected_orphans == report.orphans
-    assert report.books_to_halt == ()
+    assert report.books_to_halt == ("A",), "so every book there is stops"
     assert "5 shares" in report.orphans[0].line
     assert "1 share" in report.orphans[0].line, "the line says what we expected"
+    assert "Every book stops trading" in report.orphans[0].line
 
 
 def test_expected_orphans_can_be_given_as_a_plain_list_of_symbols_instead():
@@ -270,16 +364,30 @@ def test_with_no_expected_orphans_at_all_the_leftover_spy_is_a_problem():
     report = reconcile([held("SPY", 1)], [], {"A": book()})
     assert report.ok is False
     assert report.orphans[0].expected is False
+    assert report.books_to_halt == ("A",)
+    assert report.summary == "1 problem across book A"
+
+
+def test_an_orphan_with_no_books_at_all_has_nobody_to_stop():
+    """The degenerate case, and it must not blow up.
+
+    Nothing calls reconcile() with no books in real life, but if something ever
+    does then an orphan has nobody to halt and the report says so plainly rather
+    than pretending five books stopped.
+    """
+    report = reconcile([held("SPY", 1)], [], {})
+    assert report.ok is False
+    assert report.books_to_halt == ()
     assert report.summary == "1 problem, with no book to blame"
 
 
 def test_an_orphan_and_a_real_mismatch_are_both_reported_and_neither_hides_the_other():
     """Book A is 20 shares out on AAPL, and 100 GHOST belong to nobody at all.
 
-    Two different problems, and both have to survive into the report. The halt
-    belongs to book A alone, because book A's own numbers are the thing that is
-    wrong. The GHOST is reported and halts nobody, and that must not swallow the
-    sentence saying what is wrong with book A's AAPL.
+    Two different problems, and both have to survive into the report. Book A is
+    blamed for the AAPL, and book B is not. Both of them stop all the same,
+    because the GHOST stops everybody, and that must not swallow the sentence
+    saying what is wrong with book A's AAPL.
     """
     report = reconcile(
         broker_positions=[held("AAPL", 120), held("GHOST", 100, avg_cost=120.0)],
@@ -287,9 +395,11 @@ def test_an_orphan_and_a_real_mismatch_are_both_reported_and_neither_hides_the_o
         books_state={"A": book({"AAPL": 100}), "B": book()},
     )
     assert report.ok is False
-    assert report.books_to_halt == ("A",), "only the book being blamed stops"
+    assert report.books_to_halt == ("A", "B"), "the GHOST stops both of them"
 
-    # The per book mismatch is there, and blames only book A.
+    # The per book mismatch is there, and blames only book A. Book B stops for
+    # the orphan and is blamed for nothing, which is the difference between
+    # books_to_halt and who has a mismatch against their name.
     assert [m.kind for m in report.mismatches] == [KIND_POSITION_QTY]
     assert (report.mismatches[0].book_id, report.mismatches[0].symbol) == ("A", "AAPL")
     assert report.mismatches_for("B") == ()
@@ -299,7 +409,7 @@ def test_an_orphan_and_a_real_mismatch_are_both_reported_and_neither_hides_the_o
     assert len(report.lines) == 2
     assert report.mismatches[0].line in report.lines
     assert report.orphans[0].line in report.lines
-    assert report.summary == "2 problems across book A"
+    assert report.summary == "2 problems across books A, B"
 
 
 def test_reconcile_imports_nothing_that_could_talk_to_the_outside_world():
@@ -436,6 +546,12 @@ def test_the_order_reference_prefix_is_the_same_one_the_guardrails_use():
 
 
 def test_several_problems_at_once_name_each_affected_book_once_and_in_order():
+    """Four problems at once, including an unexpected orphan, so all five stop.
+
+    The orphan is the GME, which nothing forgives. It halts every book, so the
+    interesting part of this test is no longer who stops but who is BLAMED:
+    books A, C and D have a mismatch against their name, books B and E do not.
+    """
     report = reconcile(
         broker_positions=[
             held("AAPL", 120),
@@ -457,10 +573,13 @@ def test_several_problems_at_once_name_each_affected_book_once_and_in_order():
         expected_orphans=LEFTOVER_SPY,
     )
     assert report.ok is False
-    assert report.books_to_halt == ("A", "C", "D")
+    assert report.books_to_halt == ("A", "B", "C", "D", "E"), (
+        "the unclaimed GME stops all of them")
     assert report.books_to_halt == tuple(sorted(set(report.books_to_halt)))
-    assert "B" not in report.books_to_halt, "book B agrees with the broker"
-    assert "E" not in report.books_to_halt, "book E is holding nothing at all"
+    blamed = sorted({m.book_id for m in report.mismatches if m.book_id})
+    assert blamed == ["A", "C", "D"]
+    assert report.mismatches_for("B") == (), "book B agrees with the broker"
+    assert report.mismatches_for("E") == (), "book E is holding nothing at all"
 
     kinds = {m.kind for m in report.mismatches}
     assert kinds == {
@@ -479,7 +598,7 @@ def test_several_problems_at_once_name_each_affected_book_once_and_in_order():
     assert unclaimed_gme[0].expected is False
     assert report.unexpected_orphans == (unclaimed_gme[0],)
 
-    assert report.summary == "5 problems across books A, C, D"
+    assert report.summary == "5 problems across books A, B, C, D, E"
 
 
 def test_the_report_is_sorted_by_symbol_then_book_then_order():

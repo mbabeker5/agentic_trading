@@ -35,6 +35,7 @@ deciding whether a book may be promoted.
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date as date_type, datetime, time as clock_time, timedelta
 from pathlib import Path
@@ -1594,42 +1595,56 @@ def nothing_left_working(day: date_type) -> Scenario:
 def phantom_position(day: date_type) -> Scenario:
     """A holding appears at the broker that the books cannot account for.
 
-    Two shapes, one after the other, because they are genuinely different
-    situations and only one of them halts anybody.
+    Three shapes, one after the other, because who stops is different each time.
 
     10:30  the account holds more OWNED than book A claims. That is a quantity
            mismatch with book A's name on it, so book A halts, book B does not,
            and Mo is told.
-    11:35  the account holds GHOST, which no book has ever claimed. That is an
-           orphan. Nobody halts, and Mo is told once for that name for the day.
+    11:35  the account holds GHOST, which no book has ever claimed and nothing
+           forgives. That is an unexpected orphan, so EVERY book halts and Mo is
+           told once for that name for the day, in one message rather than one
+           per book.
+    14:35  the account holds FORGIVEN instead, and the sandbox's
+           output/expected_orphans.json names it at exactly that quantity.
+           Nobody halts and nobody is alerted, because somebody has already
+           looked at that one and written it down.
 
-    THE SECOND ONE IS A DECISION, not the loop being lax, and this scenario used
-    to assert the opposite. The paper account holds one share of SPY bought by
-    hand on 2026-09-02 and a working order with no tag on it from the same
-    session, and neither will ever belong to a book. Halting on an orphan means
-    halting all five books on every tick of every day for the rest of the month
-    over a share nobody is managing and nobody is at risk from. A safety rule
-    that fires every five minutes forever is not a safety rule.
+    THE SECOND ONE IS THE HUB'S RULING of 2026-09-07, recorded in
+    journal/2026-09-07.md and docs/BACKLOG.md item 0b, and this scenario used to
+    assert the opposite. A holding nobody can account for means either a book
+    has lost its own record or somebody traded the account by hand, and in both
+    cases all five books are sizing their next order against a picture that is
+    not true. Nobody can be blamed for an orphan, so nobody can be singled out
+    either, which leaves stopping all of them. The way out is the forgiveness
+    file, which the third shape is here to prove works.
 
     Crafted bars and no picks, so the only thing that changes across the day is
     the fault. Neither book trades: a scenario about reconciliation should not
     also be a scenario about the shortlist.
     """
-    owned, ghost = "OWNED", "GHOST"
+    owned, ghost, forgiven = "OWNED", "GHOST", "FORGIVEN"
     watch: dict[str, dict] = {}
 
     def build(scenario: Scenario):
         series = {owned: crafted_bars(day, ramp(day, 100.0, 101.0)),
-                  ghost: crafted_bars(day, flat(120.0))}
+                  ghost: crafted_bars(day, flat(120.0)),
+                  forgiven: crafted_bars(day, flat(80.0))}
         return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
 
     def setup(context: RunContext) -> None:
         seed_book_position(context, "A", owned, 100, 100.0, stop=90.0, target=500.0,
                            opened_on=f"{day:%Y-%m-%d}")
+        # The forgiveness file, in the sandbox rather than the real project, and
+        # naming FORGIVEN at exactly the quantity the 14:35 fault injects. This
+        # is the file the hub's ruling of 2026-09-07 leans on: it is the only
+        # thing that stops a holding no book claims halting every book, which is
+        # why the third shape of this scenario exists at all.
+        (context.sandbox.output / "expected_orphans.json").write_text(
+            json.dumps({forgiven: 7}) + "\n", encoding="utf-8")
 
     def after_tick(context: RunContext, moment: datetime) -> None:
         at = f"{moment:%H:%M}"
-        if at in ("10:25", "10:35", "11:40"):
+        if at in ("10:25", "10:35", "11:40", "14:40"):
             watch[at] = dict(context.halted_books())
 
     def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
@@ -1674,26 +1689,28 @@ def phantom_position(day: date_type) -> Scenario:
             failures.append(f"the account held 100 {ghost} that no book claims and "
                             "reconciliation said everything matched")
 
-        # AN ORPHAN MUST NOT HALT ANYBODY, and that is a decision rather than a
-        # gap. This scenario used to fail unless a book halted for GHOST. The
-        # paper account holds one share of SPY bought by hand on 2026-09-02 and
-        # an untagged order from the same session, and neither will ever belong
-        # to a book, so halting on an orphan means halting all five books on
-        # every tick of every day for the rest of the month over a share nobody
-        # is managing and nobody is at risk from. What the loop does instead is
-        # say so, once per name per day, and write a line every tick.
+        # AN ORPHAN NOBODY EXPECTED HALTS EVERY BOOK. Hub ruling, 2026-09-07,
+        # recorded in journal/2026-09-07.md and docs/BACKLOG.md item 0b. This
+        # scenario asserted the opposite until that ruling. A holding nobody can
+        # account for means either a book has lost its own record or somebody
+        # traded the account by hand, and in both cases every book is sizing its
+        # next order against a picture that is not true. Nobody can be blamed
+        # for an orphan, so nobody can be singled out, which leaves stopping all
+        # of them. The way out is the forgiveness file, which 14:35 proves.
         halted_late = watch.get("11:40", {})
-        if halted_late:
-            failures.append(
-                f"the account held 100 {ghost} that no book claims and "
-                f"{', '.join(sorted(halted_late))} halted for it. An orphan is not "
-                "a book being wrong about what it holds, and halting on one would "
-                "halt every book every day forever over the SPY share left behind "
-                "by the manual test on 2026-09-02.")
+        expected_books = {book.book_id for book in context.books}
+        if set(halted_late) == expected_books:
+            evidence.append(
+                f"every book halted for the unclaimed {ghost} "
+                f"({', '.join(sorted(halted_late))}), which is the ruling of "
+                "2026-09-07: a holding nobody can account for stops all of them")
         else:
-            evidence.append(f"no book was halted for the unclaimed {ghost}, which "
-                            "is the decision: an orphan is told about, not halted "
-                            "on")
+            failures.append(
+                f"the account held 100 {ghost} that no book claims and the books "
+                f"halted for it were {sorted(halted_late) or 'none'} rather than "
+                f"all of {sorted(expected_books)}. An orphan halts every book "
+                "since the hub's ruling of 2026-09-07, because nobody can be "
+                "blamed for it and so nobody can be singled out either.")
 
         titles = [a.title for a in context.alerts.alerts]
         if any(ghost in title for title in titles):
@@ -1713,11 +1730,47 @@ def phantom_position(day: date_type) -> Scenario:
                 f"{titles or 'none'}")
 
         said_once = [t for t in titles if ghost in t]
-        if len(said_once) > 1:
+        if len(said_once) == 1:
+            evidence.append(
+                f"exactly one alert named the unclaimed {ghost}, for the finding "
+                "rather than one per halted book")
+        else:
             failures.append(
                 f"the unclaimed {ghost} was alerted {len(said_once)} times in one "
-                "day. Once per name per day is the rule, because it is the same "
-                "fact at 11:40 and at 15:40.")
+                "day. ONE alert for the finding is the rule, not one per halted "
+                "book and not one per tick: five books stop for it, and it is the "
+                "same fact at 11:40 and at 15:40.")
+
+        # And the way out. FORGIVEN is in the sandbox's
+        # output/expected_orphans.json at exactly the quantity the 14:35 fault
+        # injects, so it halts nobody and nobody is told. Without this the
+        # ruling above would halt this account every morning over the share of
+        # SPY left behind by the manual test on 2026-09-02.
+        forgiven_note = next((t.reconcile_note for t in context.ticks
+                              if t.at == "14:40"), "")
+        halted_forgiven = watch.get("14:40", {})
+        if halted_forgiven:
+            failures.append(
+                f"the account held 7 {forgiven}, which "
+                "output/expected_orphans.json names at exactly that quantity, and "
+                f"{', '.join(sorted(halted_forgiven))} were still halted at 14:40. "
+                "A forgiven orphan halts nobody, and a halt whose reason has gone "
+                f"away has to lift. Reconciliation said {forgiven_note!r}.")
+        else:
+            evidence.append(
+                f"nobody was halted for the forgiven {forgiven}, and the halts "
+                f"from {ghost} lifted once it went away: reconciliation said "
+                f"{forgiven_note!r}")
+
+        if any(forgiven in title for title in titles):
+            failures.append(
+                f"the forgiven {forgiven} raised an alert: "
+                + next(t for t in titles if forgiven in t)
+                + ". Somebody has already looked at a forgiven orphan and written "
+                "it down, so it gets its line in the record and no message.")
+        else:
+            evidence.append(f"nobody was told about the forgiven {forgiven}, "
+                            "because somebody had already looked at it")
 
         evidence.append(
             f"the fake broker reports the phantom as a SECOND ROW for {owned} "
@@ -1730,11 +1783,13 @@ def phantom_position(day: date_type) -> Scenario:
 
     return Scenario(
         key="phantom_position",
-        title="A mismatch halts one book, an orphan halts nobody, and Mo hears both",
+        title="A mismatch halts one book, an orphan halts every book, and a "
+              "forgiven one halts nobody",
         proves="that a quantity mismatch halts only the book it belongs to, that a "
-               "holding no book claims halts nobody at all, and that somebody is "
-               "told about each of them",
-        day=day, symbols=(ghost,), build_broker=build,
+               "holding no book claims halts every book on one alert rather than "
+               "five, that the forgiveness file is what stops it, and that "
+               "somebody is told about each of them",
+        day=day, symbols=(ghost, forgiven), build_broker=build,
         book_patches=only("A", "B"),
         faults=(
             Fault(at="10:30", action="inject", kind="phantom_position",
@@ -1742,6 +1797,9 @@ def phantom_position(day: date_type) -> Scenario:
             Fault(at="11:30", action="clear", kind="phantom_position"),
             Fault(at="11:35", action="inject", kind="phantom_position",
                   options={"symbol": ghost, "quantity": 100, "avg_cost": 120.0}),
+            Fault(at="14:30", action="clear", kind="phantom_position"),
+            Fault(at="14:35", action="inject", kind="phantom_position",
+                  options={"symbol": forgiven, "quantity": 7, "avg_cost": 80.0}),
         ),
         decider=lambda s: StubDecider(max_picks=1, pick_nothing_for=("A", "B")),
         setup=setup, after_tick=after_tick, check=check,

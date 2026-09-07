@@ -747,14 +747,26 @@ class ReconcileOutcome:
     those are two different questions:
 
         ok           is anything about this account unexplained?
-        books_agree  is any BOOK out of step with the broker?
+        books_agree  is it safe for any book to open something?
 
-    The paper account holds one share of SPY nobody bought and a working order
-    with no tag on it, both left over from a manual test on 2026-09-02. Neither
-    belongs to a book and neither ever will, so ok is False every single tick and
-    will stay False. Reading that as "the books are wrong" would mean no
-    reconciliation halt could ever be lifted, and no book could ever be told the
-    disagreement it was halted for has gone away.
+    The gap between them is the untagged working order, id 4, left over from the
+    manual test on 2026-09-02. An order no book sent is not a book being wrong
+    about what it holds and it stops nobody, so it makes ok False on every tick
+    of every day and leaves books_agree alone. Reading ok as "the books are
+    wrong" would mean no reconciliation halt could ever be lifted, because the
+    condition for lifting one would never be true again.
+
+    A POSITION nobody claims is not in that gap any more. Since the hub's ruling
+    of 2026-09-07, recorded in journal/2026-09-07.md and docs/BACKLOG.md item 0b,
+    an orphan nobody wrote down in advance stops every book, so it makes
+    books_agree False too. The unclaimed share of SPY is kept out of that by
+    output/expected_orphans.json, which is why that file is now something that
+    has to be right before the first tick rather than a convenience.
+
+    mismatched_books is the books a Mismatch actually names. It is narrower than
+    books_to_halt, because an orphan halts every book without naming any of them,
+    and it is what tells the reconciliation alert apart from the orphan alert:
+    one finding, one message.
     """
 
     available: bool
@@ -763,26 +775,43 @@ class ReconcileOutcome:
     lines: list = field(default_factory=list)
     orphans: list = field(default_factory=list)
     unclaimed: list = field(default_factory=list)
+    mismatched_books: list = field(default_factory=list)
     note: str = ""
 
     @property
-    def books_agree(self) -> bool:
-        """True when no book is out of step with the broker.
+    def unexpected_orphans(self) -> list:
+        """The positions nobody claims and nobody wrote down in advance."""
+        return [orphan for orphan in self.orphans
+                if not bool(getattr(orphan, "expected", False))]
 
-        An orphan position and an order nobody tagged are both reported and both
-        alerted, and neither of them is a book being wrong about what it holds.
+    @property
+    def books_agree(self) -> bool:
+        """True when nothing stops a book opening something this tick.
+
+        Three ways for it to be False: nobody could ask, a book is out of step
+        with the broker about its own holdings, or a position nobody claims and
+        nobody expected turned up. The last of those halts every book, and the
+        orphan check is repeated here rather than trusted to books_to_halt so
+        that the answer is the same however this record was built.
         """
-        return self.available and not self.books_to_halt
+        return (self.available and not self.books_to_halt
+                and not self.unexpected_orphans)
 
 
 def expected_orphans(root: Path | None = None) -> Any:
     """Positions the books already know nobody will claim.
 
     The paper account holds one share of SPY from the manual test on 2026-09-02
-    and no book owns it. Without a list like this, every single tick would report
-    it and halt all five books. Write output/expected_orphans.json as either
-    ["SPY"], which forgives any quantity, or {"SPY": 1}, which forgives that
-    exact quantity and complains again if it changes.
+    and no book owns it. Since the hub's ruling of 2026-09-07, recorded in
+    journal/2026-09-07.md and docs/BACKLOG.md item 0b, an orphan nobody wrote
+    down halts every book, so without this file every single tick would halt all
+    five over that one share. This file is what has to be right before the first
+    tick of the day, not a convenience.
+
+    Write output/expected_orphans.json as either ["SPY"], which forgives any
+    quantity, or {"SPY": 1}, which forgives that exact quantity and halts again
+    if it changes. A missing or unreadable file forgives nothing, which is the
+    safe way round: it halts rather than trades on a picture nobody checked.
     """
     path = ((root or project_root()) / "output" / "expected_orphans.json")
     if not path.exists():
@@ -860,8 +889,10 @@ def run_reconciliation(broker_positions: list, broker_open_orders: list,
     halt = [str(b) for b in (getattr(report, "books_to_halt", ()) or ())]
     lines = list(getattr(report, "lines", ()) or ())
     found = list(getattr(report, "orphans", ()) or ())
-    unclaimed = [m for m in (getattr(report, "mismatches", ()) or ())
-                 if getattr(m, "book_id", None) is None]
+    mismatches = list(getattr(report, "mismatches", ()) or ())
+    unclaimed = [m for m in mismatches if getattr(m, "book_id", None) is None]
+    mismatched = sorted({str(getattr(m, "book_id", "")) for m in mismatches
+                         if getattr(m, "book_id", None) is not None})
     note = str(getattr(report, "summary", "")) or (
         "everything matched" if ok else "the books and the broker disagree")
     if not ok and not halt and not found and not unclaimed:
@@ -869,9 +900,10 @@ def run_reconciliation(broker_positions: list, broker_open_orders: list,
         # order, so nothing here explains the no and the safe reading is that it
         # is about all of them.
         halt = list(books_state)
+        mismatched = list(books_state)
     return ReconcileOutcome(available=True, ok=ok, books_to_halt=halt,
                             lines=lines, orphans=found, unclaimed=unclaimed,
-                            note=note)
+                            mismatched_books=mismatched, note=note)
 
 
 # ---------------------------------------------------------- the day trade count
@@ -4865,11 +4897,18 @@ def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
     finds one, quiet for half an hour afterwards, because reconciliation runs
     every five minutes and the same disagreement is still there at 09:55.
 
-    Only a BOOK being out of step is shouted about here. This account has held
-    an unclaimed share of SPY since a manual test on 2026-09-02, so the
-    reconciliation's own verdict is "not ok" on every tick of every day and will
-    stay that way. Alerting on that would be nine identical messages a day
-    saying nothing has changed. report_orphans() says that once a day instead.
+    Only a BOOK being out of step is shouted about here. An untagged order at
+    the broker, such as the id 4 left over from the manual test on 2026-09-02,
+    makes the reconciliation's own verdict "not ok" on every tick of every day
+    and will keep doing so. Alerting on that would be nine identical messages a
+    day saying nothing has changed. report_orphans() says that once a day
+    instead.
+
+    A position nobody claims halts every book now, so it does reach this
+    function through books_to_halt. It is deliberately handed straight back to
+    report_orphans() rather than alerted twice: that message has to name the
+    symbol, the quantity and how to forgive it, which is knowledge this function
+    does not have. One finding, one message.
     """
     if not outcome.available:
         raise_alert(
@@ -4879,6 +4918,11 @@ def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
             key="reconcile:unavailable", now=now)
         return
     if outcome.books_agree:
+        return
+    if outcome.unexpected_orphans and not outcome.mismatched_books:
+        # Every book is halted, but for a holding no book claims rather than for
+        # anything a book got wrong about its own numbers. report_orphans()
+        # sends the one alert for that finding.
         return
     lines = "\n".join(f"- {line}" for line in outcome.lines[:6])
     raise_alert(
@@ -4893,33 +4937,52 @@ def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
 
 def report_orphans(outcome: ReconcileOutcome, now: datetime, rules: str,
                    write_ledger: bool) -> int:
-    """Say who is holding what nobody claims. Halt nobody. Returns how many.
+    """Say who is holding what nobody claims. Returns how many were said.
 
-    THE DECISION HERE, because it looks like the loop being lax and it is not.
-    An orphan NEVER halts a book. The paper account holds one share of SPY
-    bought by hand on 2026-09-02 and a working order with no tag on it from the
-    same session. Neither belongs to a book and neither ever will. Halting on an
-    orphan would mean halting all five books on every tick of every day for the
-    rest of the month, over a share nobody is managing and nobody is at risk
-    from, and a safety rule that fires every five minutes forever is not a
-    safety rule, it is noise with a halt attached.
+    THE DECISION HERE. A position no book claims and nobody wrote down in
+    advance halts EVERY book. Hub ruling, 2026-09-07, recorded in
+    journal/2026-09-07.md and docs/BACKLOG.md item 0b. A holding nobody can
+    account for means either a book has lost its own record or somebody traded
+    the account by hand, and in both cases all five books are sizing their next
+    order against a picture of the account that is not true. There is nobody to
+    blame for an orphan, so there is nobody to single out, which leaves stopping
+    all of them. The halt is the ordinary reconciliation halt: each book opens
+    nothing more today and may still close what it holds.
 
-    What it does instead is tell somebody, once per name per day, and write a
-    line into the record every tick so a reader can see it was noticed rather
-    than missed. An orphan named in output/expected_orphans.json gets the line
-    and no alert, because somebody has already looked at that one and said so.
+    reconcile() is what puts the books into books_to_halt. This function does
+    not halt anybody, it writes the record and sends the message: ONE alert per
+    finding, not one per book, naming the symbol, the quantity and how to
+    forgive it, and rate limited to once per name per day by the same key based
+    dedupe every alert in this file goes through. It is once a day and not once
+    every half hour because reconciliation runs every five minutes and it is the
+    same fact at 11:40 as at 15:40.
 
-    An order at the broker with no book tag on it is the same situation in a
-    different shape and is handled the same way.
+    An orphan named in output/expected_orphans.json halts nobody and gets no
+    alert, because somebody has already looked at that one and said so. It still
+    gets its line in the record every tick, so a reader can see it was noticed
+    rather than missed. That file is what keeps the share of SPY bought by hand
+    on 2026-09-02 from halting the account every morning, which is why it is now
+    something that has to be right before the first tick.
+
+    An order at the broker with no book tag on it is NOT the same situation and
+    is deliberately not treated the same way. An order that is only working has
+    changed nothing about what any book holds, so nobody is sizing anything
+    against a wrong picture because of it. It is written down and alerted, and
+    it halts nobody, exactly as before.
     """
     said = 0
     for orphan in outcome.orphans:
         symbol = str(getattr(orphan, "symbol", "") or "").upper()
         expected = bool(getattr(orphan, "expected", False))
+        qty = getattr(orphan, "qty", None)
+        amount = f"{int(qty)}" if isinstance(qty, (int, float)) else "N"
         line = str(getattr(orphan, "line", "")) or f"{symbol} belongs to no book"
         ledger_writer.log_rule(
             now, "orphan_position", f"{symbol}: {line} [rules {rules}]",
-            "written down. No book is halted for a position no book claims.",
+            ("written down. Somebody has already looked at this one, so no book "
+             "is halted for it."
+             if expected else
+             "written down. Every book is halted until somebody looks."),
             dry_run=not write_ledger)
         db_call("record_decision", ts=now, shape="reconcile", rules_commit=rules,
                 symbol=symbol or None, action="orphan position", rationale=line,
@@ -4931,15 +4994,21 @@ def report_orphans(outcome: ReconcileOutcome, now: datetime, rules: str,
             continue
         print(f"  orphan {symbol}: {line}")
         raise_alert(
-            "warn", f"{symbol} at the broker belongs to no book",
-            f"{line}\n\nNo book is halted for it: a position no book claims is "
-            "not a book being wrong about what it holds, and this account has "
-            "held an unclaimed share of SPY since a manual test on 2026-09-02. "
-            "Nothing is managing it, so nothing will close it either.\n\n"
-            "To stop this being said again, look at it and then write it into "
-            f"output/expected_orphans.json as [\"{symbol}\"] to forgive any "
-            f"quantity, or {{\"{symbol}\": N}} to forgive exactly N shares and "
-            "complain again if the number changes.\n"
+            "error", f"{symbol} at the broker belongs to no book, so every book "
+            "is halted",
+            f"{line}\n\nThe broker holds {amount} of {symbol} and no book claims "
+            "it. Every book is halted: each of them opens nothing more today and "
+            "may still close what it holds. That is the hub's ruling of "
+            "2026-09-07, recorded in journal/2026-09-07.md and docs/BACKLOG.md "
+            "item 0b. A holding nobody can account for means either a book has "
+            "lost its own record or somebody traded this account by hand, and in "
+            "both cases every book is sizing its next order against a picture "
+            "that is not true.\n\n"
+            "To forgive it, look at it and then write it into "
+            f"output/expected_orphans.json as {{\"{symbol}\": {amount}}} to "
+            "forgive exactly that many shares and halt again if the number "
+            f"changes, or [\"{symbol}\"] to forgive any quantity. The halt lifts "
+            "on the next tick after that, without anybody overriding it.\n"
             f"Rules {rules}.",
             key=f"orphan:{symbol}", now=now,
             quiet_minutes=ALERT_ONCE_A_DAY_MINUTES)

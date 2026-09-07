@@ -245,21 +245,60 @@ def test_a_clean_reconciliation_says_nothing(sent):
     assert sent == []
 
 
-def test_an_orphan_on_its_own_does_not_make_reconciliation_shout(sent):
-    """This account has held an unclaimed SPY share since 2026-09-02.
+def test_an_untagged_order_on_its_own_does_not_make_reconciliation_shout(sent):
+    """This account has carried the untagged working order id 4 since 2026-09-02.
 
     So the reconciliation's own verdict is "not ok" on every tick of every day
     and will stay that way. Shouting about it would be nine identical messages a
-    day saying nothing has changed. report_orphans() says it once instead.
+    day saying nothing has changed. An order that is only working has changed
+    nothing about what any book holds, so it halts nobody and report_orphans()
+    says it once a day instead.
     """
     outcome = loop.ReconcileOutcome(
         available=True, ok=False, books_to_halt=[],
-        lines=("1 share of SPY at the broker belongs to no book.",),
-        orphans=[object()], note="1 problem, with no book to blame")
+        lines=("Order 4 at the broker carries no book tag.",),
+        unclaimed=[_Unclaimed("4")], note="1 problem, with no book to blame")
     assert outcome.books_agree is True
 
     loop.alert_on_reconciliation(outcome, at(9, 50), "testhash")
     assert sent == []
+
+
+def test_the_reconciliation_alert_leaves_an_orphan_to_report_orphans(sent):
+    """One finding, one message.
+
+    An orphan halts every book now, so it does reach alert_on_reconciliation
+    through books_to_halt. It must not be alerted here as well: the message that
+    matters names the symbol, the quantity and how to forgive it, and that one
+    comes out of report_orphans().
+    """
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=["A", "B", "C", "D", "E"],
+        lines=("40 shares of GHOST at the broker belong to no book.",),
+        orphans=[_Orphan("GHOST")], mismatched_books=[],
+        note="1 problem across books A, B, C, D, E")
+    assert outcome.books_agree is False, "every book is halted for it"
+
+    loop.alert_on_reconciliation(outcome, at(9, 50), "testhash")
+    assert sent == []
+
+
+def test_a_book_mismatch_alongside_an_orphan_is_still_its_own_message(sent):
+    """Two findings, two messages, and the mismatch is not swallowed.
+
+    Book A is out of step about AAPL and there is also a GHOST nobody claims.
+    All five books stop, but book A's own numbers being wrong is a separate
+    thing from the orphan and Mo has to hear about both.
+    """
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=["A", "B", "C", "D", "E"],
+        lines=("Book A believes it holds 100 of AAPL, but the broker reports 120.",),
+        orphans=[_Orphan("GHOST")], mismatched_books=["A"],
+        note="2 problems across books A, B, C, D, E")
+
+    loop.alert_on_reconciliation(outcome, at(9, 50), "testhash")
+    assert len(sent) == 1
+    assert sent[0][1].startswith("The books and the broker disagree")
 
 
 def test_the_three_files_that_stop_the_loop_are_each_alerted(sent, tmp_path):
@@ -280,14 +319,21 @@ def test_nothing_is_said_when_none_of_the_three_files_is_there(sent, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# A position nobody claims: told about once a day, and never halted on
+# A position nobody claims: every book halted, and told about once a day
+#
+# Hub ruling, 2026-09-07, recorded in journal/2026-09-07.md and
+# docs/BACKLOG.md item 0b. reconcile() is what halts the books; these tests are
+# about the message the loop sends, which has to be ONE per finding rather than
+# one per book, has to name the symbol and the quantity, and has to say how to
+# forgive it.
 # ---------------------------------------------------------------------------
 
 
 class _Orphan:
-    def __init__(self, symbol, expected=False):
+    def __init__(self, symbol, expected=False, qty=40):
         self.symbol = symbol
         self.expected = expected
+        self.qty = qty
         self.line = f"{symbol} at the broker belongs to no book."
 
 
@@ -298,26 +344,44 @@ class _Unclaimed:
         self.line = f"Order {order_id} at the broker carries no book tag."
 
 
-def test_an_orphan_is_told_about_once_and_halts_nobody(sent, monkeypatch):
+def test_an_orphan_is_told_about_once_a_day_however_many_books_it_halted(
+        sent, monkeypatch):
+    """Five books halted, one message. Nine ticks later, still one message."""
     monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
     outcome = loop.ReconcileOutcome(
-        available=True, ok=False, books_to_halt=[], orphans=[_Orphan("GHOST")],
-        note="1 problem, with no book to blame")
+        available=True, ok=False, books_to_halt=["A", "B", "C", "D", "E"],
+        orphans=[_Orphan("GHOST")], note="1 problem across books A, B, C, D, E")
 
     assert loop.report_orphans(outcome, at(11, 40), "testhash", False) == 1
-    assert titles(sent) == ["GHOST at the broker belongs to no book"]
-    assert outcome.books_agree is True, "an orphan is not a book being wrong"
+    assert titles(sent) == [
+        "GHOST at the broker belongs to no book, so every book is halted"]
+    assert len(sent) == 1, "one alert for the finding, not one per halted book"
+    assert outcome.books_agree is False, "and every book really is halted"
 
     for hour in (12, 14, 15):
         loop.report_orphans(outcome, at(hour, 40), "testhash", False)
     assert len(sent) == 1, "it is the same fact at 11:40 and at 15:40"
 
 
+def test_two_orphans_are_two_findings_and_two_messages(sent, monkeypatch):
+    """The rate limit is per name, so a second unclaimed symbol is its own alert."""
+    monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
+    outcome = loop.ReconcileOutcome(
+        available=True, ok=False, books_to_halt=["A", "B", "C", "D", "E"],
+        orphans=[_Orphan("GHOST"), _Orphan("PHANTOM")],
+        note="2 problems across books A, B, C, D, E")
+
+    assert loop.report_orphans(outcome, at(11, 40), "testhash", False) == 2
+    assert len(sent) == 2
+    assert any("GHOST" in title for title in titles(sent))
+    assert any("PHANTOM" in title for title in titles(sent))
+
+
 def test_an_orphan_somebody_has_already_looked_at_is_not_alerted(sent, monkeypatch):
     monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
     outcome = loop.ReconcileOutcome(
         available=True, ok=False, books_to_halt=[],
-        orphans=[_Orphan("SPY", expected=True)],
+        orphans=[_Orphan("SPY", expected=True, qty=1)],
         note="1 problem, with no book to blame")
 
     assert loop.report_orphans(outcome, at(9, 40), "testhash", False) == 1
@@ -326,19 +390,54 @@ def test_an_orphan_somebody_has_already_looked_at_is_not_alerted(sent, monkeypat
     assert outcome.books_agree is True, "and it halts nobody either"
 
 
-def test_the_alert_says_how_to_stop_it_being_said_again(sent, monkeypatch):
+def test_the_alert_says_the_quantity_and_how_to_forgive_it(sent, monkeypatch):
     monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
     loop.report_orphans(
-        loop.ReconcileOutcome(available=True, ok=False, orphans=[_Orphan("SPY")]),
+        loop.ReconcileOutcome(available=True, ok=False,
+                              books_to_halt=["A", "B", "C", "D", "E"],
+                              orphans=[_Orphan("SPY", qty=2)]),
         at(9, 40), "testhash", False)
     body = sent[0][2]
+    assert sent[0][0] == "error", "every book stopping is not a warning"
+    assert "The broker holds 2 of SPY" in body, "the quantity is in the message"
     assert "expected_orphans.json" in body
+    assert '{"SPY": 2}' in body, "the exact line to write, ready to copy"
     assert '["SPY"]' in body
-    assert "Nothing is managing it" in body
+    assert "Every book is halted" in body
+    assert "2026-09-07" in body, "the ruling is cited rather than argued"
+    assert "item 0b" in body
     assert "Rules testhash" in body, "the rules hash goes on every alert"
 
 
-def test_an_order_nobody_tagged_is_the_same_situation(sent, monkeypatch):
+def test_a_missing_forgiveness_file_forgives_nothing(tmp_path):
+    """No output/expected_orphans.json means None, and None forgives nothing.
+
+    This is the pairing that makes the ruling safe: the file is read fresh every
+    tick, a missing one hands reconcile() None, and None halts rather than
+    trades on a picture nobody checked.
+    """
+    assert loop.expected_orphans(tmp_path) is None
+
+    (tmp_path / "output").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "output" / "expected_orphans.json").write_text('{"SPY": 1}\n')
+    assert loop.expected_orphans(tmp_path) == {"SPY": 1}
+
+
+def test_an_unreadable_forgiveness_file_forgives_nothing_either(tmp_path):
+    """Half written JSON forgives nothing rather than everything."""
+    (tmp_path / "output").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "output" / "expected_orphans.json").write_text('{"SPY": ')
+    assert loop.expected_orphans(tmp_path) is None
+
+
+def test_an_order_nobody_tagged_still_halts_nobody(sent, monkeypatch):
+    """An untagged ORDER is deliberately not treated like an orphan POSITION.
+
+    An order that is only working has changed nothing about what any book holds,
+    so nobody is sizing anything against a wrong picture because of it. The
+    untagged order id 4 in this account is told about and halts nobody, exactly
+    as it did before the 2026-09-07 ruling on positions.
+    """
     monkeypatch.setattr(loop.ledger_writer, "log_rule", lambda *a, **k: True)
     outcome = loop.ReconcileOutcome(
         available=True, ok=False, books_to_halt=[], unclaimed=[_Unclaimed("4")],
@@ -349,14 +448,22 @@ def test_an_order_nobody_tagged_is_the_same_situation(sent, monkeypatch):
     assert outcome.books_agree is True
 
 
-def test_a_book_that_is_actually_out_of_step_still_holds_the_books_apart():
-    """books_agree is narrower than ok, and this is where the two differ."""
+def test_books_agree_says_no_to_a_mismatch_and_to_an_orphan_and_to_a_blind_tick():
+    """books_agree is what the loop acts on, and these are the three ways it is no.
+
+    Since the 2026-09-07 ruling an orphan is one of them. It is checked from the
+    orphans list rather than only from books_to_halt, so the answer is the same
+    however this record was built.
+    """
     orphan_only = loop.ReconcileOutcome(available=True, ok=False, books_to_halt=[],
                                         orphans=[_Orphan("SPY")])
+    forgiven = loop.ReconcileOutcome(available=True, ok=True, books_to_halt=[],
+                                     orphans=[_Orphan("SPY", expected=True, qty=1)])
     real = loop.ReconcileOutcome(available=True, ok=False, books_to_halt=["A"])
     blind = loop.ReconcileOutcome(available=False, ok=False, books_to_halt=["A"])
 
-    assert orphan_only.books_agree is True
+    assert orphan_only.books_agree is False, "a holding nobody claims stops everybody"
+    assert forgiven.books_agree is True, "somebody has looked at that one"
     assert real.books_agree is False
     assert blind.books_agree is False, "nobody could ask, so nobody may say yes"
 
