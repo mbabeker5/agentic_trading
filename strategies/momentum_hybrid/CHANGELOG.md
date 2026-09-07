@@ -2,6 +2,47 @@
 
 This file records every change to this strategy's numbers: what changed, on what date, and the git commit that carried it. The reason it exists is the ledger. A decision written down in the ledger in October has to be readable against the exact rules it was made under, not against whatever the rules became by December. Without a dated commit beside each set of numbers, a good month and a changed stop loss are impossible to tell apart. The strategy file beside this one is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_hybrid/strategy.yaml` and the spec it implements is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md`.
 
+## The flatten gets out on the tick it cancels the stop, 2026-09-06 (late night)
+
+Not a change to this strategy's numbers. Every number in `strategy.yaml` is
+still exactly as Mo approved it in Momentum v2, and nothing in this entry moved
+one.
+
+Commit: 51da883 (moved from b04298a)
+
+One of the two commits in this batch moves a limit, and it is the reason the
+stamp moves. `main()` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`
+reads the account's working orders once for the whole tick and hands the same
+list to all five books, so the duplicate check could not see a cancel made after
+that read. The 15:45 flatten cancelled the resting stop, correctly and first,
+and then had its own closing order refused, naming the very order it had just
+pulled. **A rule that said no now says yes**, which is the mirror image of the
+last entry's move and just as much what this stamp records. Nothing was ever
+left open, because the position closed on the next look, five minutes later in
+the replay gate and thirty seconds later in production. What it cost was a
+flatten one tick slower than it reads, and on a fast close that is real.
+
+The once a tick read stays exactly as it was, because five books each asking IB
+Gateway the same question in the same second is how a data pacing violation
+happens and the fifth book's call really did time out at 45 seconds. A cancel now
+drops the order it pulled out of the list this tick already holds, from all three
+places that cancel: the flatten, the stop move and the market backstop. The same
+rule had been silently refusing that market backstop every time it fired, which
+is the worse half of it: the backstop exists to get out at market when a
+triggered stop-limit will not fill, and a position sitting behind a stop that
+fired and did not fill is the worst state one of these books can be in.
+
+The other commit in the batch leaves every limit answering as it did:
+
+- `9f7c04b` closes backlog item 14 by writing the decision behind every order
+  row, so a trade can be read back to the model, the cost and the reason that
+  produced it. It changes what is recorded and not what any check answers.
+
+Nothing has traded. All five books are still on `dry_run` and `promoted_on` is
+still empty on every one of them, so this is still housekeeping rather than a
+version.
+
 ## The flatten stops trusting a feed it cannot read, 2026-09-06 (night)
 
 Not a change to this strategy's numbers. Every number in `strategy.yaml` is

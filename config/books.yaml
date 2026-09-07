@@ -46,7 +46,7 @@
 #                  is no argument later about which version of the numbers and
 #                  the guardrails was signed off
 #
-# rules_commit is stamped on books A, B and E as of 2026-09-06: b04298a. It says
+# rules_commit is stamped on books A, B and E as of 2026-09-06: 51da883. It says
 # WHICH RULES THE BOOK RUNS. It is not a promotion: promoted_on is still empty on
 # all five books, every one of them is still on dry_run, and a book cannot be set
 # to tiny or full without both fields filled in. Books C and D keep an empty
@@ -70,16 +70,28 @@
 # data now halts the book. A rule that said yes from 15:45 onwards can now say
 # no, which is exactly what this stamp is for.
 #
-# WHY b04298a AND NOT THE NEWEST HASH. Seven commits since f840f0f touch code or
-# prose and not one of them moves a limit. Before b04298a: 158bc24 corrects the
-# gate's own wording, 41a0c51 wires two database writers and measures how long a
-# tick took, d11323c deletes a constant nothing read, 6fc3fd3 widens the launchd
-# generator's template glob and produces byte-identical plists. After it: 9254702
-# adds a replay scenario and strengthens another, c5c92a2 reverts an uncommitted
-# orphan halt back to the committed behaviour and documents it, 5b57b6f is the
-# backlog and the journal. That is exactly the "plumbing that leaves every limit
-# answering as it did" this rule excludes, so the stamp names the commit where
-# the behaviour stopped changing rather than the latest one.
+# And once more, to 51da883, later the same night. That is backlog item 16, and it
+# changes when an order is allowed rather than what is written down: an order the
+# same tick has already cancelled is no longer counted as one still resting, so
+# the closing order the 15:45 flatten was refused now goes out on the tick that
+# cancels the stop rather than on the next one. The same rule had been silently
+# refusing the market backstop after a triggered stop-limit, which is the worse
+# half of it. A rule that said no now says yes, which is the mirror image of the
+# move above and just as much what this stamp is for.
+#
+# WHY 51da883 AND NOT THE NEWEST HASH. The commits since f840f0f that touch code
+# or prose without moving a limit are not stamped. Before b04298a: 158bc24
+# corrects the gate's own wording, 41a0c51 wires two database writers and measures
+# how long a tick took, d11323c deletes a constant nothing read, 6fc3fd3 widens
+# the launchd generator's template glob and produces byte-identical plists.
+# Between b04298a and 51da883: 9254702 adds a replay scenario and strengthens
+# another, c5c92a2 reverts an uncommitted orphan halt back to the committed
+# behaviour and documents it, 5b57b6f and af75c0c are the backlog and the journal,
+# 8bc394d is the previous stamp move itself, and 9f7c04b closes backlog item 14 by
+# writing the decision behind every order row, which changes what is recorded and
+# not what any check answers. That is exactly the "plumbing that leaves every
+# limit answering as it did" this rule excludes, so the stamp names the commit
+# where the behaviour stopped changing rather than the latest one.
 #
 # The rule from here: BEFORE THE FIRST TRADE, move this stamp whenever a commit
 # changes guardrail behaviour. Not for a typo, a comment or a test, and not for
@@ -206,12 +218,14 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: b04298a          # the git hash of the rules this book runs
+    rules_commit: 51da883          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
       loop and guardrail fixes the replay gate found on the evening of
-      2026-09-06, and then to the flatten refusing to trust a feed it cannot
-      read. Moved 03e5318 to f840f0f to b04298a, all on 2026-09-06.
+      2026-09-06, then to the flatten refusing to trust a feed it cannot read,
+      and then to a cancel this tick has made no longer counting as an order
+      still resting, so the flatten gets out on the tick it cancels the stop.
+      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06.
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -233,12 +247,14 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: b04298a          # the git hash of the rules this book runs
+    rules_commit: 51da883          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
       loop and guardrail fixes the replay gate found on the evening of
-      2026-09-06, and then to the flatten refusing to trust a feed it cannot
-      read. Moved 03e5318 to f840f0f to b04298a, all on 2026-09-06.
+      2026-09-06, then to the flatten refusing to trust a feed it cannot read,
+      and then to a cancel this tick has made no longer counting as an order
+      still resting, so the flatten gets out on the tick it cancels the stop.
+      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06.
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -300,12 +316,14 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: b04298a          # the git hash of the rules this book runs
+    rules_commit: 51da883          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
       loop and guardrail fixes the replay gate found on the evening of
-      2026-09-06, and then to the flatten refusing to trust a feed it cannot
-      read. Moved 03e5318 to f840f0f to b04298a, all on 2026-09-06.
+      2026-09-06, then to the flatten refusing to trust a feed it cannot read,
+      and then to a cancel this tick has made no longer counting as an order
+      still resting, so the flatten gets out on the tick it cancels the stop.
+      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06.
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
