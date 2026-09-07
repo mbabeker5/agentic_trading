@@ -30,9 +30,12 @@ Self test (reads only, places nothing):
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -46,6 +49,11 @@ from paths import agent_dir  # noqa: E402
 
 DEFAULT_URL = "http://127.0.0.1:8765/mcp"
 DEFAULT_TIMEOUT = 45.0
+
+#: How long to wait, after the deadline has passed and the connection has been
+#: shut, for the worker thread to notice and stop. Tidiness only: the thread is
+#: a daemon, so one that never notices cannot hold up the tick or the process.
+ABANDON_GRACE_SECONDS = 0.5
 
 # The version of the MCP spec we ask for. The server answered with this on
 # 2026-09-02, so we are speaking the same dialect it is.
@@ -115,11 +123,51 @@ def _parse_body(raw: str, content_type: str, want_id: int | None) -> dict:
     return messages[-1]
 
 
+class _Attempt:
+    """One HTTP request in flight on a worker thread.
+
+    The worker fills in exactly one of `answer` and `error`, and the calling
+    thread reads them only after it has joined the worker or given up on it, so
+    the two never touch the same field at the same time.
+    """
+
+    def __init__(self) -> None:
+        self.response: Any = None
+        self.answer: tuple[int, str, str] | None = None
+        self.error: BaseException | None = None
+        self.http_detail: str = ""
+
+    def abandon(self) -> None:
+        """Shut the connection of a request we have stopped waiting for.
+
+        Closing matters for the server rather than for us. The MCP server holds
+        the response open while it waits on IB Gateway, so a client that simply
+        walks away leaves it writing into a socket nobody empties, and those
+        pile up one per abandoned tick. Shutting the socket underneath is what
+        tells it to stop. Best effort: if the socket cannot be reached the
+        worker is a daemon thread and dies with the process anyway.
+        """
+        response = self.response
+        if response is None:
+            return
+        raw = getattr(getattr(response, "fp", None), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            response.close()
+
+
 class McpClient:
     """One conversation with the IBKR MCP server.
 
     Create it, call a method, read the answer. It connects lazily on the first
     call, so building one costs nothing.
+
+    THE TIMEOUT IS A WALL CLOCK DEADLINE, not a socket read timeout. See
+    _post_with_deadline below for why the difference cost an hour and a half on
+    the morning of 2026-09-07.
     """
 
     def __init__(self, url: str = DEFAULT_URL, timeout: float = DEFAULT_TIMEOUT,
@@ -130,9 +178,96 @@ class McpClient:
         self._session_id: str | None = None
         self._next_id = 0
         self._ready = False
+        #: When the tool call we are inside of has to be over, as a monotonic
+        #: clock reading. None between calls. It is what makes one call() cost
+        #: at most `timeout` in total rather than `timeout` per round trip: the
+        #: handshake and the tool call share the one budget.
+        self._deadline: float | None = None
         self.server_info: dict = {}
 
     # ---------------------------------------------------------------- plumbing
+
+    def _budget(self) -> float:
+        """Seconds this round trip may take, given the call it is part of."""
+        if self._deadline is None:
+            return self.timeout
+        return max(0.0, self._deadline - time.monotonic())
+
+    def _too_slow(self, method: str) -> McpError:
+        """The one error message for running out of time, wherever we ran out.
+
+        The wording is load bearing. agent/loop.py logs this line as it is, so
+        anyone reading output/tick_YYYY-MM-DD.log at 09:35 sees the same
+        sentence a socket read timeout used to produce.
+        """
+        return McpError(
+            f"the MCP server took longer than {self.timeout:.0f} seconds to answer "
+            f"{method}. IB Gateway is usually the slow part when this happens.")
+
+    def _post(self, request: urllib.request.Request, attempt: _Attempt,
+              budget: float) -> None:
+        """The whole HTTP round trip, on a worker thread. Never raises."""
+        try:
+            response = urllib.request.urlopen(request, timeout=budget)
+            attempt.response = response
+            try:
+                session_id = response.headers.get("Mcp-Session-Id")
+                status = response.status
+                content_type = response.headers.get("Content-Type", "")
+                raw = response.read().decode("utf-8", "replace")
+            finally:
+                with contextlib.suppress(Exception):
+                    response.close()
+            if session_id:
+                self._session_id = session_id
+            attempt.answer = (status, content_type, raw)
+        except urllib.error.HTTPError as exc:
+            # The error body comes down the same socket, so reading it in the
+            # calling thread would be one more unbounded wait after the wait we
+            # have already bounded. Read it here, inside the deadline.
+            with contextlib.suppress(Exception):
+                if exc.fp:
+                    attempt.http_detail = exc.read().decode("utf-8", "replace")[:300]
+            attempt.error = exc
+        except BaseException as exc:                                # noqa: BLE001
+            attempt.error = exc
+
+    def _post_with_deadline(self, request: urllib.request.Request,
+                            method: str) -> _Attempt:
+        """One round trip that either answers or raises inside the budget.
+
+        WHY THIS IS NOT SIMPLY urlopen(timeout=...). That timeout is a socket
+        read timeout: it fires when no byte has arrived for that long. The MCP
+        server keeps the HTTP response open and alive while it waits on IB
+        Gateway, so a Gateway that has lost its upstream connection to IBKR
+        produces a response that is never finished and never silent either.
+
+        Measured on the morning of 2026-09-07: a portfolio() call made with
+        timeout=60 ran for 1,240 seconds, the 07:37 tick did not finish until
+        09:25, and because launchd will not start a second copy of a job that is
+        still running, every one minute pre-open wake up between 09:00 and 09:26
+        was lost. The pre-flight hung 44 minutes on the same reads and the day's
+        recorder hung 18.
+
+        So the waiting is done by joining a worker thread, which is a wall clock
+        wait no server can talk its way out of, and then the connection is shut
+        so the server stops writing into it.
+        """
+        budget = self._budget()
+        if budget <= 0.0:
+            raise self._too_slow(method)
+
+        attempt = _Attempt()
+        worker = threading.Thread(target=self._post,
+                                  args=(request, attempt, budget),
+                                  name=f"mcp-{method}", daemon=True)
+        worker.start()
+        worker.join(budget)
+        if worker.is_alive():
+            attempt.abandon()
+            worker.join(ABANDON_GRACE_SECONDS)
+            raise self._too_slow(method)
+        return attempt
 
     def _rpc(self, method: str, params: dict | None = None,
              notification: bool = False) -> Any:
@@ -166,16 +301,16 @@ class McpClient:
             headers=headers, method="POST",
         )
 
+        # Raises McpError by itself when the deadline passes, which is the same
+        # error the socket timeout below raises, so nothing downstream changes.
+        attempt = self._post_with_deadline(request, method)
+
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                session_id = response.headers.get("Mcp-Session-Id")
-                if session_id:
-                    self._session_id = session_id
-                status = response.status
-                content_type = response.headers.get("Content-Type", "")
-                raw = response.read().decode("utf-8", "replace")
+            if attempt.error is not None:
+                raise attempt.error
+            status, content_type, raw = attempt.answer          # type: ignore[misc]
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300] if exc.fp else ""
+            detail = attempt.http_detail
             if exc.code == 404 and self._session_id:
                 # The server forgot our session. Drop it so the next call
                 # starts a fresh one instead of looping on a dead id.
@@ -190,10 +325,9 @@ class McpClient:
                 f"Is it running? Start it with {agent_dir() / 'start_mcp.sh'}"
             ) from exc
         except socket.timeout as exc:
-            raise McpError(
-                f"the MCP server took longer than {self.timeout:.0f} seconds to answer {method}. "
-                "IB Gateway is usually the slow part when this happens."
-            ) from exc
+            # The socket read timeout, which still fires when the server goes
+            # completely silent. Same sentence as the deadline above on purpose.
+            raise self._too_slow(method) from exc
 
         if notification:
             # 202 with an empty body is the normal, correct answer here.
@@ -246,9 +380,22 @@ class McpClient:
 
         Raises McpError when the tool reports a failure, so a caller cannot
         quietly carry on with a half answer.
+
+        Comes back, one way or the other, within self.timeout seconds of being
+        called. The handshake and the tool call share that one budget, so a
+        first call that has to do the handshake too cannot cost twice as long
+        as a later one.
         """
-        self.initialize()
-        result = self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        outer = self._deadline is None
+        if outer:
+            self._deadline = time.monotonic() + self.timeout
+        try:
+            self.initialize()
+            result = self._rpc("tools/call",
+                               {"name": name, "arguments": arguments or {}})
+        finally:
+            if outer:
+                self._deadline = None
 
         blocks = result.get("content") or []
         texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
