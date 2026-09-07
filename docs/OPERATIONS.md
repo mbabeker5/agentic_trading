@@ -175,6 +175,58 @@ which stops the loop opening anything for the rest of the day, and messages you
 with the names of the checks that failed. It writes the full answer to
 `output/preflight_YYYY-MM-DD.json` either way.
 
+### A read that never returns
+
+Added 2026-09-07, after a morning that showed why every one of these guards
+needs a clock on it.
+
+IB Gateway was running and logged in, but it had lost its own upstream
+connection to IBKR: it logged warning 2110 and then answered no read at all.
+Nothing crashed, nothing said no, everything simply waited. Three things waited
+without any bound:
+
+- the tick that started at 07:37 New York finished at 09:25, because one
+  `portfolio()` call made with a 60 second timeout ran for 1,240 seconds. Since
+  launchd will not start a second copy of a job that is still running, every
+  one-minute pre-open wake-up between 09:00 and 09:26 was lost;
+- the 09:00 pre-flight hung 44 minutes and never wrote a verdict, so
+  `output/NO_TRADE_TODAY` was neither written nor deliberately withheld, and Mo
+  killed it by hand;
+- the day recorder hung 18 minutes on a single `--once` tick.
+
+Four bounds now sit under that, smallest first:
+
+1. **The MCP client.** `agent/mcp_client.py` treats its `timeout` as a wall
+   clock deadline rather than a socket read timeout, because the server keeps
+   the HTTP response alive while it waits on Gateway and a read timeout
+   therefore never fires. Every tool call is back inside 45 seconds with an
+   answer or an `McpError`, and the socket is shut so the server stops writing
+   into it. Details in `docs/MCP_SERVER.md`.
+2. **One tick.** `agent/run_tick.sh` kills `agent/loop.py` if it runs longer
+   than 240 seconds, which is inside the 300 second launchd gap. A killed tick
+   logs one `KILLED:` line into `output/tick_YYYY-MM-DD.log`, writes nothing to
+   the heartbeat, does not enter the fast window and exits 124, so the next
+   launchd wake-up starts fresh. A tick that has stopped making progress is
+   worth nothing; the next one starting on time is worth a great deal.
+3. **The pre-flight.** `agent/preflight.py` gives the whole 09:00 run ten
+   minutes. It looks at the clock between checks and has a SIGALRM underneath
+   for a single check that never comes back. Either way it writes
+   `output/NO_TRADE_TODAY`, saying the broker could not be read in time, sends
+   the usual alert, keeps whatever checks did finish in the report, and exits.
+   The check is called `finished_in_time` in the report and the alert.
+4. **The recorder.** `agent/replay/common.py` hands ib_async a request timeout
+   on connect, because the library's own default is to wait forever, and
+   `agent/replay/record_day.py` caps a whole tick at 240 seconds and writes an
+   overrunning one down as a missed slot.
+
+What you see when it happens: `KILLED:` in the tick log, a pre-flight alert
+naming `finished_in_time`, or `missed` slots in the recording manifest. All
+three usually have the same cause, so check Gateway first. Look for 2110 in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/ibc_logs/`
+and at
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/mcp_logs/mcp_ibkr.log`.
+The usual fix is a fresh Gateway login.
+
 ## What an alert looks like
 
 A real one, as it arrives in Slack:

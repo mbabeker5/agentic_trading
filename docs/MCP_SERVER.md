@@ -36,6 +36,14 @@ Through the server, against the live paper Gateway:
 - A dry-run order returns notes and sends nothing.
 - A real order attempt with trading disabled is refused with `TRADING_DISABLED: live trading is disabled; set IBKR_ENABLE_TRADING=true to enable mutating tools`. Open orders afterwards: none.
 
+## The client's timeout is a deadline, not a read timeout
+
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/mcp_client.py` takes a `timeout`, 45 seconds by default, and it means wall clock: every tool call comes back, with an answer or with an `McpError`, inside that many seconds of being made. The handshake and the tool call share the one budget, so a first call is no slower than a later one.
+
+It has to be a deadline because a socket read timeout does not bite here. The server keeps the HTTP response open and alive while it waits on IB Gateway, so a Gateway that has lost its upstream link to IBKR (warning 2110) produces a response that never finishes and is never silent either. Measured on 2026-09-07: a `portfolio()` call made with `timeout=60` ran for 1,240 seconds, the tick that started at 07:37 New York finished at 09:25, and every one-minute pre-open wake-up in between was lost because launchd will not start a second copy of a running job.
+
+So the round trip is done on a worker thread that is joined with a deadline, and the socket is shut when the deadline passes, which is what stops the server writing into a connection nobody is reading. The error is the same `McpError` and the same sentence the old socket timeout produced, so nothing downstream changed: `the MCP server took longer than 45 seconds to answer tools/call`.
+
 ## Tool argument shapes
 
 Contracts and orders are passed as plain objects with IBKR's own field names, for example:
