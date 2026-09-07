@@ -12,7 +12,10 @@
       ~/Library/LaunchAgents/com.mtalib.agentic-trading.deadman.plist
 
   WHY THIS ONE IS NOT GENERATED LIKE THE OTHER SIX. The six live jobs are written
-  by scripts/gen_launchd.py from config/launchd/templates/*.template, and
+  by scripts/gen_launchd.py from config/launchd/templates/, and
+  this file is skipped there because it is a finished plist and not a template
+  in that folder's own format, whatever its name suggests. gen_launchd.py names
+  it out loud on every run rather than passing over it in silence. Also,
   tests/test_paths.py checks that every generated file matches its template and
   that each job has exactly the number of wake ups it is meant to have. The dead
   man's handle is not switched on yet and has never run against a real account,

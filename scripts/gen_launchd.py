@@ -25,6 +25,11 @@ USE IT
 
     ... says whether the files on disk already match, changes nothing, and
         exits 1 if they do not. This is the one to run after editing a template.
+        It fails three ways, not one: a template whose plist is out of date, a
+        template with no plist at all, and a plist whose template has gone. The
+        middle one is how three jobs stayed missing for a week, and the last one
+        is its mirror, a job that still gets loaded from a definition nobody
+        keeps any more.
 
     python3 .../scripts/gen_launchd.py --install
 
@@ -39,7 +44,9 @@ It runs on any Python 3.9 or newer with nothing installed, on purpose: it has to
 work on a fresh Mac before the project's own virtual environment exists.
 
 THE TEMPLATE FORMAT. One file per job in config/launchd/templates/, named
-<job>.template. Sections are marked with [name] on a line of their own:
+<job>.template or <job>.plist.tmpl. Both endings are read, and the reason there
+are two is written above discover_templates() below. Sections are marked with
+[name] on a line of their own:
 
     [job]
     name = tick
@@ -82,6 +89,17 @@ the Mac thinks, so every one of these jobs also sets TZ so the scripts agree,
 but the WAKE UP TIMES are the Mac's local clock. Move to a Mac set to another
 time zone and either set that Mac to Eastern or shift every time in the
 templates. The generated files say so at the top.
+
+THREE FILES IN THAT FOLDER ARE NOT TEMPLATES AT ALL, whatever their names
+suggest. backup_db.plist.tmpl, deadman.plist.tmpl and sheet_sync.plist.tmpl are
+whole finished plists with {ROOT} written through them, made by hand before this
+script existed. There is no [schedule] in English in any of them for this script
+to expand, so nothing here can render one, and each of the three says inside
+itself that it is held back on purpose along with the three steps to convert it.
+They are found and named out loud on every run that writes or checks anything,
+so that the way they went missing in the first place cannot happen twice.
+--uninstall is the one mode that stays quiet about them, because it is about
+what launchd is running and not about what this folder holds.
 
 This script never loads a job unless you type --install, and it never places an
 order under any circumstances.
@@ -215,6 +233,106 @@ def expand_schedule(rules: list[str]) -> list[dict[str, int]]:
     for rule in rules:
         seen.update(expand_rule(rule))
     return [{"Weekday": w, "Hour": h, "Minute": m} for w, h, m in sorted(seen)]
+
+
+# ------------------------------------------------------------------ finding the templates
+
+#: The two endings a template file may have.
+#:
+#: TWO RATHER THAN ONE ON PURPOSE. Six templates are named <job>.template and
+#: three are named <job>.plist.tmpl. Renaming the three to match would be the
+#: tidier fix, and it would also break anybody's local checkout or notes that
+#: refer to them by name, which several do: the journal, the docs and the files
+#: themselves all name them. So both endings are read and either may be used.
+TEMPLATE_ENDINGS = (".template", ".plist.tmpl")
+
+
+def discover_templates(template_dir: Path) -> list[Path]:
+    """Every template file in the folder, whichever of the two endings it uses.
+
+    Duplicates dropped and sorted, so two runs of this script go through the
+    files in the same order and write the same bytes.
+
+    This globbed "*.template" alone until 2026-09-06, which is how three jobs
+    went missing: backup_db, deadman and sheet_sync are all named *.plist.tmpl,
+    so the generator never looked at them, no plist was ever written, and
+    nothing ran them. Nothing noticed either, because --check went through the
+    list the generator handed it, and a file the generator cannot see is missing
+    from that list too.
+    """
+    found: set[Path] = set()
+    for ending in TEMPLATE_ENDINGS:
+        found.update(template_dir.glob(f"*{ending}"))
+    return sorted(found)
+
+
+def job_name_from_filename(path: Path) -> str:
+    """The job a template file belongs to, worked out from its name alone.
+
+    tick.template is the job "tick", and sheet_sync.plist.tmpl is the job
+    "sheet_sync" and not "sheet_sync.plist". Path.stem gets the second one
+    wrong, because it only takes one ending off the end.
+
+    A template that parses states its own name in [job], and that is the name
+    that counts. This is for the checks, which have to work out which plist
+    belongs to a file that may not parse at all.
+    """
+    name = path.name
+    for ending in TEMPLATE_ENDINGS:
+        if name.endswith(ending):
+            return name[: -len(ending)]
+    return path.stem
+
+
+def is_pre_rendered_plist(path: Path) -> bool:
+    """True for the old hand made kind: a finished plist rather than a template.
+
+    Three files in the templates folder are whole plists with {ROOT} written
+    through them, from before this script existed. They hold no schedule in
+    English to expand, so nothing here can render one, and handing one to
+    parse_template only produces "text before the first section" off its XML
+    declaration on line 1.
+
+    Telling them apart by their first real line rather than by their name is
+    what lets a new job written in this script's own format be read normally
+    whichever of the two endings its file uses.
+    """
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line.startswith("<?xml")
+    return False
+
+
+def pre_rendered_templates(root: Path) -> list[Path]:
+    """The files in the templates folder that this script cannot render."""
+    template_dir = root / "config" / "launchd" / "templates"
+    return [path for path in discover_templates(template_dir)
+            if is_pre_rendered_plist(path)]
+
+
+def report_pre_rendered(root: Path) -> list[Path]:
+    """Name every file nothing was generated from, and hand them back.
+
+    Called by every run that writes or checks. Skipping a file in that folder
+    without saying so is the whole of the original bug, so this is the one thing
+    here that is never quiet.
+    """
+    held_back = pre_rendered_templates(root)
+    if not held_back:
+        return []
+    print("\nfound but NOT generated, and not by accident:")
+    for path in held_back:
+        print(f"  {path}   (job {job_name_from_filename(path)})")
+    print("  Each of these is a finished plist with {ROOT} written through it,\n"
+          "  made by hand before this generator existed, so it carries no\n"
+          "  schedule in English for this script to expand. Every one of the\n"
+          "  three says inside itself why it is held back and the three steps\n"
+          "  that convert it. One of them is the dead man's handle, the only\n"
+          "  job in this project that can place an order, so converting them is\n"
+          "  a decision for a person rather than a rename.")
+    return held_back
 
 
 # ------------------------------------------------------------------ reading a template
@@ -433,13 +551,19 @@ def find_claude() -> str:
 
 
 def generate(root: Path, out_dir: Path, subs: dict[str, str]) -> dict[Path, str]:
-    """Every template rendered, keyed by the file it belongs in."""
+    """Every template rendered, keyed by the file it belongs in.
+
+    The pre-rendered plists are the one thing left out, and report_pre_rendered()
+    names each of them on every run so the gap is never silent.
+    """
     template_dir = root / "config" / "launchd" / "templates"
-    templates = sorted(template_dir.glob("*.template"))
+    templates = discover_templates(template_dir)
     if not templates:
         raise TemplateError(f"no templates found in {template_dir}")
     written: dict[Path, str] = {}
     for path in templates:
+        if is_pre_rendered_plist(path):
+            continue
         job = parse_template(path)
         text = render(job, subs)
         plistlib.loads(text.encode("utf-8"))  # refuse to write anything unreadable
@@ -535,26 +659,74 @@ def main(argv: list[str] | None = None) -> int:
         return do_uninstall(sorted(rendered))
 
     if args.check:
-        differences = 0
-        for path, text in sorted(rendered.items()):
-            if not path.exists():
-                print(f"MISSING  {path}")
-                differences += 1
-            elif path.read_text(encoding="utf-8") != text:
-                print(f"DIFFERS  {path}")
-                differences += 1
+        problems = 0
+        template_dir = root / "config" / "launchd" / "templates"
+
+        # Start from the templates, not from the plists on disk. A template that
+        # nobody ever generated has no plist to compare, so a check that walks
+        # the plists cannot see it, and that is exactly how three missing jobs
+        # went unnoticed. Re-parsing here is safe: generate() above has already
+        # been through the same files, so a template that could not be read has
+        # stopped this run before now with its own message.
+        sources: dict[Path, Path] = {}      # the plist wanted, and its template
+        for path in discover_templates(template_dir):
+            if is_pre_rendered_plist(path):
+                continue
+            name = parse_template(path)["name"]
+            sources[out_dir / f"{args.label_prefix}.{name}.plist"] = path
+
+        for plist in sorted(sources):
+            template = sources[plist]
+            if not plist.exists():
+                print(f"NO PLIST {template}")
+                print(f"         was never generated. It wants {plist}")
+                problems += 1
+            elif plist.read_text(encoding="utf-8") != rendered[plist]:
+                print(f"DIFFERS  {plist}")
+                print(f"         no longer matches {template}")
+                problems += 1
             else:
-                print(f"same     {path}")
-        if differences:
-            print(f"\n{differences} file(s) out of date. Run this script without "
-                  "--check to rewrite them.")
-        return 1 if differences else 0
+                print(f"same     {plist}")
+
+        # The mirror image of a missing plist: a plist whose template has gone.
+        # It is worse than untidy, because --install still copies it and launchd
+        # still runs it, so a job goes on firing from a definition nobody keeps.
+        # Only this run's own label prefix is looked at, so generating under a
+        # different prefix does not condemn the real files sitting beside it.
+        # The three held-back files count as templates here even though nothing
+        # renders them. Each one tells you to render it by hand with sed, and
+        # config/launchd/ is where it says to put the result, so a hand made
+        # deadman plist has a template behind it and is not an orphan. Without
+        # this, --check would tell you to delete the dead man's handle three
+        # lines above naming the file that made it.
+        wanted = {plist.name for plist in sources} | {
+            f"{args.label_prefix}.{job_name_from_filename(path)}.plist"
+            for path in pre_rendered_templates(root)}
+        if out_dir.is_dir():
+            for plist in sorted(out_dir.glob(f"{args.label_prefix}.*.plist")):
+                if plist.name not in wanted:
+                    print(f"ORPHAN   {plist}")
+                    print(f"         nothing in {template_dir} makes this file "
+                          "any more")
+                    problems += 1
+
+        report_pre_rendered(root)
+
+        if problems:
+            print(f"\n{problems} problem(s) above. A plist that is missing or "
+                  "out of date is fixed by\nrunning this script without --check. "
+                  "An orphan has to be deleted by hand,\non purpose, because a "
+                  "loaded job's file is not something this script\nshould remove "
+                  "behind your back.")
+        return 1 if problems else 0
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for path, text in sorted(rendered.items()):
         path.write_text(text, encoding="utf-8")
         count = text.count("<key>Weekday</key>")
         print(f"wrote {path}  ({count} wake ups a week)")
+
+    report_pre_rendered(root)
 
     print(f"\nroot:        {root}")
     print(f"venv python: {venv_python}")

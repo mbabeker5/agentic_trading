@@ -12,7 +12,10 @@
       ~/Library/LaunchAgents/com.mtalib.agentic-trading.sheet_sync.plist
 
   WHY THIS ONE IS NOT GENERATED LIKE THE SIX LIVE JOBS. Those are written by
-  scripts/gen_launchd.py from config/launchd/templates/*.template, and
+  scripts/gen_launchd.py from config/launchd/templates/, and
+  this file is skipped there because it is a finished plist and not a template
+  in that folder's own format, whatever its name suggests. gen_launchd.py names
+  it out loud on every run rather than passing over it in silence. Also,
   tests/test_paths.py checks that every generated plist matches its template and
   that each job wakes up exactly the number of times it is meant to. This job
   has never run against the real sheet, so it is deliberately kept out of that

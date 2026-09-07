@@ -16,8 +16,9 @@ So these tests check four things:
 2. No Python file that this work owns has that path in its code. Comments and
    docstrings are stripped out before the check, because there it is welcome.
 3. Every shell script works out the project folder the same way.
-4. scripts/gen_launchd.py writes plists that actually parse, with the right
-   number of wake ups in each.
+4. scripts/gen_launchd.py finds every template in the folder, whichever of
+   the two endings it uses, and writes plists that actually parse with the
+   right number of wake ups in each.
 
 Run them with:
 
@@ -29,6 +30,7 @@ import ast
 import importlib.util
 import io
 import plistlib
+import shutil
 import subprocess
 import sys
 import tokenize
@@ -38,6 +40,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 AGENT = REPO / "agent"
+TEMPLATE_DIR = REPO / "config" / "launchd" / "templates"
 
 if str(AGENT) not in sys.path:
     sys.path.insert(0, str(AGENT))
@@ -459,3 +462,223 @@ def test_a_double_hyphen_in_a_comment_is_refused(tmp_path):
     subs = generator.substitutions(REPO, REPO, Path.home(), "com.example", "claude")
     with pytest.raises(generator.TemplateError):
         generator.render(job, subs)
+
+
+# --------------------------------------------- 5. finding every template there is
+
+def temp_project(tmp_path):
+    """A throwaway copy of the templates folder, with its own output folder.
+
+    These tests delete plists and add templates on purpose. Doing that inside
+    the repo would fight whatever else is running, and would leave the real
+    config/launchd/ in a state the next person did not ask for.
+    """
+    root = tmp_path / "project"
+    templates = root / "config" / "launchd" / "templates"
+    templates.mkdir(parents=True)
+    for path in TEMPLATE_DIR.iterdir():
+        if path.is_file():
+            shutil.copy2(path, templates / path.name)
+    return root
+
+
+def run_generator(root, *flags):
+    """The generator run the way a person runs it, so the exit code is real."""
+    return subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "gen_launchd.py"),
+         "--root", str(root), *flags],
+        capture_output=True, text=True, check=False, cwd=str(REPO))
+
+
+def test_the_generator_reads_both_template_endings():
+    """Six templates end .template and three end .plist.tmpl.
+
+    It globbed the first ending alone until 2026-09-06, so the other three were
+    never read and no plist was ever written for any of them. Both endings are
+    accepted rather than the three being renamed, because their names are
+    written down in the journal and inside the files themselves, and a rename
+    would break anybody's notes that point at them.
+    """
+    generator = load_generator()
+    names = [path.name for path in generator.discover_templates(TEMPLATE_DIR)]
+    assert "tick.template" in names
+    assert "backup_db.plist.tmpl" in names
+    assert "deadman.plist.tmpl" in names
+    assert "sheet_sync.plist.tmpl" in names
+    # Sorted with no repeats, so two runs go through the files in one order.
+    assert names == sorted(set(names))
+
+
+def test_a_plist_tmpl_file_is_not_a_job_called_plist():
+    """Path.stem takes one ending off, which is one too few here.
+
+    It would make sheet_sync.plist.tmpl the job "sheet_sync.plist", and the
+    plist would be written to a filename with .plist in the middle of it.
+    """
+    generator = load_generator()
+    job_name = generator.job_name_from_filename
+    assert job_name(Path("sheet_sync.plist.tmpl")) == "sheet_sync"
+    assert job_name(Path("deadman.plist.tmpl")) == "deadman"
+    assert job_name(Path("backup_db.plist.tmpl")) == "backup_db"
+    assert job_name(Path("tick.template")) == "tick"
+
+
+def test_every_template_the_generator_can_read_has_a_plist_on_disk():
+    """A template the generator CAN read and never generated from.
+
+    Every other test in this section starts from the generator's own list of
+    files, and a template the generator cannot see is missing from that list
+    too, so all of them passed while three jobs quietly had no plist at all.
+    This one starts from the folder instead.
+
+    IT WOULD NOT HAVE CAUGHT THE ORIGINAL BUG, and saying so matters more than
+    the reassurance of pretending otherwise. It skips the pre-rendered files,
+    and all three of the jobs that are actually missing are pre-rendered, so it
+    passes today with backup_db, deadman and sheet_sync still absent. What it
+    guards is the next one: a real template added to that folder and never
+    generated from. The synthetic version of that is
+    test_check_fails_when_a_template_has_no_plist below, which invents its own
+    template so it can prove the check fires.
+    """
+    generator = load_generator()
+    prefix = generator.DEFAULT_LABEL_PREFIX
+    out_dir = REPO / "config" / "launchd"
+    missing = []
+    for path in generator.discover_templates(TEMPLATE_DIR):
+        if generator.is_pre_rendered_plist(path):
+            continue
+        job = generator.job_name_from_filename(path)
+        if not (out_dir / f"{prefix}.{job}.plist").exists():
+            missing.append(path.name)
+    assert missing == [], (
+        "no plist was ever generated from " + ", ".join(missing)
+        + ", so nothing runs it. Run: python3 scripts/gen_launchd.py")
+
+
+def test_the_hand_made_plists_are_named_out_loud():
+    """The real lesson of the bug is that a silent file is the dangerous one.
+
+    backup_db, deadman and sheet_sync are finished plists rather than templates
+    in the generator's format, so nothing is generated from them, and that stays
+    true until somebody converts them on purpose. What must never happen again
+    is that being silent, so the generator names every one of them on every run
+    and this checks that it does.
+    """
+    generator = load_generator()
+    held_back = generator.pre_rendered_templates(REPO)
+    result = run_generator(REPO, "--check")
+    for path in held_back:
+        assert path.name in result.stdout, (
+            f"{path.name} sits in the templates folder, nothing generates it, "
+            "and the generator said nothing about it")
+
+
+def test_check_fails_when_a_plist_is_deleted(tmp_path):
+    """A job whose file has gone would silently stop being installed."""
+    root = temp_project(tmp_path)
+    assert run_generator(root).returncode == 0
+    assert run_generator(root, "--check").returncode == 0
+
+    (root / "config" / "launchd"
+     / "com.mtalib.agentic-trading.weekly.plist").unlink()
+    result = run_generator(root, "--check")
+    assert result.returncode != 0, result.stdout
+    assert "weekly.template" in result.stdout
+
+
+def test_check_fails_when_a_template_has_no_plist(tmp_path):
+    """A template nobody generated was invisible to --check until now.
+
+    The new template is given the .plist.tmpl ending on purpose, because that is
+    the ending the generator used to be blind to, so this is both halves of the
+    bug in one test.
+    """
+    root = temp_project(tmp_path)
+    assert run_generator(root).returncode == 0
+
+    (root / "config" / "launchd" / "templates" / "brand_new.plist.tmpl").write_text(
+        "[job]\nname = brand_new\n\n[program]\n/bin/echo\n\n"
+        "[schedule]\nat 12:00 on friday\n", encoding="utf-8")
+    result = run_generator(root, "--check")
+    assert result.returncode != 0, result.stdout
+    assert "brand_new.plist.tmpl" in result.stdout
+    # The job is brand_new, so the file it wants has .plist once and at the end.
+    assert "com.mtalib.agentic-trading.brand_new.plist" in result.stdout
+
+
+def test_check_fails_when_a_plist_has_no_template(tmp_path):
+    """The mirror image, and no safer: --install still loads a stale job."""
+    root = temp_project(tmp_path)
+    assert run_generator(root).returncode == 0
+
+    (root / "config" / "launchd" / "templates" / "weekly.template").unlink()
+    result = run_generator(root, "--check")
+    assert result.returncode != 0, result.stdout
+    assert "ORPHAN" in result.stdout
+    assert "com.mtalib.agentic-trading.weekly.plist" in result.stdout
+
+
+def test_a_hand_rendered_plist_is_not_condemned_as_an_orphan(tmp_path):
+    """The dead man's handle, rendered the way its own header tells you to.
+
+    Each of the three held-back files says to render it with sed into
+    config/launchd/. Nothing generates it, so the orphan check has to count
+    those three as templates anyway, otherwise --check tells you to delete the
+    dead man's handle three lines above naming the file that made it.
+    """
+    root = temp_project(tmp_path)
+    assert run_generator(root).returncode == 0
+
+    source = (root / "config" / "launchd" / "templates" / "deadman.plist.tmpl")
+    target = (root / "config" / "launchd"
+              / "com.mtalib.agentic-trading.deadman.plist")
+    target.write_text(source.read_text(encoding="utf-8").replace("{ROOT}", str(root)),
+                      encoding="utf-8")
+
+    result = run_generator(root, "--check")
+    assert result.returncode == 0, result.stdout
+    assert "ORPHAN" not in result.stdout
+    assert "deadman.plist.tmpl" in result.stdout, "it is still named out loud"
+
+
+def test_the_plists_on_disk_all_parse_and_carry_a_label():
+    """Read the real files, not the rendered text, and read them strictly.
+
+    plistlib refuses things `plutil -lint` waves through, and plistlib is the
+    one that matters, because launchd is no more forgiving than it is.
+    """
+    plists = sorted((REPO / "config" / "launchd")
+                    .glob("com.mtalib.agentic-trading.*.plist"))
+    assert len(plists) == len(EXPECTED_WAKE_UPS)
+    for path in plists:
+        loaded = plistlib.loads(path.read_bytes())
+        job = path.stem.rsplit(".", 1)[1]
+        assert loaded["Label"] == f"com.mtalib.agentic-trading.{job}"
+        assert loaded["StartCalendarInterval"], f"{path.name} has no schedule"
+
+
+def test_the_tick_job_keeps_its_pre_open_minutes_and_its_five_minute_grid():
+    """A guard on the job that matters most, in case the generator changes.
+
+    Widening the template glob has no business touching the tick job, so this
+    says out loud what that job's day looks like: 27 one minute wake ups from
+    09:00 to 09:26, then the five minute grid on to 16:05.
+    """
+    loaded = plistlib.loads(
+        (REPO / "config" / "launchd"
+         / "com.mtalib.agentic-trading.tick.plist").read_bytes())
+    monday = {(entry["Hour"], entry["Minute"])
+              for entry in loaded["StartCalendarInterval"]
+              if entry["Weekday"] == 1}
+
+    pre_open = {(9, minute) for minute in range(0, 27)}
+    assert pre_open <= monday, (
+        "the pre-open minutes are gone: "
+        + ", ".join(sorted(f"09:{m:02d}" for _, m in pre_open - monday)))
+
+    # 09:30 to 16:05. The grid starts at 09:25, which the pre-open half hour
+    # already carries, and expand_schedule() writes it once.
+    grid = {(t // 60, t % 60) for t in range(9 * 60 + 30, 16 * 60 + 6, 5)}
+    assert grid <= monday, (
+        "the five minute grid is gone: "
+        + ", ".join(sorted(f"{h:02d}:{m:02d}" for h, m in grid - monday)))

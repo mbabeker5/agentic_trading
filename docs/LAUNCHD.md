@@ -37,6 +37,14 @@ The templates are here, one per job:
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/
 ```
 
+Two file endings are read, `<job>.template` and `<job>.plist.tmpl`, and a new
+job may use either. The generator globbed the first ending alone until
+2026-09-06, which is how three jobs came to have no plist at all: they are named
+`*.plist.tmpl`, so it never looked at them. Both are accepted now rather than
+the three files being renamed, because their names are written down in the
+journal and inside the files themselves, and a rename would break anybody's
+notes that point at them.
+
 The generator is here:
 
 ```
@@ -44,7 +52,7 @@ The generator is here:
 ```
 
 Why it exists: a job that fires every five minutes needs one entry per wake up,
-written out in full. The tick job has 420 of them and the watchdog has 533.
+written out in full. The tick job has 550 of them and the watchdog has 533.
 Nobody keeps that correct by hand, and every one of those entries used to have
 this Mac's own home folder written into it, which is the thing that stopped the
 project moving to another machine. Now the schedule is written once, in English,
@@ -72,6 +80,21 @@ With no flags it rewrites every plist in `config/launchd/` and loads nothing.
 nothing, and exits non-zero if they do not. That is the one to run after editing
 a template, and a test runs it too, so a template edit that was never generated
 fails the suite.
+
+`--check` fails three ways, and the words it prints say which:
+
+| Word | What it means | What to do |
+|---|---|---|
+| `DIFFERS` | the plist no longer matches its template | run the script again with no flags |
+| `NO PLIST` | a template nobody ever generated, so there is no plist to compare | run the script again with no flags |
+| `ORPHAN` | a plist in `config/launchd/` whose template has gone | delete the plist by hand |
+
+`NO PLIST` is the one that matters, because a check that walked the plists
+instead of the templates could not see it, and that is exactly how three jobs
+stayed missing. `ORPHAN` has to be a manual deletion on purpose: a loaded job's
+file is not something this script should remove behind your back. The three
+held-back files below count as templates for the orphan check, so a plist you
+rendered from one of them by hand is not condemned.
 
 `--install` copies the plists to `~/Library/LaunchAgents` and asks launchd to
 load them. **That starts the jobs running.** It is the only thing in the file
@@ -278,15 +301,19 @@ after the close.
 
 ---
 
-# All six jobs
+# The nine job definitions, and the six that generate
 
-There are six job definitions in the repo. **None of them is loaded.** They sit
-there waiting for you to decide, and `scripts/gen_launchd.py --install` is the
-one command that starts them.
+`config/launchd/templates/` holds nine job definitions. Six of them are turned
+into plists by the generator and three are not, and the difference is the format
+each file is written in rather than anything about the job. **None of the nine is
+loaded.** They sit there waiting for you to decide, and
+`scripts/gen_launchd.py --install` is the one command that starts the six.
+
+## The six that generate
 
 | Job | When | What runs | Wake ups a week |
 |---|---|---|---|
-| `tick` | every 5 min 09:25 to 16:05, plus 07:00, 07:30 and 16:30, weekdays | `agent/run_tick.sh` | 420 |
+| `tick` | every 5 min 09:25 to 16:05, plus every minute 09:00 to 09:26 and 07:00, 07:30, 16:30, weekdays | `agent/run_tick.sh` | 550 |
 | `watchdog` | every 5 min in market hours, hourly the rest of the time including weekends | `agent/watchdog.py --once` | 533 |
 | `preflight` | 09:00 weekdays | `agent/preflight.py` | 5 |
 | `recorder` | every 5 min 09:25 to 16:05 weekdays | `agent/replay/record_day.py --once` | 405 |
@@ -299,6 +326,62 @@ column, which is what every `launchctl` command below wants.
 Only the tick job can trade, and only once a book in `config/books.yaml` is
 taken out of dry run by hand. The other five read, write files and send
 messages.
+
+## The three that do not generate, and what they are for
+
+| Job | When it would run | What it does, in one line |
+|---|---|---|
+| `sheet_sync` | 16:35 weekdays | rewrites the Google Sheet ledger from the database half an hour after the close, so the sheet is a picture of the database rather than a second record of its own |
+| `backup_db` | 17:00 every day | copies `data/trading.sqlite` to `data/backups/trading_YYYY-MM-DD.sqlite` with SQLite's own online backup, and deletes copies over thirty days old |
+| `deadman` | every 5 min 09:30 to 16:00 weekdays | the dead man's handle: if the loop has gone quiet for more than fifteen minutes while the market is open and a book still holds a position or has an order working, it messages you and pulls the kill switch |
+
+Their files are:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/sheet_sync.plist.tmpl
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/backup_db.plist.tmpl
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/deadman.plist.tmpl
+```
+
+**Why they still do not generate.** The generator finds all three now, and names
+all three on every run, but it cannot render any of them. They are not templates
+in its format at all: each one is a whole finished plist with `{ROOT}` written
+through it, made by hand before the generator existed, with its schedule already
+spelled out entry by entry and no line of English for the generator to expand.
+`deadman.plist.tmpl` is 2,079 lines and carries its 395 wake ups one at a time.
+Handing one to the generator produces `line 1: text before the first section`,
+off the XML declaration at the top.
+
+Each of the three also says, inside itself, that it is held back on purpose,
+because none of the three has ever run on a schedule and putting an unwatched
+job in the same list as the ready ones was thought worse than leaving it out.
+
+**What converting one takes.** Each file carries its own three steps at the top,
+and they are the same three every time. Write
+`config/launchd/templates/<job>.template` in the generator's format, taking the
+program, the environment and the comment straight from the existing file and
+writing the schedule as the one English line the file names:
+
+| Job | The schedule line to write | Wake ups to expect |
+|---|---|---|
+| `sheet_sync` | `at 16:35 on weekdays` | 5 |
+| `backup_db` | `at 17:00 on everyday` | 7 |
+| `deadman` | `every 5 minutes from 09:30 to 16:00 on weekdays` | 395 |
+
+Then add that count to `EXPECTED_WAKE_UPS` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_paths.py`,
+run the generator, and load it when you mean to.
+
+**`deadman` is the one to think hardest about, and the one that is missing most.**
+Every tick writes `output/heartbeat`, and the dead man's handle is the only thing
+that reads it on a schedule, so while this job does not exist that heartbeat has
+no reader and a loop that dies holding a position stays dead and holding it. It
+is also the only job in this project that can place an order: the orders it can
+cause are closing orders from `agent/kill_switch.py` and only on an account
+whose id starts with `DU`, but that is still the reason converting it is a
+decision rather than a rename. Take `--really` out of its `ProgramArguments` and
+it decides and logs and sends nothing, which is the way to watch it for a week
+first.
 
 ## The recorder
 
