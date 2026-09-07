@@ -111,10 +111,16 @@ SENATE_SEARCH = SENATE_BASE + "/search/"
 SENATE_DATA = SENATE_BASE + "/search/report/data/"
 SENATE_PTR_REPORT_TYPE = "[11]"  # the site's own code for a Periodic Transaction Report
 
-# A volunteer rebuild of the old House Stock Watcher feed, refreshed daily from
-# the same Clerk filings this script reads directly. Only used when the official
-# sources are unreachable. See the notes on fetch_mirror for why it is not
-# trusted further than that.
+# An independent GitHub feed, refreshed daily by its own scraper from the same
+# Clerk filings this script reads directly. Only used when the official sources
+# are unreachable. See the notes on fetch_mirror for why it is not trusted
+# further than that.
+#
+# NOT a mirror or a rebuild of the old House Stock Watcher feed, whatever the
+# name of this constant suggests. It shares a repository name with it and
+# nothing else: its own scraper reads disclosures-clerk.house.gov directly. The
+# constant keeps the old name because renaming it would touch code that has
+# nothing to do with the correction. Checked 2026-09-06.
 MIRROR_URL = (
     "https://raw.githubusercontent.com/TattooedHead/house-stock-watcher-data/"
     "main/data/all_transactions.json"
@@ -1334,11 +1340,17 @@ def parse_senate_ptr(html: str, filing: dict[str, Any]) -> tuple[list[Purchase],
 def fetch_mirror(
     session: requests.Session, since: date, cache_dir: Path, report: dict[str, Any]
 ) -> list[Purchase]:
-    """Last resort: a volunteer rebuild of the old House Stock Watcher feed.
+    """Last resort: an independent GitHub feed that scrapes the House Clerk.
 
-    This is one JSON file on GitHub, rebuilt daily from the same House Clerk
-    filings this script normally reads itself. It covers the House only, so the
-    Senate is simply missing when this path runs.
+    This is one JSON file on GitHub, rebuilt daily by its own scraper from the
+    same House Clerk filings this script normally reads itself. It covers the
+    House only, so the Senate is simply missing when this path runs.
+
+    It is not a mirror or a rebuild of the old House Stock Watcher feed. It
+    shares a repository name with it and nothing else, which this docstring got
+    wrong until 2026-09-06. The practical consequence is the useful part: there
+    is no third party dataset in this book's chain at all, so no third party
+    data licence applies on any path, official or degraded.
 
     It is a fallback and not a primary source, for a measured reason. Checked on
     2026-09-06 against 17 filings both it and this script had parsed, they agreed

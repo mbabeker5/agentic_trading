@@ -64,10 +64,20 @@ both and uses whatever answers.
 
 **Fallback: an independent GitHub feed that scrapes the House Clerk itself.** Capitol Trades was meant to
 be the fallback, but it cannot be reached at all, so writing code against it
-would mean shipping something untestable. Instead the fallback is a volunteer
-rebuild of the old House Stock Watcher feed: one JSON file on GitHub, refreshed
-daily from the same Clerk filings this script reads directly. It has been tested,
-it works, and the sweep runs off it when both official sources fail.
+would mean shipping something untestable. Instead the fallback is one JSON file
+on GitHub, refreshed daily by its own scraper from the same Clerk filings this
+script reads directly. It has been tested, it works, and the sweep runs off it
+when both official sources fail.
+
+It shares a repository name with the old House Stock Watcher feed and nothing
+else, and calling it a rebuild or a mirror of that feed, which this document did
+until 2026-09-06, was wrong in a way that mattered. Its scraper reads
+`disclosures-clerk.house.gov` directly. So every byte of trade data in this
+book, primary and fallback alike, comes from the same two government systems,
+there is no third party dataset anywhere in the chain, and no third party data
+licence applies to any of it. What does apply is the statutory restriction on
+the filings themselves, 5 U.S.C. 13107(c), and that is a question for Mo rather
+than for this document.
 
 It is a safety net and nothing more, for reasons that were measured rather than
 assumed. See the next section.
