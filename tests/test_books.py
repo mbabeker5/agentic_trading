@@ -1673,16 +1673,22 @@ def one_ticker_one_book(guard):
     )
 
 
-def test_the_default_in_the_settings_file_lets_books_share_a_ticker():
-    """The hub retired one ticker one book on 2026-09-06 and Mo confirmed it.
+def test_the_settings_file_says_one_ticker_one_book_and_nobody_has_overruled_it():
+    """This line is Mo's to set and it has not been set yet.
 
-    Left out of a settings file the key comes back FALSE, so a book that says
-    nothing about it shares happily. The old behaviour is one line away and is
-    tested right below.
+    journal/2026-09-06.md records the hub retiring one ticker one book and says,
+    in as many words: "Mo can overturn this. It was decided by the hub, not by
+    him." A commit later moved the default to false on the grounds that he had
+    confirmed it the same day, and nothing in the journal or in the settings
+    says he did. So it is the careful answer until he says otherwise.
+
+    Left out of a settings file the key comes back TRUE, so a book that says
+    nothing about it gets the exclusive rule rather than the loose one. The
+    other branch is one line away and is tested right below.
     """
     for book_id in ("A", "B", "C", "D", "E"):
         guard = load_book_guardrails(BOOKS_YAML, book_id)
-        assert guard.universe.symbol_exclusive is False, book_id
+        assert guard.universe.symbol_exclusive is True, book_id
 
 
 def test_an_entry_in_a_name_another_book_holds_is_refused_with_the_switch_on():

@@ -435,14 +435,21 @@ class UniverseConfig:
     counter or listed abroad, and anything halted right now. The scanner applies
     them; they are written here so a book's whole universe reads in one place.
 
-    symbol_exclusive is the one ticker, one book rule, and it is DECIDED. The
-    hub retired it on 2026-09-06 and Mo confirmed the decision the same day, so
-    the default is now false: two books may hold the same ticker, and the rule
-    reports which other book is in a name rather than refusing the entry. It is
-    still a switch, because that is what makes overturning it one line rather
-    than a rewrite, and both branches are still tested. See
-    _check_symbol_exclusivity below for the argument on each side and for what
-    replaced the refusal.
+    symbol_exclusive is the one ticker, one book rule. It is a SWITCH and the
+    line it points at is Mo's to set, not the code's.
+
+    THE DEFAULT IS TRUE AND THERE IS A DISAGREEMENT BEHIND IT, so it is written
+    down rather than left in a commit message. journal/2026-09-06.md records the
+    hub retiring the rule and says, in as many words, "Mo can overturn this. It
+    was decided by the hub, not by him." A later commit moved the default to
+    false saying Mo had confirmed it the same day. Nothing in the journal or the
+    settings says he did. So the default is back to the careful answer, one
+    ticker to one book, and the loose one is one line away.
+
+    Both branches are real and both are tested, which is the whole point of a
+    switch: whichever Mo wants costs one line in config/guardrails.yaml and
+    nothing else. See _check_symbol_exclusivity below for the argument on each
+    side and for what carries the load either way.
     """
 
     price_floor: float
@@ -468,7 +475,7 @@ class UniverseConfig:
     exclude_preferred: bool = True
     require_us_primary_listing: bool = True
     exclude_halted: bool = True
-    symbol_exclusive: bool = False
+    symbol_exclusive: bool = True
 
 
 @dataclass(frozen=True)
@@ -1552,7 +1559,7 @@ def _build_universe(raw: dict, where: str) -> UniverseConfig:
         # standing instruction and because a settings file written before this
         # switch existed should get the careful answer rather than the loose one.
         symbol_exclusive=_optional_bool(
-            raw, "universe.symbol_exclusive", where, default=False
+            raw, "universe.symbol_exclusive", where, default=True
         ),
     )
 
@@ -2981,28 +2988,33 @@ def _check_symbol_exclusivity(
 ) -> None:
     """One ticker, one book, or not. universe.symbol_exclusive decides.
 
-    DECIDED, AND OFF. Two people disagreed about this in writing on the same
-    day, both with a real argument. The hub retired the rule on 2026-09-06 and
-    Mo confirmed it, so the default is false and two books may share a ticker.
-    It stays a switch because that is what makes overturning it one line.
+    NOT DECIDED, AND THE DISAGREEMENT IS WRITTEN DOWN HERE RATHER THAN LEFT IN A
+    COMMIT MESSAGE. The review team called cross-book exclusivity a blocking
+    finding on the morning of 2026-09-06 and the hub overturned it the same
+    evening. journal/2026-09-06.md records that overturn and says, in as many
+    words: "Mo can overturn this. It was decided by the hub, not by him." A
+    later commit moved the default to false on the grounds that Mo had confirmed
+    it the same day, and nothing in the journal or in the settings says he did.
+    So the default is the careful answer and the loose one is one line away.
 
-        universe.symbol_exclusive: false   THE DEFAULT, and what
+        universe.symbol_exclusive: true    THE DEFAULT, and what
                                            config/guardrails.yaml says today.
-                                           Two books may be in the same name at
-                                           once. The rule writes a note saying
-                                           which other book is there and refuses
-                                           nothing.
-        universe.symbol_exclusive: true    the old rule. No two books may be in
-                                           the same name at once, and the second
-                                           book's entry is REFUSED. Set it to
-                                           true and the old behaviour is back.
+                                           No two books may be in the same name
+                                           at once, and the second book's entry
+                                           is REFUSED. The name stays with
+                                           whichever book comes first in
+                                           config/books.yaml.
+        universe.symbol_exclusive: false   two books may share a name. The rule
+                                           writes a note saying which other book
+                                           is there and refuses nothing, which
+                                           is what commit 03e5318 did.
 
-    What replaced the refusal is arithmetic, and it is stricter in the way that
-    matters: agent/reconcile.py compares, for every ticker, the broker's netted
-    line against the SUM of what every book believes it holds, and halts every
-    book holding that symbol when they disagree. On top of that
+    What carries the load when the switch is off is arithmetic, and in one way it
+    is stricter: agent/reconcile.py compares, for every ticker, the broker's
+    netted line against the SUM of what every book believes it holds, and halts
+    every book holding that symbol when they disagree. On top of that
     money.account_symbol_pct_max caps any one ticker at 15 percent of what all
-    five books are worth, which is the rule that now stops them piling in.
+    five books are worth, which is the rule that stops them piling in.
 
     The case for true. IBKR nets
     positions by symbol inside the one shared paper account, so if book A is

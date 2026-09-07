@@ -193,29 +193,45 @@ universe:
                               # path in agent/guardrails.py, rule id halted,
                               # reading IBKR's tick type 49.
 
-  # ONE TICKER, ONE BOOK. DECIDED, AND OFF (hub 2026-09-06, confirmed by Mo the
-  # same day). Two books MAY hold the same ticker.
-  # false  THE DEFAULT. Two books may share a name. The rule still runs and
-  #        still writes a note saying which other book is in it, rule id
-  #        symbol_exclusive, and it refuses nothing.
-  # true   the old rule back. No two books in one name, the second book's entry
-  #        refused, and the name stays with whichever book comes first in
+  # ONE TICKER, ONE BOOK. THIS LINE IS MO'S TO SET AND IT HAS NOT BEEN SET YET.
+  #
+  # true   THE DEFAULT, and what this file says. No two books in one name at
+  #        once. The second book's entry is REFUSED, rule id symbol_exclusive,
+  #        and the name stays with whichever book comes first in
   #        config/books.yaml.
-  # Why it went. Books A, B and E run the same strategy on the same shortlist,
-  # so two of them picking the same name is the agreement month one exists to
-  # measure, and the old rule threw that away: whichever book ticked first took
-  # the name and the other two were locked out, so the three were never choosing
-  # from the same menu. The netting the rule worried about is real, but
-  # attribution never needed exclusivity, because every order carries its book's
-  # tag and every book keeps its own record.
-  # What replaced it, and it is stricter where it counts: agent/reconcile.py
-  # checks each ticker as a whole, adding up what every book holding it believes
-  # and comparing that with the broker's netted line, and halts every book in
-  # that name when the two disagree. money.account_symbol_pct_max then caps any
-  # one ticker at 15 percent of what all five books are worth.
-  # To overturn it, set this to true. Both branches are built and both tested.
+  # false  two books may share a name. The rule still runs and still writes a
+  #        note saying which other book is in it, and it refuses nothing.
+  #
+  # THE DISAGREEMENT, written here rather than left in a commit message. The
+  # review team called cross-book exclusivity a blocking finding on the morning
+  # of 2026-09-06 and the hub overturned it the same evening. The journal entry
+  # for that overturn says, in as many words: "Mo can overturn this. It was
+  # decided by the hub, not by him." A later commit then moved this line to
+  # false saying Mo had confirmed it the same day, and nothing in the journal or
+  # in these settings says he did. So it is back to the careful answer, and the
+  # loose one is this one line.
+  #
+  # The case for false. Books A, B and E run the same strategy on the same
+  # shortlist, so two of them picking the same name is the agreement month one
+  # exists to measure, and the exclusive rule throws that away: whichever book
+  # ticks first takes the name and the other two are locked out, so the three
+  # are never choosing from the same menu. Attribution never needed exclusivity,
+  # because every order carries its book's tag and every book keeps its own
+  # record.
+  #
+  # The case for true. IBKR nets positions by symbol inside the one shared paper
+  # account, so two books in one name means the account's own line is a sum
+  # rather than an answer, and no arithmetic stands between a position and
+  # knowing whose it is.
+  #
+  # Either way agent/reconcile.py checks each ticker as a whole, adding up what
+  # every book holding it believes and comparing that with the broker's netted
+  # line, and halts every book in that name when the two disagree.
+  # money.account_symbol_pct_max caps any one ticker at 15 percent of what all
+  # five books are worth. Both branches are built and both are tested, and the
+  # replay gate proves the refusing branch whichever way this line points.
   # The reasoning is in journal/2026-09-06.md.
-  symbol_exclusive: false
+  symbol_exclusive: true
 
   allow_options: false        # no options in month one
   allow_shorts: false         # no betting on falls. Item A10, shorting, is the
