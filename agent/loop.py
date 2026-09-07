@@ -1507,6 +1507,10 @@ class BookTick:
         # Why this book may not OPEN anything this tick because of the quotes,
         # or an empty string when it may. Exits are never blocked by it.
         self.data_block = ""
+        # The account's working orders, read once for the whole tick by main().
+        # consider() looks in here before sending anything, so a book cannot
+        # stack a second copy of an order it already has resting.
+        self.broker_orders: list = []
 
     @property
     def tag(self) -> str:
@@ -1668,6 +1672,80 @@ def live_locks(book: gr.BookConfig, account_id: str,
     return (not shut), shut
 
 
+#: Which orders count as the same kind of thing. An exit, a stop and a flatten
+#: are three names for getting out, and two of them resting at once in the same
+#: name is the same mistake whichever pair it is.
+ORDER_FAMILY = {"entry": "opening", "exit": "closing", "stop": "closing",
+                "flatten": "closing"}
+
+
+def order_family(purpose: Any) -> str:
+    return ORDER_FAMILY.get(str(purpose or "").strip().lower(), "opening")
+
+
+def duplicate_order_reason(tick: BookTick, state: bs.BookState,
+                           guard: gr.Guardrails,
+                           intent: gr.OrderIntent) -> str | None:
+    """Is an order like this one already resting? The reason why, or None.
+
+    FOUND BY RUNNING THE GATE RATHER THAN BY READING THE CODE. A book short a
+    name whose price rises all day gets a fade exit on every manage tick, and
+    every tick sent a fresh limit order to cover the whole position. Seventy two
+    identical cover orders were resting at the broker by the close. On a paper
+    replay that is a curiosity. In a live account it is the position committed
+    once for every five minutes of the day, and all of it filling together on
+    the first dip.
+
+    Two places are looked at, because either on its own can be wrong. The book's
+    own working orders are the fast answer and they are what the book believes.
+    The broker's open orders are the true answer and they include an order this
+    book has forgotten, which is exactly what a restart leaves behind.
+
+    Matched on the name, the side and the KIND of order rather than the exact
+    purpose, because an exit, a stop and a flatten are three words for getting
+    out and two of them resting at once is the same mistake whichever pair it
+    is. Never matched on the price: a second cover order a cent cheaper is still
+    the position sold twice.
+    """
+    symbol = intent.symbol.upper()
+    family = order_family(intent.purpose)
+    side = intent.side.upper()
+
+    for order_id, order in (state.working_orders or {}).items():
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol") or "").upper() != symbol:
+            continue
+        if _number(order.get("remaining"), _number(order.get("qty"), 1.0)) <= 0:
+            continue
+        if order_family(order.get("purpose")) != family:
+            continue
+        if str(order.get("side") or side).upper() != side:
+            continue
+        return (f"this book already has order {order_id} resting at the broker, "
+                f"{order.get('side') or side} "
+                f"{_number(order.get('remaining'), _number(order.get('qty'))):g} "
+                f"{symbol} ({order.get('purpose') or family}), and a second one "
+                "would be the same shares traded twice")
+
+    ref = str(guard.order_ref or tick.tag).upper()
+    for row in tick.broker_orders or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol") or "").upper() != symbol:
+            continue
+        if str(row.get("orderRef") or row.get("order_ref") or "").upper() != ref:
+            continue
+        if str(row.get("action") or row.get("side") or "").upper() != side:
+            continue
+        return (f"the broker already has order "
+                f"{row.get('orderId') or row.get('order_id')} resting, {side} "
+                f"{symbol}, tagged {ref}, which this book's own file has "
+                "forgotten about. A second one would be the same shares traded "
+                "twice.")
+    return None
+
+
 def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
              account_state, intent: gr.OrderIntent, broker: broker_mod.Broker,
              guards: Guards, extra: str = "", model: str | None = None,
@@ -1685,6 +1763,20 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
     thing would send.
     """
     tick.would_be_orders += 1
+
+    # Before every check and before every send, in a dry run as well, because a
+    # rehearsal that stacks orders the real thing would not is not a rehearsal.
+    already = duplicate_order_reason(tick, state, guard, intent)
+    if already:
+        tick.say(f"NOT placing {describe(intent)}: {already}")
+        tick.refused += 1
+        tick.rule("duplicate_order", f"{intent.symbol}: {already}",
+                  "no order was sent, because an order like it is already working")
+        tick.record(state, intent.symbol, f"no order, {describe(intent)}", already)
+        refused = gr.Decision(allowed=False)
+        refused.add("duplicate_order", already)
+        return refused
+
     decision = gr.check_order(guard, account_state, intent)
     summary = describe(intent) + (f" {extra}" if extra else "")
     verdict = ("allowed by the guardrails" if decision.allowed
@@ -4125,6 +4217,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     disagreement which no longer exists.
     """
     tick = BookTick(book, now, rules, write_ledger, quiet=quiet)
+    tick.broker_orders = list(broker_orders or [])
     plan = plan_for(book, guard)
     day = now.date()
     state = bs.load_state(book.book_id, book.order_ref, day, capital=book.capital_usd)
