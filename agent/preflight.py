@@ -109,9 +109,12 @@ and the only MCP tools it calls are the ones that read.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -168,6 +171,25 @@ LIVE_ACCOUNT = "U28440091"
 
 #: The scanner can take a few minutes when IBKR is slow. Past this it is broken.
 SCANNER_TIMEOUT_SECONDS = 300
+
+#: HOW LONG THE WHOLE MORNING CHECK MAY TAKE. Ten minutes: comfortably more than
+#: a working morning needs, and comfortably less than the half hour between this
+#: job at 09:00 and the open at 09:30.
+#:
+#: Why it exists. On 2026-09-07 IB Gateway lost its upstream connection to IBKR,
+#: every broker read hung, and this script sat there for 44 minutes and never
+#: wrote its verdict at all. output/NO_TRADE_TODAY was neither written nor
+#: deliberately withheld, which is the worst of the three ways a morning can
+#: end, because nothing downstream could tell the difference between "the checks
+#: passed" and "the checks never finished". Mo killed it by hand.
+#:
+#: A pre-flight that runs out of time now stops the day and says why.
+PREFLIGHT_BUDGET_SECONDS = 600.0
+
+#: What the deadline reports itself as when it fires. Deliberately NOT in
+#: CHECK_ORDER below: it is not a question about the broker, it is this script
+#: saying it never reached the end of the list.
+CHECK_IN_TIME = "finished_in_time"
 
 #: agent/scanner.py returns this when a scan could not be trusted. Distinct from
 #: 1, which means it could not reach Gateway at all.
@@ -863,11 +885,101 @@ def check_time_zone(now: datetime | None = None) -> Result:
     )
 
 
-def run_checks(scan_out: Path, write_regime: bool = False) -> list[Result]:
+class PreflightTimeout(RuntimeError):
+    """The pre-flight passed its budget and stopped where it stood."""
+
+
+def out_of_time_result(spent: float, missed: list[str],
+                       budget: float = PREFLIGHT_BUDGET_SECONDS) -> Result:
+    """The one answer the pre-flight gives when it runs out of time.
+
+    It fails, so it lands in NO_TRADE_TODAY and in the alert like any other
+    failed check. A morning whose checks did not finish is not a morning to open
+    positions in: nobody knows whether the broker is fine or on fire.
+    """
+    return Result(
+        CHECK_IN_TIME, False,
+        f"The pre-flight ran for {spent:.0f} seconds, past its {budget:.0f} second "
+        "budget: the broker could not be read in time. "
+        + (f"Checks that never ran: {', '.join(missed)}."
+           if missed else
+           "Every check ran, but too slowly to be worth anything before the open."),
+        facts={"budget_seconds": budget, "spent_seconds": round(spent, 1),
+               "checks_not_run": missed})
+
+
+def arm_deadline(seconds: float) -> bool:
+    """Ask the operating system to interrupt us if the morning runs long.
+
+    The wall clock check inside run_checks is the ordinary way a slow morning
+    ends: it notices between two checks and stops tidily. This alarm sits
+    underneath that, for the case where one single check is what is hanging and
+    control never comes back to the loop at all.
+
+    Returns False when the alarm could not be set, which is what happens off the
+    main thread. The checks then run with the between-checks clock alone, which
+    is still a great deal better than the 44 minutes of 2026-09-07.
+    """
+    def ring(signum, frame):                                      # noqa: ARG001
+        raise PreflightTimeout(
+            f"the pre-flight passed its {seconds:.0f} second budget while a check "
+            "was still waiting on the broker")
+
+    try:
+        signal.signal(signal.SIGALRM, ring)
+        signal.setitimer(signal.ITIMER_REAL, float(seconds))
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def disarm_deadline() -> None:
+    """Put the alarm away. Safe to call whether or not one was ever set."""
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+
+
+def run_checks(scan_out: Path, write_regime: bool = False,
+               collected: list[Result] | None = None,
+               budget_seconds: float = PREFLIGHT_BUDGET_SECONDS,
+               clock=time.monotonic) -> list[Result]:
+    """Every check, in order, stopping if the morning runs out of time.
+
+    The clock is read between checks rather than during one, because a check
+    halfway through a broker read has no safe place to be interrupted. What
+    stops a single check hanging forever is its own bound: the MCP reads carry
+    the wall clock deadline in agent/mcp_client.py, the scanner has
+    SCANNER_TIMEOUT_SECONDS, and main() arms a SIGALRM underneath all of it.
+
+    `collected` is how main keeps the answers of the checks that did finish even
+    when the alarm goes off in the middle of one. It is the same list that comes
+    back, so callers that only want the return value can ignore it.
+    """
+    results = collected if collected is not None else []
+    started = clock()
+
+    # The two that come out of one connection, so they are never split.
     login, market = check_gateway_and_data()
-    return [login, market, check_scanner(scan_out), check_scanner_filters(),
-            check_reconcile(), check_day_trade_counters(), check_time_zone(),
-            check_day_trade_regime(write_regime=write_regime)]
+    results.append(login)
+    results.append(market)
+
+    rest = [
+        (CHECK_SCANNER, lambda: check_scanner(scan_out)),
+        (CHECK_SCANNER_FILTERS, check_scanner_filters),
+        (CHECK_RECONCILE, check_reconcile),
+        (CHECK_DAY_TRADES, check_day_trade_counters),
+        (CHECK_TIME_ZONE, check_time_zone),
+        (CHECK_DAY_TRADE_REGIME, lambda: check_day_trade_regime(write_regime=write_regime)),
+    ]
+
+    for index, (name, run) in enumerate(rest):
+        spent = clock() - started
+        if spent >= budget_seconds:
+            results.append(out_of_time_result(
+                spent, [n for n, _ in rest[index:]], budget_seconds))
+            return results
+        results.append(run())
+    return results
 
 
 def report_path(now: datetime, dry_run: bool) -> Path:
@@ -935,7 +1047,23 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"{now:%Y-%m-%d %H:%M:%S %Z} pre-flight"
           f"{' (dry run)' if args.dry_run else ''}")
-    results = run_checks(scan_out, write_regime=args.write_regime)
+
+    # The budget. Whatever happens below, this run writes its report, and if it
+    # ran out of time it writes NO_TRADE_TODAY and says the broker could not be
+    # read in time. What it must never do again is hang for 44 minutes and write
+    # nothing either way.
+    results: list[Result] = []
+    began = time.monotonic()
+    arm_deadline(PREFLIGHT_BUDGET_SECONDS)
+    try:
+        run_checks(scan_out, write_regime=args.write_regime, collected=results)
+    except PreflightTimeout:
+        done = {r.name for r in results}
+        results.append(out_of_time_result(
+            time.monotonic() - began,
+            [name for name in CHECK_ORDER if name not in done]))
+    finally:
+        disarm_deadline()
 
     failed = [r.name for r in results if not r.passed]
     verdict = "fail" if failed else "pass"

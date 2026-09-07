@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
 if str(AGENT_DIR) not in sys.path:
@@ -842,3 +845,165 @@ def test_a_broken_time_zone_check_does_not_stop_the_morning(monkeypatch):
     assert result.passed
     assert result.facts["warning"] is True
     assert "no zone database" in result.detail
+
+
+# ----------------------------------------------------- the pre-flight's own deadline
+
+# WHY THIS EXISTS. On 2026-09-07 IB Gateway lost its upstream link to IBKR,
+# every broker read hung, and the 09:00 pre-flight sat there for 44 minutes and
+# never wrote its verdict. output/NO_TRADE_TODAY was neither written nor
+# deliberately withheld, so nothing downstream could tell "the checks passed"
+# from "the checks never finished". Mo killed it by hand. A pre-flight that runs
+# out of time now stops the day and says the broker could not be read in time.
+
+def stub_clock(*readings):
+    """A clock that returns each reading in turn, then sticks on the last one."""
+    values = list(readings)
+
+    def clock():
+        return values.pop(0) if len(values) > 1 else values[0]
+    return clock
+
+
+def stub_every_check(monkeypatch, ran: list[str]):
+    """Replace every check with a stub that passes and writes down that it ran."""
+    def pair():
+        ran.append(preflight.CHECK_GATEWAY)
+        ran.append(preflight.CHECK_MARKET_DATA)
+        return (preflight.Result(preflight.CHECK_GATEWAY, True, "stub"),
+                preflight.Result(preflight.CHECK_MARKET_DATA, True, "stub"))
+
+    def one(name):
+        def run(*args, **kwargs):
+            ran.append(name)
+            return preflight.Result(name, True, "stub")
+        return run
+
+    monkeypatch.setattr(preflight, "check_gateway_and_data", pair)
+    monkeypatch.setattr(preflight, "check_scanner", one(preflight.CHECK_SCANNER))
+    monkeypatch.setattr(preflight, "check_scanner_filters",
+                        one(preflight.CHECK_SCANNER_FILTERS))
+    monkeypatch.setattr(preflight, "check_reconcile", one(preflight.CHECK_RECONCILE))
+    monkeypatch.setattr(preflight, "check_day_trade_counters",
+                        one(preflight.CHECK_DAY_TRADES))
+    monkeypatch.setattr(preflight, "check_time_zone", one(preflight.CHECK_TIME_ZONE))
+    monkeypatch.setattr(preflight, "check_day_trade_regime",
+                        one(preflight.CHECK_DAY_TRADE_REGIME))
+
+
+def test_a_morning_inside_its_budget_runs_every_check(monkeypatch, tmp_path):
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+    results = preflight.run_checks(tmp_path / "scan.json", clock=stub_clock(0.0))
+    assert ran == list(preflight.CHECK_ORDER)
+    assert [r.name for r in results] == list(preflight.CHECK_ORDER)
+    assert all(r.passed for r in results)
+
+
+def test_a_morning_that_runs_out_of_time_stops_where_it_stands(monkeypatch, tmp_path):
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+    # Nought seconds gone when the checks start, eleven minutes gone by the time
+    # the gateway pair comes back.
+    results = preflight.run_checks(tmp_path / "scan.json",
+                                   clock=stub_clock(0.0, 660.0))
+    assert ran == [preflight.CHECK_GATEWAY, preflight.CHECK_MARKET_DATA]
+    assert results[-1].name == preflight.CHECK_IN_TIME
+    assert results[-1].passed is False
+    assert "the broker could not be read in time" in results[-1].detail
+    assert preflight.CHECK_SCANNER in results[-1].facts["checks_not_run"]
+    assert preflight.CHECK_DAY_TRADE_REGIME in results[-1].facts["checks_not_run"]
+
+
+def test_the_checks_that_did_finish_are_kept(monkeypatch, tmp_path):
+    """A slow morning still reports what it managed to learn before it stopped."""
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+    results = preflight.run_checks(tmp_path / "scan.json",
+                                   clock=stub_clock(0.0, 10.0, 20.0, 900.0))
+    names = [r.name for r in results]
+    assert names[:4] == [preflight.CHECK_GATEWAY, preflight.CHECK_MARKET_DATA,
+                         preflight.CHECK_SCANNER, preflight.CHECK_SCANNER_FILTERS]
+    assert names[-1] == preflight.CHECK_IN_TIME
+    assert results[-1].facts["checks_not_run"] == [
+        preflight.CHECK_RECONCILE, preflight.CHECK_DAY_TRADES,
+        preflight.CHECK_TIME_ZONE, preflight.CHECK_DAY_TRADE_REGIME]
+
+
+def test_the_deadline_is_not_one_of_the_ordinary_checks():
+    """It is this script saying it never got to the end, not a broker question."""
+    assert preflight.CHECK_IN_TIME not in preflight.CHECK_ORDER
+    assert preflight.CHECK_ORDER[-1] == preflight.CHECK_DAY_TRADE_REGIME
+
+
+def test_the_budget_is_shorter_than_the_wait_for_the_open():
+    """09:00 to 09:30 is half an hour. The budget has to fit inside it."""
+    assert 0 < preflight.PREFLIGHT_BUDGET_SECONDS <= 1800
+    assert preflight.PREFLIGHT_BUDGET_SECONDS > preflight.SCANNER_TIMEOUT_SECONDS
+
+
+def test_the_alarm_interrupts_a_check_that_never_comes_back():
+    """The last resort: one check hanging, control never coming back to the loop."""
+    began = time.monotonic()
+    assert preflight.arm_deadline(0.3) is True
+    try:
+        with pytest.raises(preflight.PreflightTimeout):
+            time.sleep(30)
+    finally:
+        preflight.disarm_deadline()
+    assert time.monotonic() - began < 5
+
+
+def test_disarming_leaves_no_alarm_behind():
+    preflight.arm_deadline(0.2)
+    preflight.disarm_deadline()
+    time.sleep(0.5)          # would have gone off by now if it were still armed
+
+
+def test_a_pre_flight_that_ran_out_of_time_stops_the_day(monkeypatch, tmp_path):
+    """The whole point: NO_TRADE_TODAY gets written, and the alert says why."""
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    sent = []
+    monkeypatch.setattr(preflight.alerts_module, "alert",
+                        lambda level, subject, body: sent.append((level, subject, body))
+                        or ["test"])
+
+    def hangs(*args, **kwargs):
+        # What the alarm does in the middle of a check that will not come back.
+        kwargs.get("collected", []).append(
+            preflight.Result(preflight.CHECK_GATEWAY, True, "Gateway is up."))
+        raise preflight.PreflightTimeout("the pre-flight passed its budget")
+
+    monkeypatch.setattr(preflight, "run_checks", hangs)
+
+    code = preflight.main([])
+
+    assert code == 1
+    marker = tmp_path / "NO_TRADE_TODAY"
+    assert marker.exists()
+    assert preflight.CHECK_IN_TIME in marker.read_text(encoding="utf-8")
+    assert sent, "a morning that ran out of time has to say so"
+    level, subject, body = sent[0]
+    assert level == "error"
+    assert preflight.CHECK_IN_TIME in subject
+    assert "the broker could not be read in time" in body
+    # The check that did finish before the alarm is still in the report.
+    report = json.loads(next(tmp_path.glob("preflight_*.json")).read_text())
+    assert preflight.CHECK_GATEWAY in report["checks"]
+    assert report["verdict"] == "fail"
+
+
+def test_a_dry_run_that_runs_out_of_time_creates_nothing(monkeypatch, tmp_path):
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    sent = []
+    monkeypatch.setattr(preflight.alerts_module, "alert",
+                        lambda *a, **k: sent.append(a) or ["test"])
+    monkeypatch.setattr(preflight, "run_checks",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            preflight.PreflightTimeout("out of time")))
+
+    assert preflight.main(["--dry-run"]) == 1
+    assert not (tmp_path / "NO_TRADE_TODAY").exists()
+    assert sent == []
