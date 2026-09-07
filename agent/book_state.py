@@ -104,9 +104,14 @@ class Position:
 #:                   reason and the account was emptied under the books' feet.
 #:   other           anything else, including a guardrail asking for one.
 #:                   Clears at the next trading day.
+#:   market_data     the quotes are not good enough to open a position on: a
+#:                   competing session has taken the data line, or what came
+#:                   back is delayed. Clears the moment a live quote arrives,
+#:                   because the thing that was wrong is no longer wrong.
 HALT_RECONCILIATION = "reconciliation"
 HALT_LOSS_CAP = "loss_cap"
 HALT_KILL_SWITCH = "kill_switch"
+HALT_MARKET_DATA = "market_data"
 HALT_OTHER = "other"
 
 #: How many halt reasons are kept. The five most recent, oldest dropped.

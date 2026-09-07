@@ -387,6 +387,20 @@ It tracks the one paper account all five books share, so a day is a day and not 
 
 Nothing has been loaded. Writing the file is not the same as running it, and `scripts/gen_launchd.py --install` is still a separate, deliberate step.
 
+### The quotes have to say how old they are, and this account's are delayed
+
+The loop asks IB Gateway for LIVE quotes, market data type 1, and reads back which type it was actually served. Asking for delayed and being given delayed proves nothing; asking for live and being given delayed is the fact that matters. `agent/replay/record_day.py` already worked this way, and until 2026-09-06 the loop did not: nothing anywhere read `marketDataType` off a reply, so a fifteen minute old price and a live one were the same thing to it.
+
+A book whose quotes are not live is halted, cause `market_data`, which means it opens nothing and may still close what it holds. Managing a position on a delayed price is fine. Deciding what to pay for a new one is not, because the whole strategy is a break of a range that happened in the last five minutes. The halt lifts itself the moment a live quote arrives.
+
+**This account is served delayed data every day.** Live data was refused outright on 2026-09-06 with IBKR errors 10168 and 10089. So until the streaming quote subscription is bought, no book will open a position, and that is the honest answer rather than a gap: every book is on `dry_run` anyway, and a rule that quietly let entries through on a stale price would be worse than one that stops them. The alert about it is said once a day rather than every half hour, because it is the same fact all day.
+
+### IBKR code 10197: somebody else has the market data line
+
+10197 means another session is logged in with the same IBKR credentials and has taken the market data line, so this one gets no quotes at all. In plain words: Mo has a live quote screen or an app open somewhere. The loop used to catch it inside `snapshot_by_symbol()`, turn it into a note, and handle it exactly like a quote that did not arrive, so half an hour of no quotes passed without a word.
+
+Now the code is kept, the book is halted for as long as it lasts, and the alert says what it means and what to do about it: close the TWS window or the mobile app and it clears itself on the next tick.
+
 ### Holidays are known to the day trade counter and to nothing else
 
 `schedule.holidays` in `config/guardrails.yaml` is read by `agent/pdt.py` to work out what a business day is. The order checks in `agent/guardrails.py` still know about weekends only. The loop will happily decide it is a trading day on Thanksgiving; the shortlist will be empty and nothing will happen, but the log will say `manage` rather than `closed`.

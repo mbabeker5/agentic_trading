@@ -1705,8 +1705,8 @@ def competing_session_and_delayed_data(day: date_type) -> Scenario:
     return Scenario(
         key="competing_session_delayed_data",
         title="A competing session, then delayed data",
-        proves="that IBKR code 10197 halts the day, and that a position is never "
-               "quietly opened on a delayed quote",
+        proves="that IBKR code 10197 halts a book while it lasts, and that a "
+               "position is never quietly opened on a delayed quote",
         day=day, symbols=(name,), build_broker=build,
         book_patches=only("A"),
         faults=(Fault(at="10:00", action="inject", kind="competing_session"),

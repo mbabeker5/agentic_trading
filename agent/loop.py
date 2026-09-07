@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -431,8 +432,12 @@ def read_guards(root: Path | None = None) -> Guards:
                   no_trade_today=folder / "NO_TRADE_TODAY")
 
 
-def entries_blocked_reason(guards: Guards, state: bs.BookState) -> str | None:
+def entries_blocked_reason(guards: Guards, state: bs.BookState,
+                           tick: "BookTick | None" = None) -> str | None:
     """Why this book may not open anything right now, or None when it may."""
+    if tick is not None and tick.data_block:
+        return (f"the quotes are not good enough to open a position on: "
+                f"{tick.data_block}")
     if guards.stop_present:
         return (f"the stop file {guards.stop} exists, so this tick may close "
                 "positions and open nothing")
@@ -1044,22 +1049,247 @@ def contract_for(row: dict) -> dict:
     return contract
 
 
-def snapshot_by_symbol(broker: broker_mod.Broker, rows: list[dict],
-                       notes: list[str]) -> dict[str, dict]:
-    """One quote each for a list of names, in a single call, keyed by symbol."""
+#: IBKR's market data types. 1 is a live streaming quote, 2 is the last one from
+#: when the market was open, 3 is delayed by about fifteen minutes and 4 is a
+#: delayed frozen one.
+MARKET_DATA_LIVE = 1
+MARKET_DATA_FROZEN = 2
+MARKET_DATA_DELAYED = 3
+MARKET_DATA_DELAYED_FROZEN = 4
+MARKET_DATA_LABELS = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed frozen"}
+
+#: The types a new position may be opened on. Only a live quote. A fifteen
+#: minute old price is fine for deciding whether to get out of something and is
+#: not fine for deciding what to pay for it, because the whole strategy is a
+#: break of a range that happened in the last five minutes.
+LIVE_ENOUGH_TO_ENTER = (MARKET_DATA_LIVE,)
+
+#: IBKR error 10197. Another session is logged in with the same credentials and
+#: has taken the market data line, so this one gets nothing.
+COMPETING_SESSION_CODE = 10197
+
+#: What that actually means, in words rather than a number.
+COMPETING_SESSION_PLAIN = (
+    "Mo has a live quote screen or app open somewhere, logged in as the same "
+    "IBKR user. IBKR gives the market data line to one session at a time, so "
+    "this one is getting no quotes at all until that one is closed.")
+
+
+@dataclass
+class QuoteFeed:
+    """What the broker's quotes said about themselves, apart from the prices.
+
+    Kept as its own thing because the loop used to throw all of it away.
+    snapshot_by_symbol() caught every failure and turned it into a note, so IBKR
+    code 10197 was handled exactly like a quote that did not arrive, and nothing
+    anywhere read marketDataType off a reply. The loop went on managing
+    positions off the last price it happened to have, and it would have opened
+    new ones on a fifteen minute old quote without ever saying so.
+    """
+
+    quotes: dict = field(default_factory=dict)
+    market_data_type: int | None = None
+    codes: tuple = ()
+    error: str = ""
+    asked_for: int = MARKET_DATA_LIVE
+
+    @property
+    def label(self) -> str:
+        return MARKET_DATA_LABELS.get(self.market_data_type or 0, "unknown")
+
+    @property
+    def competing_session(self) -> bool:
+        """Is another session holding the market data line? IBKR code 10197."""
+        return COMPETING_SESSION_CODE in self.codes
+
+    @property
+    def good_enough_to_enter(self) -> bool:
+        """May a NEW position be opened on this feed? Exits are never blocked."""
+        return (not self.competing_session
+                and self.market_data_type in LIVE_ENOUGH_TO_ENTER)
+
+    @property
+    def why_not(self) -> str:
+        """One sentence saying why not, or an empty one when it is fine."""
+        if self.competing_session:
+            return (f"IBKR code {COMPETING_SESSION_CODE}, a competing live "
+                    f"session: {COMPETING_SESSION_PLAIN}")
+        if self.market_data_type is None:
+            return ("no quote came back at all, so nobody can say whether the "
+                    "price is current" + (f": {self.error}" if self.error else ""))
+        if self.market_data_type not in LIVE_ENOUGH_TO_ENTER:
+            return (f"the quotes came back as market data type "
+                    f"{self.market_data_type} ({self.label}), and this book asked "
+                    f"for type {self.asked_for} (live). A price about fifteen "
+                    "minutes old is fine for deciding whether to get out of "
+                    "something and is not fine for deciding what to pay for it")
+        return ""
+
+
+def error_codes_from(exc: BaseException) -> tuple:
+    """Every IBKR error code carried by one failure, from the object or its words.
+
+    The replay broker puts the code on the exception. The real MCP client wraps
+    the server's reply in its own error and the number survives only in the
+    message, so both are read.
+    """
+    found: list[int] = []
+    code = getattr(exc, "code", None)
+    try:
+        if code is not None:
+            found.append(int(code))
+    except (TypeError, ValueError):
+        pass
+    for number in re.findall(r"\b(1\d{4})\b", f"{exc}"):
+        found.append(int(number))
+    return tuple(dict.fromkeys(found))
+
+
+def read_quotes(broker: broker_mod.Broker, rows: list[dict], notes: list[str],
+                market_data_type: int = MARKET_DATA_LIVE) -> QuoteFeed:
+    """One quote each for a list of names, plus what the feed said about itself.
+
+    LIVE is asked for, not delayed. Asking for delayed and being given delayed
+    proves nothing; asking for live and being given delayed is the fact that
+    matters, and it is the fact this account has to face. agent/replay/record_day.py
+    already worked this way: ask for live, take what you are given, write down
+    which you got.
+    """
     contracts = [contract_for(row) for row in rows if row.get("symbol")]
     if not contracts:
-        return {}
+        return QuoteFeed(asked_for=market_data_type)
     try:
-        answer = broker.snapshot(contracts) or {}
+        answer = broker.snapshot(contracts, market_data_type=market_data_type) or {}
+    except TypeError:
+        # A broker whose snapshot takes no market data type at all. Older fakes
+        # in the tests are like this, and the loop should still work with them.
+        try:
+            answer = broker.snapshot(contracts) or {}
+        except Exception as exc:             # noqa: BLE001
+            notes.append(f"no quotes came back for {len(contracts)} names: {exc}")
+            return QuoteFeed(codes=error_codes_from(exc), error=str(exc),
+                             asked_for=market_data_type)
     except Exception as exc:                 # noqa: BLE001
         notes.append(f"no quotes came back for {len(contracts)} names: {exc}")
-        return {}
-    out: dict[str, dict] = {}
+        return QuoteFeed(codes=error_codes_from(exc), error=str(exc),
+                         asked_for=market_data_type)
+
+    quotes: dict[str, dict] = {}
     for row in (answer.get("snapshots") or answer.get("quotes") or []):
         if isinstance(row, dict) and row.get("symbol"):
-            out[str(row["symbol"]).upper()] = row
-    return out
+            quotes[str(row["symbol"]).upper()] = row
+
+    served = _served_type(answer, quotes)
+    codes = tuple(int(c) for c in (answer.get("error_codes") or answer.get("codes")
+                                   or ()) if str(c).lstrip("-").isdigit())
+    return QuoteFeed(quotes=quotes, market_data_type=served, codes=codes,
+                     asked_for=market_data_type)
+
+
+def note_the_feed(tick: BookTick, state: bs.BookState, feed: QuoteFeed) -> None:
+    """Say what the quotes were, block entries when they are not good enough.
+
+    THE TWO THINGS THIS EXISTS FOR, both found by the replay gate.
+
+    IBKR code 10197 means another session is logged in with the same
+    credentials and has taken the market data line. The loop caught it inside
+    snapshot_by_symbol(), turned it into a note, and handled it exactly like a
+    quote that did not arrive. Nothing read the code and nothing said what it
+    meant, so half an hour of no quotes at all passed without a word and the
+    loop went on managing positions off the last price it happened to have.
+
+    And nothing anywhere read marketDataType off a reply, so a fifteen minute
+    old price and a live one were the same thing to it. That matters more than
+    it sounds: this paper account is served delayed data every day, checked
+    against the live server on 2026-09-06, and errors 10168 and 10089 say live
+    data was refused outright.
+
+    A book with a data problem is halted, cause market_data, which means it
+    opens nothing and may still close what it holds. The halt lifts itself the
+    moment a live quote arrives, so a quote screen Mo closes at 10:35 costs the
+    half hour it was open rather than the rest of the day.
+    """
+    if feed.good_enough_to_enter:
+        tick.data_block = ""
+        for row in state.clear_halt(bs.HALT_MARKET_DATA):
+            tick.say(f"  the market data halt is lifted: quotes are {feed.label} "
+                     "again")
+            tick.rule("halt_cleared", f"book {tick.book.book_id}: {row.get('reason')}",
+                      f"lifted, because the quotes came back as {feed.label}")
+        return
+    if not feed.quotes and not feed.competing_session and feed.market_data_type is None:
+        # Nobody asked for a quote this tick, so there is nothing to judge.
+        return
+
+    why = feed.why_not
+    tick.data_block = why
+    tick.note(f"market data type {feed.market_data_type} ({feed.label}): {why}")
+    tick.rule("market_data",
+              f"quotes came back {feed.label}"
+              + (f", IBKR code {COMPETING_SESSION_CODE}"
+                 if feed.competing_session else "")
+              + f": {why}",
+              "this book opens nothing until the quotes are live again, and it "
+              "may still close what it holds")
+    db_call("record_watchdog", check_name="market_data", ok=False, detail=why,
+            action_taken=f"book {tick.book.book_id} opens nothing until the "
+                         "quotes are live again",
+            ts=tick.now)
+    state.halt(why, cause=bs.HALT_MARKET_DATA, at=tick.now.isoformat())
+
+    if feed.competing_session:
+        tick.alert(
+            "error", "Another session has taken the market data line",
+            f"IBKR code {COMPETING_SESSION_CODE}.\n\n{COMPETING_SESSION_PLAIN}"
+            f"\n\nBook {tick.book.book_id} is getting no quotes, so it opens "
+            "nothing until that session is closed. It may still close what it "
+            "holds, on the last price it has.\n\nClose the TWS window or the "
+            "IBKR mobile app and it clears itself on the next tick.",
+            key="competing_session")
+    else:
+        tick.alert(
+            "warn", f"Quotes are {feed.label}, so no book is opening anything",
+            f"{why}\n\nBook {tick.book.book_id} asked for live quotes "
+            f"(market data type {feed.asked_for}) and was given type "
+            f"{feed.market_data_type} ({feed.label}).\n\nThis paper account is "
+            "served delayed data every day: live data was refused outright on "
+            "2026-09-06 with errors 10168 and 10089. Until the streaming quote "
+            "subscription is bought, this is the ordinary state of the account "
+            "and no book will open a position, which is why this is said once a "
+            "day rather than every half hour.\n\nExits are unaffected and use "
+            "the price that did arrive.",
+            key="delayed_data", quiet_minutes=ALERT_ONCE_A_DAY_MINUTES)
+
+
+def _served_type(answer: dict, quotes: dict[str, dict]) -> int | None:
+    """Which market data type the broker actually served, or None when it did not say."""
+    for key in ("market_data_type", "marketDataType"):
+        value = answer.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    for row in quotes.values():
+        for key in ("marketDataType", "market_data_type"):
+            value = row.get(key)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def snapshot_by_symbol(broker: broker_mod.Broker, rows: list[dict],
+                       notes: list[str]) -> dict[str, dict]:
+    """One quote each for a list of names, keyed by symbol. Prices only.
+
+    For the callers that want nothing but the numbers. Anything that decides
+    whether to OPEN a position uses read_quotes above instead, because the
+    decision needs to know how old the price is.
+    """
+    return read_quotes(broker, rows, notes).quotes
 
 
 #: IBKR's halted tick is tick type 49. It comes back as a number: 0 means not
@@ -1274,6 +1504,9 @@ class BookTick:
         # of the tick and main() writes the smallest across every book into
         # output/next_tick_seconds for the wrapper to read.
         self.next_tick_seconds = 300
+        # Why this book may not OPEN anything this tick because of the quotes,
+        # or an empty string when it may. Exits are never blocked by it.
+        self.data_block = ""
 
     @property
     def tag(self) -> str:
@@ -1912,7 +2145,9 @@ def build_pick_packet(tick: BookTick, state: bs.BookState, plan: BookPlan,
     between reviewing a decision and guessing at it.
     """
     notes: list[str] = []
-    quotes = snapshot_by_symbol(broker, rows, notes)
+    feed = read_quotes(broker, rows, notes)
+    quotes = feed.quotes
+    note_the_feed(tick, state, feed)
     enriched: list[dict] = []
 
     for row in rows:
@@ -2094,7 +2329,7 @@ def do_pick(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Guard
                     str(skip.get("rationale") or "no reason given"),
                     model=result.model, cost=None, prompt_hash=result.prompt_hash)
 
-    blocked = entries_blocked_reason(guards, state)
+    blocked = entries_blocked_reason(guards, state, tick)
     for pick in result.picks:
         _consider_pick(tick, state, plan, guard, broker, account_state, guards,
                        pick, result, blocked)
@@ -2889,7 +3124,9 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
 
     prices: dict[str, tuple[float | None, float | None]] = {}
     if positions:
-        quotes = snapshot_by_symbol(broker, [{"symbol": s} for s in positions], notes)
+        feed = read_quotes(broker, [{"symbol": s} for s in positions], notes)
+        note_the_feed(tick, state, feed)
+        quotes = feed.quotes
         for symbol in positions:
             if plan.family == MOMENTUM:
                 try:
@@ -3104,7 +3341,7 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
     happen at 09:40, at 10:55, or never. A pick refused at 09:35 for want of
     room can also come back once something else has been closed.
     """
-    blocked = entries_blocked_reason(guards, state)
+    blocked = entries_blocked_reason(guards, state, tick)
     if blocked:
         if state.picks:
             tick.note(f"no new positions this tick: {blocked}")
@@ -3147,8 +3384,12 @@ def _fire_waiting_entries(tick: BookTick, state: bs.BookState, plan: BookPlan,
             if bars:
                 last_close = _number(bars[-1].get("close")) or None
         if last_close is None:
-            quotes = snapshot_by_symbol(broker, [{"symbol": symbol}], [])
-            last_close = snapshot_price(quotes.get(symbol))
+            waiting = read_quotes(broker, [{"symbol": symbol}], tick.notes)
+            note_the_feed(tick, state, waiting)
+            if tick.data_block:
+                tick.say(f"  {symbol}: no entry, {tick.data_block}")
+                return
+            last_close = snapshot_price(waiting.quotes.get(symbol))
         if not last_close:
             tick.note(f"{symbol}: no price came back, so its entry cannot be judged "
                       "this tick")
@@ -3617,6 +3858,11 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     day = now.date()
     state = bs.load_state(book.book_id, book.order_ref, day, capital=book.capital_usd)
     state.account_id = account_id
+    # Whether this book was already halted when the tick started. A halt that is
+    # still there five minutes later is not news, so only a NEW one is alerted
+    # on. The thirty minute rate limit is underneath that as well, for a halt
+    # that flaps.
+    was_halted = bool(state.halted)
 
     # A kill switch flatten is not a mismatch. It is the handle working. So the
     # books are brought into line with the account and told why, rather than
@@ -3723,7 +3969,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     # A halted book opens nothing for the rest of the day. Until 2026-09-06 that
     # was written to a log file nobody was watching, so a book could stop at
     # 09:50 and nobody would find out until somebody opened the ledger.
-    if state.halted:
+    if state.halted and not was_halted:
         held = len(state.all_positions())
         tick.alert(
             "error", f"Book {book.book_id} is halted",

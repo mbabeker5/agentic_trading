@@ -93,9 +93,18 @@ class CountingBroker:
         return {"executions": [], "fills": [], "notes": []}
 
     def snapshot(self, contracts, market_data_type=3) -> dict:
+        """Every quote says which market data type it is, because a real one does.
+
+        A broker that answers a snapshot without saying whether the price is
+        live or fifteen minutes old is not modelling a quiet market, it is
+        modelling one that cannot answer, and the loop refuses to open a
+        position on a price whose age nobody will vouch for.
+        """
         self.calls.append("snapshot")
-        return {"snapshots": [{"symbol": c.get("symbol"), "last": self._price,
-                               "close": self._price, "marketPrice": self._price}
+        return {"market_data_type": int(market_data_type),
+                "snapshots": [{"symbol": c.get("symbol"), "last": self._price,
+                               "close": self._price, "marketPrice": self._price,
+                               "marketDataType": int(market_data_type)}
                               for c in contracts], "notes": []}
 
     def historical_bars(self, contract, duration, bar_size, what="TRADES",
