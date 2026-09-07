@@ -5,7 +5,21 @@ Everything here exercises the pure part of
 decide_actions(), its bookkeeping partner update_state(), and judge_restart(),
 which is the rule for whether a restart of IB Gateway actually took. No test
 here touches IB Gateway, sends an alert, or starts anything. The restart tests
-feed made up probes to the decision, so no Gateway is started or stopped.
+feed made up probes to the decision, so no Gateway is started or stopped, and
+the connection tests hand _connect_read_only() and _positions_answer() a stand
+in object rather than an ib_async session.
+
+The later sections are all about the same day, 2026-09-07, which produced four
+separate lessons in about twelve hours:
+
+* a Gateway logged in and cut off from IBKR at once, which every check passed,
+  so ib_answers now asks it a real question;
+* a restart that could show all three local proofs and still not work, so there
+  is a fourth proof that IBKR is on the other end;
+* a stuck copy of the watchdog holding client id 250, so a collision moves to a
+  spare id instead of alerting, and the whole run is on a wall clock;
+* Labor Day, a shut market that failed market_data every five minutes, so the
+  market hours question knows about holidays.
 
 Run them with:
 
@@ -41,6 +55,9 @@ def healthy() -> dict[str, wd.Check]:
                                         detail="127.0.0.1:4002 is accepting connections."),
         wd.CHECK_IB_CONNECT: wd.Check(wd.CHECK_IB_CONNECT, ok=True,
                                       detail="Connected read only, account DUT077572."),
+        wd.CHECK_IB_ANSWERS: wd.Check(
+            wd.CHECK_IB_ANSWERS, ok=True,
+            detail="Gateway answered a positions request in 0.04 s, 1 position."),
         wd.CHECK_MARKET_DATA: wd.Check(wd.CHECK_MARKET_DATA, ok=True,
                                        detail="SPY real time quote, bid 769.4 ask 769.5."),
         wd.CHECK_LOOP_TICK: wd.Check(wd.CHECK_LOOP_TICK, ok=True,
@@ -65,9 +82,28 @@ def gateway_down() -> dict[str, wd.Check]:
     checks[wd.CHECK_IB_CONNECT] = wd.Check(
         wd.CHECK_IB_CONNECT, ok=True, skipped=True,
         detail="not checked, the port is shut")
+    checks[wd.CHECK_IB_ANSWERS] = wd.Check(
+        wd.CHECK_IB_ANSWERS, ok=True, skipped=True,
+        detail="not checked, the port is shut")
     checks[wd.CHECK_MARKET_DATA] = wd.Check(
         wd.CHECK_MARKET_DATA, ok=True, skipped=True,
         detail="not checked, there was no connection to ask on")
+    return checks
+
+
+def gateway_not_answering() -> dict[str, wd.Check]:
+    """The outage of 2026-09-07, twice in one day, as the checks now see it.
+
+    Gateway is running, the port is open, the login goes through and the
+    account id comes back. Every one of the old checks passes. The only thing
+    wrong is that IBKR is not on the other end any more, and the only check
+    that can tell is the one that asks a real question.
+    """
+    checks = healthy()
+    checks[wd.CHECK_IB_ANSWERS] = wd.Check(
+        wd.CHECK_IB_ANSWERS, ok=False,
+        detail=("Gateway is logged in but IBKR is not answering (positions request "
+                "timed out after 20 s); it has lost its upstream connection."))
     return checks
 
 
@@ -427,8 +463,12 @@ class FakeProbe:
 
 
 def try_restart(*looks, exit_code=None, handle=True, wait_seconds=120,
-                poll_seconds=5):
+                poll_seconds=5, answers=True, stop_first=False, stopper=None):
     """One restart attempt with made up answers. No Gateway is anywhere near it.
+
+    answers stands in for the fourth proof, the read that either comes back
+    from the new Gateway or does not. It is only ever asked once the first
+    three proofs are in, so most of these tests never reach it.
 
     Returns the outcome and the list of sleeps it asked for, so a test can say
     both what it decided and how long it was willing to wait.
@@ -440,7 +480,10 @@ def try_restart(*looks, exit_code=None, handle=True, wait_seconds=120,
     outcome = wd.restart_gateway(
         wait_seconds=wait_seconds, poll_seconds=poll_seconds,
         probe=FakeProbe(BEFORE, *looks), launcher=launcher,
-        sleep=lambda seconds: slept.append(seconds))
+        sleep=lambda seconds: slept.append(seconds),
+        stop_first=stop_first,
+        stopper=stopper or (lambda: (True, "the old Gateway was stopped")),
+        answering=lambda: answers)
     return outcome, slept
 
 
@@ -761,3 +804,568 @@ def test_the_time_zone_check_is_asked_even_when_the_market_is_shut(monkeypatch):
     assert asked, "the time zone was not checked at all outside market hours"
     assert wd.CHECK_TIME_ZONE in checks
     assert checks[wd.CHECK_TIME_ZONE].ok
+
+
+# ------------------------------------------- a Gateway that will not answer
+
+# WHY THIS CHECK EXISTS. On 2026-09-07 IB Gateway lost its upstream connection
+# to IBKR twice, at 22:35 Pacific the night before and again at 07:50 New York
+# in the morning, both times when the MacBook went to sleep. Both times it kept
+# running, kept port 4002 open and kept completing the login handshake, so
+# gateway_process, gateway_port and ib_connect all reported ok all night while
+# every reqPositions, account update and reqExecutions timed out. Nothing
+# restarted it. A person did, at 04:12 and 09:48, and each restart fixed it
+# instantly. See journal/gateway_reads_2026-09-07.md.
+
+def test_a_gateway_that_never_answers_fails_and_is_restarted_exactly_once():
+    actions, state = step(gateway_not_answering(), MID_MORNING, {"checks": {}})
+
+    raised = alerts_in(actions)
+    assert [a.check for a in raised] == [wd.CHECK_IB_ANSWERS]
+    assert raised[0].level == "error"
+    assert "lost its upstream connection" in raised[0].body
+    assert "What to do" in raised[0].body
+
+    started = restarts_in(actions)
+    assert len(started) == 1, "a Gateway that cannot answer is a dead Gateway"
+    assert started[0].check == wd.CHECK_IB_ANSWERS
+    assert state["checks"][wd.CHECK_IB_ANSWERS]["restart_attempted"] is True
+
+
+def test_a_gateway_that_answers_says_nothing_and_starts_nothing():
+    actions, state = step(healthy(), MID_MORNING, {"checks": {}})
+    assert actions == []
+    assert state["checks"][wd.CHECK_IB_ANSWERS]["ok"] is True
+
+
+def test_the_outage_only_ever_gets_one_restart_however_long_it_lasts():
+    """The whole night of 2026-09-07 in one test, five minutes at a time."""
+    state: dict = {"checks": {}}
+    now = MID_MORNING
+    restarts = 0
+    alerts = 0
+    for _ in range(72):                       # six hours of wake ups
+        actions, state = step(gateway_not_answering(), now, state)
+        restarts += len(restarts_in(actions))
+        alerts += len(alerts_in(actions))
+        now += timedelta(minutes=5)
+    assert restarts == 1
+    # The budget is unchanged: once when it breaks, then every thirty minutes.
+    assert alerts == 1 + 11
+
+
+def test_a_gateway_that_starts_answering_again_is_announced_once():
+    _, state = step(gateway_not_answering(), MID_MORNING, {"checks": {}})
+    actions, state = step(healthy(), MID_MORNING + timedelta(minutes=10), state)
+
+    raised = alerts_in(actions)
+    assert [a.check for a in raised] == [wd.CHECK_IB_ANSWERS]
+    assert raised[0].level == "info"
+    assert raised[0].title.startswith("Recovered")
+
+    actions, _ = step(healthy(), MID_MORNING + timedelta(minutes=15), state)
+    assert actions == []
+
+
+def test_a_gateway_that_is_down_altogether_does_not_get_two_restarts():
+    """ib_answers is skipped when there is nothing to ask on, so it adds nothing."""
+    actions, _ = step(gateway_down(), MID_MORNING, {"checks": {}})
+    started = restarts_in(actions)
+    assert len(started) == 1
+    assert started[0].check == wd.CHECK_GATEWAY_PROCESS, "the process check owns that one"
+
+
+def test_the_new_check_is_in_the_reported_order_and_can_cause_a_restart():
+    assert wd.CHECK_IB_ANSWERS in wd.CHECK_ORDER
+    assert wd.CHECK_IB_ANSWERS in wd.WHAT_TO_DO
+    assert wd.CHECK_IB_ANSWERS in wd.RESTART_CHECKS
+    # Right after ib_connect, because it is the same connection asked twice.
+    order = list(wd.CHECK_ORDER)
+    assert order.index(wd.CHECK_IB_ANSWERS) == order.index(wd.CHECK_IB_CONNECT) + 1
+
+
+def test_twenty_seconds_is_what_a_read_gets():
+    assert wd.ANSWER_TIMEOUT_SECONDS == 20
+
+
+class FakeIB:
+    """The smallest IB Gateway that can be interesting.
+
+    positions is either a list to hand back, or an exception to raise, which is
+    what a Gateway with no upstream connection does once ib.RequestTimeout is
+    set on it.
+    """
+
+    RequestTimeout = 0
+
+    def __init__(self, positions):
+        self.positions = positions
+        self.asked = 0
+
+    def reqPositions(self):
+        self.asked += 1
+        if isinstance(self.positions, BaseException):
+            raise self.positions
+        return self.positions
+
+
+def test_a_read_that_never_comes_back_is_the_failure_we_went_looking_for():
+    import asyncio
+
+    check = wd._positions_answer(FakeIB(asyncio.TimeoutError()), timeout=20, codes=[])
+
+    assert check.name == wd.CHECK_IB_ANSWERS
+    assert not check.ok and not check.skipped
+    assert check.detail == ("Gateway is logged in but IBKR is not answering "
+                            "(positions request timed out after 20 s); it has "
+                            "lost its upstream connection.")
+
+
+def test_warning_two_one_one_zero_is_the_same_failure_said_out_loud():
+    """Gateway sometimes admits it: 2110, connectivity to the server is broken."""
+    check = wd._positions_answer(FakeIB([]), timeout=20,
+                                 codes=[wd.CODE_UPSTREAM_BROKEN])
+
+    assert not check.ok
+    assert check.code == wd.CODE_UPSTREAM_BROKEN
+    assert "lost its upstream connection" in check.detail
+
+
+def test_a_blip_that_mended_itself_is_not_reported_as_broken():
+    """2110 then 1102 is a connection that dropped and came back. Not news.
+
+    The IBC log for 2026-09-06 holds exactly this pair, a loss at 15:40 and a
+    restore three minutes later, so reading a lone 2110 would have paged Mo
+    about a Gateway that was working.
+    """
+    check = wd._positions_answer(
+        FakeIB(["one position"]), timeout=20,
+        codes=[wd.CODE_UPSTREAM_BROKEN, wd.CODE_UPSTREAM_RESTORED])
+
+    assert check.ok
+    assert "answered a positions request" in check.detail
+
+
+def test_a_connection_that_dropped_again_after_coming_back_is_broken():
+    """Whichever of the pair IBKR said last is the state now."""
+    check = wd._positions_answer(
+        FakeIB([]), timeout=20,
+        codes=[wd.CODE_UPSTREAM_BROKEN, wd.CODE_UPSTREAM_RESTORED,
+               wd.CODE_UPSTREAM_BROKEN])
+
+    assert not check.ok
+    assert check.code == wd.CODE_UPSTREAM_BROKEN
+
+
+def test_a_read_that_comes_back_passes_and_says_how_long_it_took():
+    check = wd._positions_answer(FakeIB(["one position"]), timeout=20, codes=[])
+
+    assert check.ok and not check.skipped
+    assert "Gateway answered a positions request in" in check.detail
+    assert "1 position." in check.detail
+
+
+def test_an_empty_account_still_counts_as_an_answer():
+    """No positions is a perfectly good answer. Silence is not."""
+    check = wd._positions_answer(FakeIB([]), timeout=20, codes=[])
+    assert check.ok
+    assert "0 positions." in check.detail
+
+
+# --------------------------------------- the fourth proof that a restart took
+
+def test_a_gateway_that_comes_back_and_still_cannot_answer_is_not_a_restart():
+    """The whole point. The outage of 2026-09-07 had all three local proofs."""
+    outcome, _ = try_restart(ALL_THREE, answers=False)
+
+    assert outcome.took is False
+    assert (outcome.new_pid, outcome.fresh_login, outcome.port_open) == (True, True, True)
+    assert outcome.answers is False
+    assert "IBKR answering a read: no" in outcome.detail
+
+
+def test_a_gateway_that_comes_back_and_answers_is_a_restart():
+    outcome, _ = try_restart(ALL_THREE, answers=True)
+
+    assert outcome.took is True
+    assert outcome.answers is True
+    assert "IBKR answering a read: yes" in outcome.detail
+
+
+def test_the_read_is_not_even_asked_while_the_first_three_are_missing():
+    """No point asking a Gateway that has not started whether it can answer."""
+    asked: list[int] = []
+    nothing = wd.GatewayProbe(pid=None, login_at=BEFORE_LOGIN, port_open=False)
+    outcome = wd.restart_gateway(
+        wait_seconds=10, poll_seconds=5,
+        probe=FakeProbe(BEFORE, nothing), launcher=lambda: (FakeHandle(None), "starting"),
+        sleep=lambda seconds: None,
+        answering=lambda: asked.append(1) or True)
+
+    assert outcome.took is False
+    assert asked == [], "nothing was there to ask"
+    assert outcome.answers is None
+    assert "not asked" in outcome.detail
+
+
+def test_the_did_not_take_message_carries_the_fourth_proof_too():
+    outcome, _ = try_restart(ALL_THREE, answers=False)
+    alert = wd.restart_did_not_take_alert(wd.CHECK_IB_ANSWERS, outcome)
+
+    assert alert.level == "error"
+    assert "IBKR answering a read: no" in alert.body
+    assert "What to do" in alert.body
+
+
+def test_a_stuck_gateway_is_stopped_before_a_new_one_is_started():
+    """Two logins fighting over one session is worse than the hang it fixes."""
+    order: list[str] = []
+    outcome = wd.restart_gateway(
+        wait_seconds=10, poll_seconds=5,
+        probe=FakeProbe(BEFORE, ALL_THREE),
+        launcher=lambda: order.append("start") or (FakeHandle(None), "starting"),
+        sleep=lambda seconds: None, stop_first=True,
+        stopper=lambda: order.append("stop") or (True, "the old Gateway was stopped"),
+        answering=lambda: True)
+
+    assert order == ["stop", "start"]
+    assert outcome.took is True
+
+
+def test_a_gateway_that_will_not_stop_is_never_started_on_top_of():
+    outcome = wd.restart_gateway(
+        wait_seconds=10, poll_seconds=5,
+        probe=FakeProbe(BEFORE, ALL_THREE),
+        launcher=lambda: (_ for _ in ()).throw(AssertionError("must not start")),
+        sleep=lambda seconds: None, stop_first=True,
+        stopper=lambda: (False, "stop_gateway.sh exited 1, the old Gateway is still there"),
+        answering=lambda: True)
+
+    assert outcome.took is False
+    assert "still there" in outcome.detail
+    assert "nothing was started" in outcome.detail
+
+
+def test_nothing_is_stopped_when_there_is_no_gateway_to_stop():
+    """A Gateway that is not running has nothing to stop, so the stop is skipped."""
+    stopped: list[int] = []
+    nothing_before = wd.GatewayProbe(pid=None, login_at=None, port_open=False)
+    outcome = wd.restart_gateway(
+        wait_seconds=10, poll_seconds=5,
+        probe=FakeProbe(nothing_before, ALL_THREE),
+        launcher=lambda: (FakeHandle(None), "starting"),
+        sleep=lambda seconds: None, stop_first=True,
+        stopper=lambda: stopped.append(1) or (True, "stopped"),
+        answering=lambda: True)
+
+    assert stopped == []
+    assert outcome.took is True
+
+
+def test_only_the_not_answering_path_stops_the_old_gateway_first(monkeypatch):
+    """A Gateway that is down has nothing to stop; one that is up and stuck does."""
+    catch_alerts(monkeypatch)
+    asked: list[bool] = []
+    monkeypatch.setattr(wd, "restart_gateway",
+                        lambda *a, **k: asked.append(k.get("stop_first")) or
+                        fake_outcome(True))
+
+    wd.perform(wd.decide_actions(gateway_down(), MID_MORNING, {"checks": {}}),
+               allow_restart=True)
+    wd.perform(wd.decide_actions(gateway_not_answering(), MID_MORNING, {"checks": {}}),
+               allow_restart=True)
+
+    assert asked == [False, True]
+
+
+# ------------------------------------------ not colliding with its own copy
+
+# WHY. At 09:40 on 2026-09-07 the watchdog could not connect at all: "Error 326
+# client id 250 already in use", because an earlier copy of itself was still
+# hung on the Gateway that had stopped answering. That is a watchdog problem
+# wearing a Gateway problem's clothes, and reporting it as ib_connect failing
+# would have been the second wrong alert of the morning.
+
+class FakeConnector:
+    """An IB Gateway that refuses the ids in taken and accepts anything else."""
+
+    def __init__(self, taken=(), how="code"):
+        self.taken = set(taken)
+        self.how = how
+        self.tried: list[int] = []
+        self.codes: list[int] = []
+
+    def connect(self, host, port, clientId, timeout, readonly):
+        self.tried.append(clientId)
+        if clientId not in self.taken:
+            return
+        if self.how == "code":
+            self.codes.append(wd.CODE_CLIENT_ID_IN_USE)
+            raise ConnectionError("Peer closed connection.")
+        raise ConnectionError(f"Peer closed connection. clientId {clientId} "
+                              "already in use?")
+
+
+def connect_with(taken=(), how="code"):
+    fake = FakeConnector(taken, how)
+    used, note, failures = wd._connect_read_only(fake, fake.codes, wd.CLIENT_ID)
+    return fake, used, note, failures
+
+
+def test_the_ordinary_run_uses_its_own_client_id_and_says_nothing_about_it():
+    fake, used, note, failures = connect_with()
+
+    assert used == wd.CLIENT_ID == 250
+    assert fake.tried == [250]
+    assert note == "" and failures == []
+
+
+def test_error_three_two_six_falls_through_to_the_spare_id():
+    fake, used, note, _ = connect_with(taken={wd.CLIENT_ID})
+
+    assert used == wd.SPARE_CLIENT_IDS[0]
+    assert fake.tried == [250, wd.SPARE_CLIENT_IDS[0]]
+    assert "already in use" in note
+    assert "earlier watchdog copy is still running" in note
+
+
+def test_a_closed_socket_that_only_says_already_in_use_counts_too():
+    """ib_async sometimes shows the collision as a dropped socket, not a code."""
+    fake, used, note, _ = connect_with(taken={wd.CLIENT_ID}, how="message")
+
+    assert used == wd.SPARE_CLIENT_IDS[0]
+    assert "spare id" in note
+
+
+def test_two_stuck_copies_still_leave_a_spare():
+    fake, used, _note, _ = connect_with(
+        taken={wd.CLIENT_ID, wd.SPARE_CLIENT_IDS[0]})
+
+    assert used == wd.SPARE_CLIENT_IDS[1]
+    assert fake.tried == [250, wd.SPARE_CLIENT_IDS[0], wd.SPARE_CLIENT_IDS[1]]
+
+
+def test_a_refusal_that_is_not_a_collision_is_not_retried():
+    """A Gateway that is genuinely not there is news, and one attempt says so."""
+    class Refuses(FakeConnector):
+        def connect(self, host, port, clientId, timeout, readonly):
+            self.tried.append(clientId)
+            raise ConnectionRefusedError("Connect call failed")
+
+    fake = Refuses()
+    used, note, failures = wd._connect_read_only(fake, fake.codes, wd.CLIENT_ID)
+
+    assert used is None
+    assert fake.tried == [250], "no point trying four ids on a Gateway that is not there"
+    assert note == ""
+    assert "Connect call failed" in failures[0]
+
+
+def test_the_spare_ids_belong_to_nobody_else():
+    assert wd.CLIENT_ID not in wd.SPARE_CLIENT_IDS
+    # The ids in use across this project today. A spare must never be one.
+    assert not set(wd.SPARE_CLIENT_IDS) & {99, 100, 201, 250, 251, 252, 260, 261, 282}
+    assert len(set(wd.SPARE_CLIENT_IDS)) == len(wd.SPARE_CLIENT_IDS)
+
+
+# ---------------------------------------------- the run cannot outlast itself
+
+class FakeClock:
+    """A clock that only moves when a test says so."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def quiet_checks(monkeypatch, clock=None, cost=0.0):
+    """Every real check replaced by an instant passing one, optionally costing time."""
+    def cheap(name, result=None):
+        def run(*args, **kwargs):
+            if clock is not None:
+                clock.advance(cost)
+            return result or wd.Check(name, ok=True, detail="fine")
+        return run
+
+    monkeypatch.setattr(wd, "check_gateway_process", cheap(wd.CHECK_GATEWAY_PROCESS))
+    monkeypatch.setattr(wd, "check_gateway_port", cheap(wd.CHECK_GATEWAY_PORT))
+    monkeypatch.setattr(wd, "check_ib",
+                        lambda **k: (wd.Check(wd.CHECK_IB_CONNECT, ok=True),
+                                     wd.Check(wd.CHECK_IB_ANSWERS, ok=True),
+                                     wd.Check(wd.CHECK_MARKET_DATA, ok=True)))
+    monkeypatch.setattr(wd, "check_loop_tick", cheap(wd.CHECK_LOOP_TICK))
+    monkeypatch.setattr(wd, "check_disk", cheap(wd.CHECK_DISK))
+    monkeypatch.setattr(wd, "check_time_zone", cheap(wd.CHECK_TIME_ZONE))
+
+
+def test_a_run_with_time_to_spare_asks_everything(monkeypatch):
+    clock = FakeClock()
+    quiet_checks(monkeypatch, clock, cost=1.0)
+
+    checks = wd.run_checks(MID_MORNING, wd.Schedule(),
+                           wd.Deadline(seconds=90, clock=clock))
+
+    assert set(checks) == set(wd.CHECK_ORDER)
+    assert not any(check.skipped for check in checks.values())
+
+
+def test_a_check_that_hangs_does_not_hold_the_run_past_the_deadline(monkeypatch):
+    """The first check eats the whole budget. The rest are skipped, not asked."""
+    clock = FakeClock()
+    quiet_checks(monkeypatch)
+    asked: list[str] = []
+
+    def hangs():
+        asked.append(wd.CHECK_GATEWAY_PROCESS)
+        clock.advance(400)                    # a check that went away for ages
+        return wd.Check(wd.CHECK_GATEWAY_PROCESS, ok=True, detail="eventually")
+
+    def never(*args, **kwargs):
+        asked.append("something after it")
+        return wd.Check(wd.CHECK_DISK, ok=True)
+
+    monkeypatch.setattr(wd, "check_gateway_process", hangs)
+    monkeypatch.setattr(wd, "check_disk", never)
+    monkeypatch.setattr(wd, "check_ib",
+                        lambda **k: asked.append("ib") or (None, None, None))
+
+    checks = wd.run_checks(MID_MORNING, wd.Schedule(),
+                           wd.Deadline(seconds=90, clock=clock))
+
+    assert asked == [wd.CHECK_GATEWAY_PROCESS], "nothing after the hang was asked"
+    assert set(checks) == set(wd.CHECK_ORDER), "the run still reports on all eight"
+    assert checks[wd.CHECK_GATEWAY_PROCESS].ok
+    for name in wd.CHECK_ORDER[1:]:
+        assert checks[name].skipped, f"{name} should have been skipped"
+        assert "ran out of time" in checks[name].detail
+
+
+def test_a_run_that_ran_out_of_time_says_nothing_and_forgets_nothing_it_should(monkeypatch):
+    """Skipped is nobody looked, so it raises no alert and starts no Gateway."""
+    clock = FakeClock()
+    quiet_checks(monkeypatch)
+    monkeypatch.setattr(wd, "check_gateway_process",
+                        lambda: clock.advance(400) or
+                        wd.Check(wd.CHECK_GATEWAY_PROCESS, ok=True))
+
+    checks = wd.run_checks(MID_MORNING, wd.Schedule(),
+                           wd.Deadline(seconds=90, clock=clock))
+    actions = wd.decide_actions(checks, MID_MORNING, {"checks": {}})
+
+    assert actions == []
+
+
+def test_ninety_seconds_is_the_budget_and_it_fits_inside_the_wake_up():
+    assert wd.RUN_DEADLINE_SECONDS == 90
+    # 90 for the checks, 60 to stop a stuck Gateway, 120 to prove the new one.
+    # launchd wakes this every 300 seconds, and 270 is less than 300.
+    total = (wd.RUN_DEADLINE_SECONDS + wd.STOP_TIMEOUT_SECONDS
+             + wd.RESTART_VERIFY_SECONDS)
+    assert total < 300
+
+
+def test_the_deadline_reports_how_much_of_the_budget_went(monkeypatch):
+    clock = FakeClock()
+    deadline = wd.Deadline(seconds=90, clock=clock)
+    assert not deadline.expired() and deadline.remaining() == 90
+
+    clock.advance(30)
+    assert deadline.remaining() == 60
+    clock.advance(70)
+    assert deadline.expired() and deadline.remaining() == 0
+
+    skipped = deadline.out_of_time(wd.CHECK_DISK)
+    assert skipped.skipped and skipped.ok
+    assert "ran out of time after 100 seconds" in skipped.detail
+
+
+# ------------------------------------------------ a closed Monday is closed
+
+# WHY. 2026-09-07 is Labor Day. The market was shut all day, SPY quotes were
+# delayed because there were no live quotes to have, and market_data reported a
+# miss every five minutes from the open to the close. A holiday has to be as
+# quiet as a Saturday.
+
+LABOR_DAY = datetime(2026, 9, 7, 11, 0, tzinfo=wd.EASTERN)      # a Monday, shut
+
+
+def holiday_schedule() -> wd.Schedule:
+    return wd.Schedule(holidays=("2026-09-07", "2026-11-26", "2026-12-25"))
+
+
+def test_a_market_holiday_is_not_a_trading_day():
+    schedule = holiday_schedule()
+    assert wd.is_trading_day(LABOR_DAY, schedule) is False
+    assert wd.in_market_hours(LABOR_DAY, schedule) is False
+
+
+def test_the_tuesday_after_the_holiday_is_a_trading_day():
+    schedule = holiday_schedule()
+    tuesday = datetime(2026, 9, 8, 11, 0, tzinfo=wd.EASTERN)
+    assert wd.is_trading_day(tuesday, schedule) is True
+    assert wd.in_market_hours(tuesday, schedule) is True
+
+
+def test_a_holiday_at_eleven_in_the_morning_skips_the_quotes_and_the_heartbeat(monkeypatch):
+    """The two checks that only make sense while the market is open."""
+    asked: list[bool] = []
+    monkeypatch.setattr(wd, "check_gateway_process",
+                        lambda: wd.Check(wd.CHECK_GATEWAY_PROCESS, ok=True))
+    monkeypatch.setattr(wd, "check_gateway_port",
+                        lambda *a, **k: wd.Check(wd.CHECK_GATEWAY_PORT, ok=True))
+    monkeypatch.setattr(wd, "check_disk", lambda *a, **k: wd.Check(wd.CHECK_DISK, ok=True))
+    monkeypatch.setattr(wd, "check_time_zone",
+                        lambda *a, **k: wd.Check(wd.CHECK_TIME_ZONE, ok=True))
+
+    def fake_ib(port_ok, market_hours=True, **kwargs):
+        asked.append(market_hours)
+        return (wd.Check(wd.CHECK_IB_CONNECT, ok=True),
+                wd.Check(wd.CHECK_IB_ANSWERS, ok=True),
+                wd.Check(wd.CHECK_MARKET_DATA, ok=True, skipped=True,
+                         detail="not checked, the market is shut"))
+
+    monkeypatch.setattr(wd, "check_ib", fake_ib)
+    checks = wd.run_checks(LABOR_DAY, holiday_schedule())
+
+    assert asked == [False], "the quote feed was asked about as if the market were open"
+    assert checks[wd.CHECK_MARKET_DATA].skipped
+    assert checks[wd.CHECK_LOOP_TICK].skipped
+    assert "market is shut" in checks[wd.CHECK_LOOP_TICK].detail
+    # The Gateway checks still run. A holiday is no reason to stop watching it.
+    assert not checks[wd.CHECK_GATEWAY_PROCESS].skipped
+    assert not checks[wd.CHECK_IB_ANSWERS].skipped
+
+
+def test_a_holiday_says_nothing_all_day():
+    """The whole of Labor Day, five minutes at a time, in silence."""
+    schedule = holiday_schedule()
+    checks = healthy()
+    checks[wd.CHECK_MARKET_DATA] = wd.Check(
+        wd.CHECK_MARKET_DATA, ok=True, skipped=True,
+        detail="not checked, the market is shut")
+    checks[wd.CHECK_LOOP_TICK] = wd.Check(
+        wd.CHECK_LOOP_TICK, ok=True, skipped=True,
+        detail="not checked, the market is shut")
+
+    state: dict = {"checks": {}}
+    now = LABOR_DAY
+    said = 0
+    for _ in range(72):
+        assert wd.in_market_hours(now, schedule) is False
+        actions, state = step(checks, now, state)
+        said += len(actions)
+        now += timedelta(minutes=5)
+    assert said == 0
+
+
+def test_the_holidays_are_read_off_the_real_config_file():
+    """Whatever config/guardrails.yaml says, the watchdog reads the same list."""
+    schedule = wd.load_schedule()
+    assert "2026-09-07" in schedule.holidays, (
+        "Labor Day 2026 is missing from schedule.holidays in config/guardrails.yaml")
+    assert all(isinstance(day, str) for day in schedule.holidays)

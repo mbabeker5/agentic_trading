@@ -220,6 +220,12 @@ CODE_UPSTREAM_BROKEN = 2110       # "Connectivity between Trader Workstation and
                                   # cut off from IBKR at the same time, which is
                                   # the exact state that fooled every check on
                                   # the night of 2026-09-06 into 2026-09-07.
+CODE_UPSTREAM_RESTORED = 1102     # "Connectivity has been restored." The other
+                                  # half of the pair, and the reason 2110 is not
+                                  # read on its own: the IBC log for 2026-09-06
+                                  # has a connectivity loss at 15:40 and this
+                                  # three minutes later, and a blip that mended
+                                  # itself must not page anybody.
 
 #: The three codes that all mean the same thing: no real time quotes for us.
 #: IBKR picks between them depending on what it was last asked for, so all three
@@ -946,10 +952,18 @@ def _positions_answer(ib, timeout: int = ANSWER_TIMEOUT_SECONDS,
       asyncio.TimeoutError once ib.RequestTimeout is set, and that setting also
       caps everything else asked on this connection.
     * IBKR says warning 2110, "Connectivity between Trader Workstation and
-      server is broken", which is Gateway admitting it up front.
+      server is broken", which is Gateway admitting it up front. That one
+      arrives with the handshake rather than with the read, which is why every
+      message seen on this connection counts and not only the ones that turned
+      up while the read was outstanding. The list is made fresh per connection,
+      so there is nothing stale in it.
+
+      2110 is read together with its opposite, 1102, "connectivity has been
+      restored". Whichever of the two IBKR said last is the state now. Without
+      that, a blip that mended itself in three minutes would page Mo, and the
+      IBC log for 2026-09-06 has exactly such a pair in it.
     """
     seen = codes if codes is not None else []
-    before = len(seen)
     started = time.monotonic()
     try:
         positions = ib.reqPositions()
@@ -963,7 +977,9 @@ def _positions_answer(ib, timeout: int = ANSWER_TIMEOUT_SECONDS,
                              f"({reason}); it has lost its upstream connection."))
     took = time.monotonic() - started
 
-    if CODE_UPSTREAM_BROKEN in seen[before:]:
+    upstream = [c for c in seen
+                if c in (CODE_UPSTREAM_BROKEN, CODE_UPSTREAM_RESTORED)]
+    if upstream and upstream[-1] == CODE_UPSTREAM_BROKEN:
         return Check(CHECK_IB_ANSWERS, ok=False, code=CODE_UPSTREAM_BROKEN,
                      detail=("Gateway is logged in but IBKR is not answering "
                              f"(IBKR warning {CODE_UPSTREAM_BROKEN}, connectivity "
