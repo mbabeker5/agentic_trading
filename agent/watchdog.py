@@ -969,12 +969,16 @@ def _positions_answer(ib, timeout: int = ANSWER_TIMEOUT_SECONDS,
         positions = ib.reqPositions()
     except Exception as exc:                                      # noqa: BLE001
         took = time.monotonic() - started
-        reason = (f"positions request timed out after {timeout} s"
-                  if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
-                  else f"the positions request failed after {took:.0f} s: {exc}")
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return Check(CHECK_IB_ANSWERS, ok=False,
+                         detail=("Gateway is logged in but IBKR is not answering "
+                                 f"(positions request timed out after {timeout} s); "
+                                 "it has lost its upstream connection."))
+        # Something else went wrong. Still a miss, because a read that raises is
+        # a read nobody got, but the cause is not ours to name.
         return Check(CHECK_IB_ANSWERS, ok=False,
-                     detail=(f"Gateway is logged in but IBKR is not answering "
-                             f"({reason}); it has lost its upstream connection."))
+                     detail=("Gateway is logged in and the positions request "
+                             f"failed after {took:.0f} s: {exc}"))
     took = time.monotonic() - started
 
     upstream = [c for c in seen

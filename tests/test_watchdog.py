@@ -1369,3 +1369,13 @@ def test_the_holidays_are_read_off_the_real_config_file():
     assert "2026-09-07" in schedule.holidays, (
         "Labor Day 2026 is missing from schedule.holidays in config/guardrails.yaml")
     assert all(isinstance(day, str) for day in schedule.holidays)
+
+
+def test_a_read_that_fails_some_other_way_is_a_miss_without_a_diagnosis():
+    """A read that raises is a read nobody got, but the cause is not ours to name."""
+    check = wd._positions_answer(FakeIB(ConnectionError("Socket disconnect")),
+                                 timeout=20, codes=[])
+
+    assert not check.ok
+    assert "Socket disconnect" in check.detail
+    assert "lost its upstream connection" not in check.detail
