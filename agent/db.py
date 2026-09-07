@@ -664,21 +664,32 @@ def record_order(ts: Any = None, book_id: str | None = None,
 
 def update_order_status(order_id: int, status: str,
                         broker_order_id: Any = None,
+                        oca_group: str | None = None,
                         conn: sqlite3.Connection | None = None) -> bool:
     """Move an order on: submitted, filled, cancelled, rejected.
 
     An order table that can only ever say "sent" is not worth having, so this
-    is the one update helper in the file. broker_order_id is here too because
-    the broker's own id often arrives a moment after the row was written.
+    is the one update helper in the file. broker_order_id and oca_group are here
+    too because both are the broker's own names for the order and neither exists
+    until it answers. Since 2026-09-06 the loop writes the order row BEFORE it
+    sends, so that the row can carry the decision that caused it, and these two
+    are written in from the answer a moment later.
+
+    A field left out is left alone rather than blanked, so moving an order from
+    submitted to filled cannot lose the ids written when it was sent.
     """
+    columns = ["status=?"]
+    values: list[Any] = [str(status)]
+    if broker_order_id is not None:
+        columns.append("broker_order_id=?")
+        values.append(str(broker_order_id))
+    if oca_group is not None:
+        columns.append("oca_group=?")
+        values.append(str(oca_group))
     with _guarded("an order status") as box:
         with transaction(conn) as db:
-            if broker_order_id is None:
-                db.execute("UPDATE orders SET status=? WHERE id=?",
-                           (str(status), int(order_id)))
-            else:
-                db.execute("UPDATE orders SET status=?, broker_order_id=? WHERE id=?",
-                           (str(status), str(broker_order_id), int(order_id)))
+            db.execute(f"UPDATE orders SET {', '.join(columns)} WHERE id=?",
+                       (*values, int(order_id)))
             box.append(True)
     return bool(box)
 

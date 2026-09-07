@@ -239,6 +239,39 @@ def test_a_trade_row_is_the_twenty_columns_the_sheet_expects(seeded):
     ]
 
 
+def test_a_trade_row_takes_its_reason_model_cost_and_hash_from_the_decision(seeded):
+    """Item 14. Four of the twenty columns reach the sheet through one join.
+
+    db.trades_for_date walks fills to orders to decisions, and the middle link is
+    orders.decision_id. Nothing in agent/loop.py ever set it until 2026-09-06, so
+    the join matched nothing and all four of these columns were blank on every
+    trade row the nightly sync wrote. A month of results that cannot be read
+    against the model that produced it or the price it cost is the whole cost of
+    a NULL in one column.
+    """
+    linked = sync_sheet.trades_rows()[0]
+    assert linked[11] == "broke the opening range on 3.1x volume"    # L Reason
+    assert linked[15] == "openrouter/anthropic/claude-fable-5.1"     # P Model
+    assert linked[16] == pytest.approx(0.0184)                       # Q Model Cost USD
+    assert linked[17] == "9f2c1a"                                    # R Prompt Hash
+
+    # And an order with no decision on it, which is what every order row in the
+    # database looked like before the fix. The row is still written, honestly
+    # blank, rather than carrying a made up model or a made up cost.
+    orphan = db.record_order(ts="2026-09-08 10:05:00", book_id="A",
+                             order_ref="BOOK_A", broker_order_id=99002,
+                             symbol="MSFT", side="BUY", qty=10, order_type="MKT",
+                             tif="DAY", purpose="entry", status="filled")
+    db.record_fill(ts="2026-09-08 10:05:02", order_id=orphan, exec_id="0002.abc",
+                   symbol="MSFT", side="BUY", qty=10, price=500.0)
+
+    blank = [row for row in sync_sheet.trades_rows() if row[2] == "MSFT"][0]
+    assert [blank[11], blank[15], blank[16], blank[17]] == ["", "", "", ""]
+    assert blank[2] == "MSFT" and blank[4] == 10, (
+        "the trade itself still lands, so a missing decision loses the reason "
+        "rather than the fill")
+
+
 def test_the_book_column_lands_in_column_o_where_every_formula_looks_for_it():
     """The Books tab slices Trades by column O. One column out and every
     per book figure in the sheet silently becomes zero."""

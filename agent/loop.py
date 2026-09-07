@@ -1589,7 +1589,7 @@ class BookTick:
 
     def record(self, state: bs.BookState, symbol: str, decision: str, rationale: str,
                model: str | None = None, cost: Any = None,
-               prompt_hash: str = "") -> None:
+               prompt_hash: str = "") -> int | None:
         """Write one judgement to the book's file, the database and the Sheet.
 
         The database first, because it is the system of record and it is a file
@@ -1597,20 +1597,31 @@ class BookTick:
         is a nightly view of the database rather than the truth. See
         docs/DATA.md. The Sheet write stays until ledger/sync_sheet.py takes
         that job over.
+
+        RETURNS THE DECISIONS ROW ID, and that is what closes backlog item 14.
+        An order row that does not carry the id of the judgement behind it leaves
+        db.trades_for_date's join to decisions finding nothing, so every trade
+        row the nightly Sheet sync writes came out with a blank model, blank
+        cost, blank prompt hash and blank reason: a month of results that could
+        not be read against the model that produced it or the price it cost.
+        Comes back None when the database could not be written to, which the
+        caller passes on as no link rather than as a failure.
         """
         state.note_decision(self.now.isoformat(), symbol, decision, rationale,
                             phase=self.phase, rules_commit=self.rules)
-        db_call("record_decision", ts=self.now, book_id=self.book.book_id,
-                shape=self.phase, rules_commit=self.rules, symbol=symbol or None,
-                action=decision, rationale=rationale, prompt_hash=prompt_hash or None,
-                model=model if model is not None else (self.book.model or "none"),
-                cost_usd=(None if cost is None else _number(cost)))
+        decision_id = db_call(
+            "record_decision", ts=self.now, book_id=self.book.book_id,
+            shape=self.phase, rules_commit=self.rules, symbol=symbol or None,
+            action=decision, rationale=rationale, prompt_hash=prompt_hash or None,
+            model=model if model is not None else (self.book.model or "none"),
+            cost_usd=(None if cost is None else _number(cost)))
         ledger_writer.log_decision(
             self.now, symbol, decision, f"{rationale} [rules {self.rules}]",
             mode=str(self.book.mode), book_id=self.book.book_id,
             model=model if model is not None else (self.book.model or "none"),
             model_cost_usd=cost, prompt_hash=prompt_hash,
             dry_run=not self.write_ledger)
+        return decision_id
 
     def alert(self, level: str, title: str, body: str, key: str,
               quiet_minutes: int = ALERT_QUIET_MINUTES) -> list[str] | None:
@@ -1859,14 +1870,20 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
                     if decision.rule_ids else ""))
         if decision.allowed:
             tick.say("  nothing was sent to the broker: " + "; ".join(shut))
-        tick.record(state, intent.symbol, f"would place {summary}",
-                    f"{verdict}. {because}", model=model, cost=cost,
-                    prompt_hash=prompt_hash)
+        decision_id = tick.record(
+            state, intent.symbol, f"would place {summary}",
+            f"{verdict}. {because}", model=model, cost=cost,
+            prompt_hash=prompt_hash)
         # The order that was not sent is written down too. A month of the orders
         # a dry run would have sent is the whole of what a dry run is for, and
         # it is worthless if it only lives in a log file. See docs/DATA.md.
+        #
+        # The judgement above is written first and its id comes down here with
+        # it (item 14), because an order row with no decision on it is a row
+        # nobody can read the model, the cost or the reason off afterwards.
         record_order_row(tick, guard, intent, stop=stop,
-                         status=("refused" if not decision.allowed else "dry_run"))
+                         status=("refused" if not decision.allowed else "dry_run"),
+                         decision_id=decision_id)
         for rule_id, reason in zip(decision.rule_ids, decision.reasons):
             tick.rule(rule_id, f"{intent.symbol}: {reason}", "the order was not placed")
         alert_on_caps(tick, intent, decision)
@@ -1874,11 +1891,20 @@ def consider(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
 
     # Not reachable today. All four locks would have to be open at once, and the
     # first of them needs a book promoted by hand with the hub's approval on it.
-    result = submit(tick, state, intent, broker, guard, stop=stop, target=target)
-    tick.record(state, intent.symbol, f"placed {summary}",
-                f"{verdict}. {because}. The broker confirmed by "
-                f"{result.get('confirmed_by')}",
-                model=model, cost=cost, prompt_hash=prompt_hash)
+    #
+    # THE JUDGEMENT IS WRITTEN BEFORE THE ORDER GOES OUT, and that is item 14.
+    # submit() writes the order row before it sends, so the row can carry the
+    # decision that caused it, and a decision written after the broker answered
+    # could not be pointed at. It is also the honest order of the two: the book
+    # decides, and then the order goes. What the broker made of it lands on the
+    # order row a moment later, as its status and its two broker side ids.
+    decision_id = tick.record(state, intent.symbol, f"placed {summary}",
+                              f"{verdict}. {because}",
+                              model=model, cost=cost, prompt_hash=prompt_hash)
+    result = submit(tick, state, intent, broker, guard, stop=stop, target=target,
+                    decision_id=decision_id)
+    tick.say(f"  the broker confirmed it by "
+             f"{result.get('confirmed_by') or 'neither open orders nor executions'}")
     return decision
 
 
@@ -1919,13 +1945,22 @@ def alert_on_caps(tick: BookTick, intent: gr.OrderIntent,
 def record_order_row(tick: BookTick, guard: gr.Guardrails, intent: gr.OrderIntent,
                      stop: float = 0.0, status: str = "dry_run",
                      broker_order_id: Any = None,
-                     oca_group: str | None = None) -> int | None:
+                     oca_group: str | None = None,
+                     decision_id: int | None = None) -> int | None:
     """One order into the database, sent or only worked out. Returns its row id.
 
     Written in dry run too, and that is the point rather than an oversight: all
     five books are on dry run, so the orders they did not send are the entire
     result so far. status says which this was, one of dry_run, refused,
     submitted, filled, cancelled or rejected.
+
+    decision_id is the decisions row this order came out of, and it is the whole
+    of backlog item 14. Nothing passed it until 2026-09-06, so the column was
+    NULL on every row ever written, db.trades_for_date's join to decisions
+    matched nothing, and the Trades tab of the Google Sheet carried a blank
+    model, cost, prompt hash and reason against every fill. Both callers have
+    the id before they get here: the dry run path writes the judgement first and
+    the live path writes it before the order is sent.
     """
     return db_call(
         "record_order", ts=tick.now, book_id=tick.book.book_id,
@@ -1934,7 +1969,8 @@ def record_order_row(tick: BookTick, guard: gr.Guardrails, intent: gr.OrderInten
         qty=int(intent.qty),
         order_type=("LMT" if intent.limit_price else "MKT"),
         limit_price=intent.limit_price, stop_price=(_number(stop) or None),
-        tif="DAY", purpose=intent.purpose, status=status)
+        tif="DAY", purpose=intent.purpose, status=status,
+        decision_id=decision_id)
 
 
 def order_dict(intent: gr.OrderIntent) -> dict:
@@ -2045,7 +2081,7 @@ def resting_stop_id(state: bs.BookState, symbol: str) -> str | None:
 
 def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
            broker: broker_mod.Broker, guard: gr.Guardrails, stop: float = 0.0,
-           target: float = 0.0) -> dict:
+           target: float = 0.0, decision_id: int | None = None) -> dict:
     """Send one order to the broker and write down what actually came back.
 
     An entry goes out as a bracket, so its stop rests at IBKR instead of only in
@@ -2058,12 +2094,30 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     execution id, so an order that filled instantly and one that fills at 10:20
     are handled by the same code.
 
+    THE ORDER ROW IS WRITTEN BEFORE THE ORDER IS SENT, since 2026-09-06, and
+    that is backlog item 14. It used to be written afterwards, out of what the
+    broker handed back, which meant it could not carry the id of the decision
+    that caused it: the judgement was only written after this function returned.
+    So orders.decision_id was NULL on every row, db.trades_for_date's join found
+    nothing, and every trade row in the nightly Sheet had a blank model, cost,
+    prompt hash and reason. Writing the row first fixes that, and it costs
+    nothing: the broker's own order id and one-cancels-the-other group are the
+    only two things on the row that are not known yet, and both are written in
+    below the moment the answer arrives. It is the safer order as well. An order
+    that reached IBKR and then lost this process is now on the record instead of
+    missing from it.
+
     Nothing reaches this today. It exists so the live path is real, visible code
     with its locks on it rather than something to be invented in a hurry later.
     """
     contract = contract_for({"symbol": intent.symbol})
     order = order_dict(intent)
     ref = guard.order_ref or tick.tag
+
+    # Before the send, so it can point at the judgement behind it. The row id
+    # comes back so a fill can point at the order that made it.
+    row_id = record_order_row(tick, guard, intent, stop=stop, status="submitted",
+                              decision_id=decision_id)
 
     stop_order, target_order = child_orders(intent, stop, target)
     if intent.purpose == "entry" and stop_order is not None:
@@ -2078,13 +2132,14 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     filled = _number(result.get("filled_qty"))
     price = _number(result.get("avg_fill_price"))
 
-    # The order itself, into the database, with whatever the broker called it.
-    # The row id comes back so a fill can point at the order that made it.
-    row_id = record_order_row(
-        tick, guard, intent, stop=stop, broker_order_id=result.get("order_id"),
-        oca_group=result.get("oca_group"),
-        status=("filled" if filled > 0 else
-                "submitted" if result.get("working") else "rejected"))
+    # What the broker made of it, onto the row written above: the two names it
+    # gave the order, and where the order now stands.
+    if row_id:
+        db_call("update_order_status", int(row_id),
+                ("filled" if filled > 0 else
+                 "submitted" if result.get("working") else "rejected"),
+                broker_order_id=result.get("order_id"),
+                oca_group=result.get("oca_group"))
 
     if filled > 0:
         tick.say(f"the broker says {filled:g} {intent.symbol} filled at "

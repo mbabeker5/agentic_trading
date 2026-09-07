@@ -126,6 +126,19 @@ to BOOK_E, which is what makes a fill traceable back to the book that asked for
 it once five books share one account, plus the parent order and OCA group that
 hold a bracket together.
 
+`decision_id` is the row's link back to the judgement it came out of, and it is
+the one column here worth its own paragraph. Nothing in `agent/loop.py` set it
+until 2026-09-06, so it was NULL on every row ever written, the join in
+`db.trades_for_date` from fills to orders to decisions matched nothing, and every
+trade row the nightly Sheet sync produced carried a blank model, a blank cost, a
+blank prompt hash and a blank reason. Both writers now have the id before they
+need it. A dry run writes the judgement first and the order second. The live path
+writes the judgement, then writes the order row BEFORE it sends, and fills in the
+broker's own order id, its one-cancels-the-other group and the final status from
+the answer a moment later. Writing the row first is also the safer order: an
+order that reached IBKR and then lost this process is on the record rather than
+missing from it. That was backlog item 14.
+
 **fills.** One row per execution. IBKR's own execution id is unique in this
 table, which is what stops the same fill being counted twice when the reconciler
 reads the day's executions again after a restart. Slippage in dollars and in
@@ -210,7 +223,7 @@ What each of them writes:
 |---|---|---|
 | `agent/loop.py` | `ticks` | one row per book per tick, whether or not anything happened |
 | `agent/loop.py` | `decisions` | every judgement, and every guardrail firing as a row marked `rejected` with the rule's own id in `reject_reason` |
-| `agent/loop.py` | `orders` | every order sent, and every order a dry run only worked out |
+| `agent/loop.py` | `orders` | every order sent, and every order a dry run only worked out, each carrying `decision_id`, the judgement it came out of. The live path writes the row before it sends and updates the broker's own ids and the status from the answer |
 | `agent/loop.py` | `fills` | every execution read back off the broker, deduplicated on IBKR's own execution id. Nothing on `dry_run`: there is no execution to read, so this table is empty until a book is promoted |
 | `agent/loop.py` | `position_snapshots` | what each book held at each tick, with the stop and the target on it. A book holding nothing writes no row, so the snapshot for a flat book is the absence of one |
 | `agent/loop.py` | `day_trade_counters` | one row per book per day, written from the check itself rather than at the close, because `would_have_blocked` is added to each time the rule bit and that running total is what says what the limit costs |

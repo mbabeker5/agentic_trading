@@ -17,6 +17,7 @@ Nothing here touches a broker, a network or the real database.
 """
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import sys
 from datetime import date, datetime
@@ -157,6 +158,163 @@ def test_an_order_nobody_sent_is_written_down_anyway(database):
     assert row["stop_price"] == pytest.approx(48.5)
     assert row["purpose"] == "entry"
     assert row["status"] == "dry_run"
+
+
+def test_an_order_points_at_the_judgement_that_caused_it(database):
+    """Item 14. The column was NULL on every order row ever written.
+
+    A dry run writes the judgement first and the order second, so the id is
+    there to be passed. Nothing passed it until 2026-09-06.
+    """
+    tick = tick_for("A")
+    tick.phase = "pick"
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    guard = gr.load_book_guardrails(BOOKS_YAML, "A")
+    intent = gr.OrderIntent(symbol="AAPL", side="BUY", qty=40, limit_price=231.20,
+                            purpose="entry", book_id="A", sector="Technology")
+
+    decision_id = tick.record(state, "AAPL", "would place BUY 40 AAPL limit 231.20",
+                              "allowed by the guardrails. no limit was breached",
+                              model="claude-fable-5.1", cost=0.0184,
+                              prompt_hash="9f2c1a")
+    assert decision_id, "the decisions row id is what the order row has to carry"
+    loop.record_order_row(tick, guard, intent, stop=228.0, status="dry_run",
+                          decision_id=decision_id)
+
+    row = rows(database, "SELECT * FROM orders")[0]
+    assert row["decision_id"] == decision_id
+
+
+# ---------------------------------------------------------------------------
+# From a trade back to the judgement that caused it (item 14)
+# ---------------------------------------------------------------------------
+
+
+class Filling:
+    """A broker that takes one order and then reports one execution for it.
+
+    Nothing leaves this object. fill() is a separate step on purpose, because
+    that is what really happens to a limit order: it goes out, it rests, and the
+    execution turns up on a later look rather than in the reply.
+    """
+
+    def __init__(self, order_id: int = 7001):
+        self.order_id = order_id
+        self.placed: list[dict] = []
+        self._executions: list[dict] = []
+
+    # -- reading ----------------------------------------------------------
+
+    def account_summary(self, account=None):
+        return {"items": [{"tag": "NetLiquidation", "value": "100000"}]}
+
+    def portfolio(self, account=None, include_pnl=True):
+        return {"positions": [], "totals": {}, "notes": []}
+
+    def open_orders(self, account=None, include_all=True):
+        return {"orders": [], "notes": []}
+
+    def executions(self, account=None, **kwargs):
+        return {"executions": list(self._executions), "notes": []}
+
+    def snapshot(self, contracts, market_data_type=3):
+        return {"market_data_type": market_data_type,
+                "snapshots": [{"symbol": c.get("symbol"), "last": 231.25,
+                               "close": 231.25, "halted": 0} for c in contracts],
+                "notes": []}
+
+    def historical_bars(self, contract, duration, bar_size, **kwargs):
+        return {"bars": [], "notes": []}
+
+    # -- acting -----------------------------------------------------------
+
+    def place_order(self, contract, order, order_ref):
+        self.placed.append({"contract": contract, "order": dict(order),
+                            "order_ref": order_ref})
+        return {"sent": True, "order_id": self.order_id, "filled_qty": 0.0,
+                "avg_fill_price": None, "working": True, "error": None,
+                "confirmed_by": "open_orders"}
+
+    def bracket_order(self, contract, entry, stop, target=None, order_ref=""):
+        answer = self.place_order(contract, entry, order_ref)
+        answer["legs"] = []
+        answer["bracketed"] = True
+        answer["oca_group"] = "BOOK_A-AAPL-1"
+        return answer
+
+    def cancel_order(self, order_id):
+        return {"order_id": order_id, "cancelled": True, "still_working": False}
+
+    def global_cancel(self):
+        raise AssertionError("no test here cancels everything")
+
+    def fill(self, symbol: str = "AAPL", shares: int = 40, price: float = 231.25):
+        self._executions.append({
+            "execId": "0001.abc", "orderId": self.order_id, "orderRef": "BOOK_A",
+            "symbol": symbol, "side": "BOT", "shares": shares, "price": price,
+            "commission": 1.0, "time": "2026-09-08 09:38:11"})
+
+
+def test_a_trade_row_carries_the_model_the_cost_and_the_reason_behind_it(
+        database, tmp_path, monkeypatch):
+    """Item 14, the whole chain: a fake fill back to the judgement that caused it.
+
+    The fill points at its order, the order points at its decision, and
+    db.trades_for_date joins the three. Until 2026-09-06 the middle link was
+    missing, so every trade row the nightly Sheet sync wrote came out with a
+    blank model, a blank cost, a blank prompt hash and a blank reason, and a
+    month of results could not be read against the model that produced it or the
+    price it cost.
+    """
+    for name in ("config", "strategies", "agent", "venv312"):
+        (tmp_path / name).symlink_to(REPO / name)
+    (tmp_path / "output").mkdir(exist_ok=True)
+    monkeypatch.setenv(loop.ROOT_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+
+    book = dataclasses.replace(gr.load_book(BOOKS_YAML, "A"), mode="full")
+    tick = loop.BookTick(book, at(9, 35), "testhash", write_ledger=False, quiet=True)
+    tick.phase = "pick"
+    guard = gr.load_book_guardrails(BOOKS_YAML, "A")
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000, root=tmp_path)
+    state.triggered["AAPL"] = {"at": "2026-09-08 09:35:02", "price": 231.10,
+                               "stop": 228.0, "qty": 40}
+    intent = gr.OrderIntent(symbol="AAPL", side="BUY", qty=40, limit_price=231.20,
+                            purpose="entry", book_id="A", sector="Technology")
+    account_state = bs.account_state_for(state, gr, at(9, 35), "DUT077572", False)
+    broker = Filling()
+
+    answer = loop.consider(tick, state, guard, account_state, intent, broker,
+                           loop.read_guards(tmp_path),
+                           model="claude-fable-5.1", cost=0.0184,
+                           prompt_hash="9f2c1a", stop=228.0)
+    assert answer.allowed, f"the guardrails refused it: {answer.reasons}"
+    assert tick.sent == 1
+
+    # The order row exists before the broker answers now, and the broker's own
+    # two names for it are written in afterwards.
+    order = rows(database, "SELECT * FROM orders")[0]
+    assert order["decision_id"] is not None
+    assert order["broker_order_id"] == "7001"
+    assert order["oca_group"] == "BOOK_A-AAPL-1"
+    assert order["status"] == "submitted"
+
+    # The fill turns up on a later look, which is what a resting limit order does.
+    broker.fill()
+    assert loop.ingest_fills(tick, state, guard, broker)
+
+    trades = db.trades_for_date(TUESDAY)
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade["symbol"] == "AAPL"
+    assert trade["book_id"] == "A"
+    assert trade["model"] == "claude-fable-5.1"
+    assert trade["cost_usd"] == pytest.approx(0.0184)
+    assert trade["prompt_hash"] == "9f2c1a"
+    assert trade["rationale"] == ("allowed by the guardrails. no limit was breached"), (
+        "the Reason column of the Trades tab comes from the decision's rationale")
+    assert trade["decision_ts"] is not None
+    assert trade["purpose"] == "entry"
 
 
 def test_what_a_book_was_holding_is_snapshotted_with_its_stop(database):
