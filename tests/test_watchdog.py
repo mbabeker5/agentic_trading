@@ -660,3 +660,103 @@ def test_the_restart_did_not_take_message_says_which_of_the_three_failed():
     assert f"port {wd.GATEWAY_PORT} accepting connections: no" in alert.body
     assert "120 seconds" in alert.body
     assert "What to do" in alert.body
+
+
+# ------------------------------------------------------- the time zone check
+
+# WHY THIS CHECK EXISTS. launchd fires a job on the Mac's own clock and nothing
+# in a plist can pin a time zone. On the night of 2026-09-06 this Mac relinked
+# /etc/localtime to America/Los_Angeles by itself, because macOS is set to pick
+# the zone from the current location, and all nine jobs quietly became three
+# hours late. Automatic zone selection is still on, so the watchdog asks this
+# every run rather than trusting a note in the docs.
+
+def _stub_verdict(monkeypatch, verdict):
+    monkeypatch.setattr(wd.timezone_check, "check",
+                        lambda *args, **kwargs: verdict)
+
+
+def test_the_time_zone_check_passes_when_the_stamp_matches_the_mac(monkeypatch):
+    _stub_verdict(monkeypatch, wd.timezone_check.Verdict(
+        True, "this Mac is in America/Los_Angeles, -180 minutes from New York",
+        system_zone="America/Los_Angeles", current_shift=-180,
+        stamped_shift=-180))
+
+    check = wd.check_time_zone()
+
+    assert check.name == wd.CHECK_TIME_ZONE
+    assert check.ok
+    assert not check.skipped
+    assert "America/Los_Angeles" in check.detail
+
+
+def test_the_time_zone_check_fails_when_the_mac_has_moved(monkeypatch):
+    """The whole point: a Mac that wanders must not fail silently."""
+    _stub_verdict(monkeypatch, wd.timezone_check.Verdict(
+        False,
+        "this Mac has moved from America/New_York to America/Los_Angeles since "
+        "the launchd jobs were written.",
+        fix="python3 /somewhere/scripts/gen_launchd.py --install",
+        system_zone="America/Los_Angeles", stamped_zone="America/New_York",
+        current_shift=-180, stamped_shift=0))
+
+    check = wd.check_time_zone()
+
+    assert not check.ok
+    assert not check.skipped, "a wrong zone is a miss, not something to skip"
+    assert "moved" in check.detail
+    # The advice that goes out with the alert has to carry the fix, because the
+    # person reading it is reading it wondering why nothing fired.
+    assert "gen_launchd.py --install" in wd.WHAT_TO_DO[wd.CHECK_TIME_ZONE]
+
+
+def test_the_time_zone_check_never_takes_the_watchdog_down(monkeypatch):
+    """A broken check must not stop the other six from being reported."""
+    def explode(*args, **kwargs):
+        raise RuntimeError("no zone database on this machine")
+    monkeypatch.setattr(wd.timezone_check, "check", explode)
+
+    check = wd.check_time_zone()
+
+    assert check.ok
+    assert check.skipped
+    assert "no zone database" in check.detail
+
+
+def test_the_time_zone_check_is_in_the_reported_order_and_has_advice():
+    assert wd.CHECK_TIME_ZONE in wd.CHECK_ORDER
+    assert wd.CHECK_TIME_ZONE in wd.WHAT_TO_DO
+    # It can never cause a Gateway restart. Restarting Gateway would do nothing
+    # whatever about a wrong time zone.
+    assert wd.CHECK_TIME_ZONE not in wd.RESTART_CHECKS
+
+
+def test_the_time_zone_check_is_asked_even_when_the_market_is_shut(monkeypatch):
+    """The useful time to hear it is the evening before, not 09:35 on the day.
+
+    Every other check that can be skipped is skipped outside market hours. This
+    one is not, because the answer does not depend on the market being open and
+    because a zone that moved overnight is worth knowing about before the open
+    rather than after it.
+    """
+    asked = []
+    monkeypatch.setattr(wd.timezone_check, "check",
+                        lambda *a, **k: asked.append(True) or
+                        wd.timezone_check.Verdict(True, "fine"))
+    monkeypatch.setattr(wd, "check_gateway_process",
+                        lambda: wd.Check(wd.CHECK_GATEWAY_PROCESS, ok=True))
+    monkeypatch.setattr(wd, "check_gateway_port",
+                        lambda *a, **k: wd.Check(wd.CHECK_GATEWAY_PORT, ok=True))
+    monkeypatch.setattr(wd, "check_ib_and_market_data",
+                        lambda **k: (wd.Check(wd.CHECK_IB_CONNECT, ok=True),
+                                     wd.Check(wd.CHECK_MARKET_DATA, ok=True)))
+    monkeypatch.setattr(wd, "check_disk",
+                        lambda *a, **k: wd.Check(wd.CHECK_DISK, ok=True))
+
+    # A Sunday evening, which is as shut as the market gets.
+    sunday = datetime(2026, 9, 6, 21, 0, tzinfo=wd.EASTERN)
+    checks = wd.run_checks(sunday, wd.Schedule())
+
+    assert asked, "the time zone was not checked at all outside market hours"
+    assert wd.CHECK_TIME_ZONE in checks
+    assert checks[wd.CHECK_TIME_ZONE].ok

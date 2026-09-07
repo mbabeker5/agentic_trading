@@ -738,3 +738,107 @@ def test_the_regime_probe_has_its_own_client_id():
     others = {preflight.CLIENT_ID, preflight.FILTER_PROBE_CLIENT_ID}
     assert preflight.REGIME_CLIENT_ID == 282
     assert preflight.REGIME_CLIENT_ID not in others
+
+
+# ------------------------------------------------------- the time zone check
+
+# WHY THIS CHECK EXISTS. launchd fires a job on the Mac's own clock and nothing
+# in a plist can pin a time zone. On the night of 2026-09-06 this Mac relinked
+# /etc/localtime to America/Los_Angeles by itself, because macOS is set to pick
+# the zone from the current location, and all nine jobs quietly became three
+# hours late. A Mac in that state should not be opening positions, so this one
+# writes NO_TRADE_TODAY.
+
+def _stub_zone(monkeypatch, verdict):
+    monkeypatch.setattr(preflight.timezone_check, "check",
+                        lambda *args, **kwargs: verdict)
+
+
+def test_the_time_zone_check_passes_when_the_stamp_matches_the_mac(monkeypatch):
+    _stub_zone(monkeypatch, preflight.timezone_check.Verdict(
+        True, "this Mac is in America/Los_Angeles, -180 minutes from New York",
+        system_zone="America/Los_Angeles", current_shift=-180,
+        stamped_shift=-180))
+
+    result = preflight.check_time_zone()
+
+    assert result.name == preflight.CHECK_TIME_ZONE
+    assert result.passed
+    assert "America/Los_Angeles" in result.detail
+    assert result.facts["current_shift"] == -180
+
+
+def test_a_wrong_time_zone_fails_and_the_detail_carries_the_fix(monkeypatch):
+    _stub_zone(monkeypatch, preflight.timezone_check.Verdict(
+        False,
+        "this Mac has moved from America/New_York to America/Los_Angeles since "
+        "the launchd jobs were written.",
+        fix="python3 /somewhere/scripts/gen_launchd.py --install",
+        system_zone="America/Los_Angeles", stamped_zone="America/New_York",
+        current_shift=-180, stamped_shift=0))
+
+    result = preflight.check_time_zone()
+
+    assert not result.passed
+    assert "moved" in result.detail
+    assert "gen_launchd.py --install" in result.detail, (
+        "the person reading this at 09:00 needs the command, not a diagnosis")
+
+
+def test_a_wrong_time_zone_stops_the_day():
+    """It must not be informational, or a wandering Mac trades anyway.
+
+    A Mac that has changed zone has every job pointing at the wrong part of the
+    day: the pre-flight itself may have run three hours late, the tick job will
+    not wake at the open, and the dead man's handle will not be watching while
+    the market is on. NO_TRADE_TODAY is the right answer and the fix takes two
+    minutes.
+    """
+    assert preflight.CHECK_TIME_ZONE not in preflight.INFORMATIONAL_CHECKS
+    assert preflight.CHECK_TIME_ZONE in preflight.CHECK_ORDER
+    # The slow regime probe keeps its place at the end.
+    assert preflight.CHECK_ORDER[-1] == preflight.CHECK_DAY_TRADE_REGIME
+    assert preflight.CHECK_ORDER[-2] == preflight.CHECK_TIME_ZONE
+
+
+def test_a_failed_time_zone_check_lands_in_the_failed_list(monkeypatch):
+    """The wiring, not the check: a failure has to reach the NO_TRADE decision.
+
+    main() builds its failed list from every result whose passed is False, so
+    this proves the new check is shaped to be picked up by that rather than
+    quietly ignored the way an informational one is.
+    """
+    _stub_zone(monkeypatch, preflight.timezone_check.Verdict(
+        False, "moved zone", fix="run the generator"))
+    results = [preflight.check_time_zone()]
+
+    failed = [r.name for r in results if not r.passed]
+
+    assert failed == [preflight.CHECK_TIME_ZONE]
+
+    # And the file it writes names the failing check, so the reason survives
+    # into output/NO_TRADE_TODAY rather than only into the alert.
+    written = preflight.write_no_trade_today(failed, datetime(2026, 9, 8, 9, 0))
+    try:
+        assert "time_zone" in written.read_text(encoding="utf-8")
+    finally:
+        written.unlink(missing_ok=True)
+
+
+def test_a_broken_time_zone_check_does_not_stop_the_morning(monkeypatch):
+    """A check that cannot run is a warning, not a reason to halt trading.
+
+    The opposite of the rule above, and both are deliberate. A Mac that has
+    genuinely changed zone must stop the day. A zone database that will not
+    load says nothing about whether the jobs are correct, so halting on it
+    would turn a missing file into a lost trading day.
+    """
+    def explode(*args, **kwargs):
+        raise RuntimeError("no zone database on this machine")
+    monkeypatch.setattr(preflight.timezone_check, "check", explode)
+
+    result = preflight.check_time_zone()
+
+    assert result.passed
+    assert result.facts["warning"] is True
+    assert "no zone database" in result.detail

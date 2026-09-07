@@ -142,8 +142,10 @@ from paths import (  # noqa: E402
     config_dir,
     no_trade_today_file,
     output_dir,
+    project_root,
     venv_python,
 )
+import timezone_check  # noqa: E402
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -195,10 +197,11 @@ CHECK_SCANNER_FILTERS = "scanner_filters_enabled"
 CHECK_RECONCILE = "reconcile"
 CHECK_DAY_TRADES = "day_trades"
 CHECK_DAY_TRADE_REGIME = "day_trade_regime"
+CHECK_TIME_ZONE = "time_zone"
 
 CHECK_ORDER = (CHECK_GATEWAY, CHECK_MARKET_DATA, CHECK_SCANNER,
                CHECK_SCANNER_FILTERS, CHECK_RECONCILE, CHECK_DAY_TRADES,
-               CHECK_DAY_TRADE_REGIME)
+               CHECK_TIME_ZONE, CHECK_DAY_TRADE_REGIME)
 
 #: Checks that record an answer and never stop the day, whatever they find.
 INFORMATIONAL_CHECKS = frozenset({CHECK_SCANNER_FILTERS, CHECK_DAY_TRADE_REGIME})
@@ -819,10 +822,51 @@ def check_day_trade_regime(write_regime: bool = False) -> Result:
 
 # ------------------------------------------------------------------- the run
 
+def check_time_zone(now: datetime | None = None) -> Result:
+    """Will today's launchd jobs fire at the right New York minute?
+
+    Not a question about the broker or the market at all. It sits second from
+    last in the order, ahead of the day trading regime probe only because that
+    one is slow and has always run last. It is a question about this Mac:
+    launchd fires a job on
+    the local clock, no plist can pin a zone, so scripts/gen_launchd.py writes
+    the wake up times in local time and stamps the zone it converted for. This
+    compares that stamp against the Mac as it is this morning.
+
+    IT STOPS THE DAY WHEN IT FAILS, deliberately. A Mac that has changed zone
+    has every job pointing at the wrong part of the day: the pre-flight itself
+    may have run three hours late, the tick job will not wake at the open, and
+    the dead man's handle will not be watching while the market is on. None of
+    that is a day to be opening positions in. It is also a two minute fix, so
+    NO_TRADE_TODAY costs little and the alert carries the command.
+
+    Quiet when nothing is installed, so a fresh clone does not fail its first
+    morning over jobs it has not loaded yet.
+
+    Why it exists: on the night of 2026-09-06 this Mac relinked /etc/localtime
+    to America/Los_Angeles by itself, because macOS is set to choose the zone
+    from the current location, and all nine jobs became three hours late with
+    nothing anywhere to say so. Automatic zone selection is still on, so this
+    can happen again on any night.
+    """
+    try:
+        verdict = timezone_check.check(project_root(), when=now)
+    except Exception as exc:                                      # noqa: BLE001
+        return Result(CHECK_TIME_ZONE, passed=True,
+                      detail=f"not checked, the time zone check itself failed: {exc}",
+                      facts={"warning": True})
+    return Result(
+        CHECK_TIME_ZONE,
+        passed=verdict.ok,
+        detail=verdict.detail if verdict.ok else f"{verdict.detail} Fix: {verdict.fix}",
+        facts=verdict.as_dict,
+    )
+
+
 def run_checks(scan_out: Path, write_regime: bool = False) -> list[Result]:
     login, market = check_gateway_and_data()
     return [login, market, check_scanner(scan_out), check_scanner_filters(),
-            check_reconcile(), check_day_trade_counters(),
+            check_reconcile(), check_day_trade_counters(), check_time_zone(),
             check_day_trade_regime(write_regime=write_regime)]
 
 

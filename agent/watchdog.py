@@ -114,6 +114,7 @@ try:
 except Exception:           # noqa: BLE001
     db_module = None        # type: ignore[assignment]
 from paths import agent_dir, config_dir, output_dir, project_root  # noqa: E402
+import timezone_check  # noqa: E402
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -174,6 +175,7 @@ CHECK_IB_CONNECT = "ib_connect"
 CHECK_MARKET_DATA = "market_data"
 CHECK_LOOP_TICK = "loop_tick"
 CHECK_DISK = "disk_free"
+CHECK_TIME_ZONE = "time_zone"
 
 #: The order checks are reported and acted on in. Stable so that two runs with
 #: the same problems produce the same actions in the same order.
@@ -184,6 +186,7 @@ CHECK_ORDER = (
     CHECK_MARKET_DATA,
     CHECK_LOOP_TICK,
     CHECK_DISK,
+    CHECK_TIME_ZONE,
 )
 
 #: Only a miss on one of these can lead to starting IB Gateway.
@@ -213,6 +216,10 @@ WHAT_TO_DO = {
     CHECK_DISK: (
         "Free some space. IB Gateway's own logs under output/ibc_logs are "
         "usually the biggest thing there."),
+    CHECK_TIME_ZONE: (
+        "Every launchd job fires at the wrong minute until they are written "
+        "again for this Mac's zone. One command fixes it and reloads them: "
+        "python3 scripts/gen_launchd.py --install"),
 }
 
 
@@ -882,6 +889,36 @@ def check_loop_tick(now: datetime, schedule: Schedule, market_hours: bool) -> Ch
                  detail=f"Last tick {moment:%H:%M} from {where}.")
 
 
+def check_time_zone(now: datetime | None = None) -> Check:
+    """Do the loaded launchd jobs still fire at the right New York minute?
+
+    launchd fires on the Mac's own clock and no plist can pin a zone, so the
+    wake up times are written in local time and stamped with the zone they were
+    converted for. This compares that stamp against the Mac now.
+
+    It is asked at every run, market hours or not, because the answer does not
+    depend on the market being open and because the useful time to hear it is
+    the evening before rather than 09:35 on the day. It is the cheapest check
+    here: two symlink reads and some arithmetic, no network and no broker.
+
+    Quiet when nothing is installed, the same restraint check_loop_tick shows
+    when the tick job is not loaded. A Mac with no jobs on it is not a fault.
+
+    Why it exists: on the night of 2026-09-06 this Mac relinked /etc/localtime
+    to America/Los_Angeles by itself, because macOS is set to choose the zone
+    from the current location, and all nine jobs became three hours late with
+    nothing to show for it. Automatic zone selection is still on.
+    """
+    try:
+        verdict = timezone_check.check(project_root(), when=now)
+    except Exception as exc:                        # never take the watchdog down
+        return Check(CHECK_TIME_ZONE, ok=True, skipped=True,
+                     detail=f"not checked, the time zone check itself failed: {exc}")
+    if verdict.ok:
+        return Check(CHECK_TIME_ZONE, ok=True, detail=verdict.detail)
+    return Check(CHECK_TIME_ZONE, ok=False, detail=verdict.detail)
+
+
 def check_disk(floor: int = DISK_FLOOR_BYTES) -> Check:
     """Is there room left on the disk this project writes to?"""
     try:
@@ -896,7 +933,7 @@ def check_disk(floor: int = DISK_FLOOR_BYTES) -> Check:
 
 
 def run_checks(now: datetime, schedule: Schedule) -> dict[str, Check]:
-    """Do all six checks and hand back the results, in the usual order."""
+    """Do all seven checks and hand back the results, in the usual order."""
     market_hours = in_market_hours(now, schedule)
     process = check_gateway_process()
     port = check_gateway_port()
@@ -908,6 +945,7 @@ def run_checks(now: datetime, schedule: Schedule) -> dict[str, Check]:
         CHECK_MARKET_DATA: data,
         CHECK_LOOP_TICK: check_loop_tick(now, schedule, market_hours),
         CHECK_DISK: check_disk(),
+        CHECK_TIME_ZONE: check_time_zone(now),
     }
 
 
