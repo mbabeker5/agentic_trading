@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The twelve things the replay gate proves, and the evidence for each.
+"""The thirteen things the replay gate proves, and the evidence for each.
 
 Run them with the harness, never on their own:
 
@@ -1246,6 +1246,319 @@ def flatten_at_close(day: date_type) -> Scenario:
 
 
 # ==========================================================================
+# (d2) Nothing is left working at the broker after the flatten
+# ==========================================================================
+
+
+def nothing_left_working(day: date_type) -> Scenario:
+    """A real bracket goes out in the morning, and by the close nothing is live.
+
+    THE DIFFERENCE FROM (d). That scenario seeds the position it flattens, so
+    the position has no bracket at the broker and the only thing left resting is
+    an entry that never filled. This one makes the loop open the position
+    itself, which is the case that actually happens every day: the entry goes
+    out as a limit parent with a stop-limit child hung off it, the parent fills,
+    and the child then sits at the broker for six hours protecting real shares.
+    That child is the order the flatten has to pull, and it did not exist in the
+    gate until brackets landed on 2026-09-06.
+
+    Two names, so both halves are covered by one day:
+
+        BRKT    the entry limit is above the market, so it fills on the first
+                bar after the pick. The stop is left resting untriggered, which
+                a day that only climbs guarantees.
+        NOFILL  the entry limit sits five dollars below a market that never
+                comes back down, so the parent AND its child are still resting
+                at 15:45 having never been able to fill.
+
+    THE ORDER OF OPERATIONS IS THE POINT, not a detail. Cancelling after sending
+    the closing order would leave a live stop and a live flatten in the same
+    name at the same moment, and both can fill: the book ends up short a
+    position it never opened. So the check reads the sequence of broker calls
+    the loop actually made and insists every cancel in a flatten tick came
+    before every order sent in it.
+    """
+    opened, resting = "BRKT", "NOFILL"
+
+    #: What the loop asked the broker to do, in the order it asked, with the
+    #: tick it asked on. Written by the wrappers in setup() below and read by
+    #: check(). The broker adapter keeps orders and cancels in two separate
+    #: lists, so there is no other way to know which came first.
+    timeline: list[tuple[str, str]] = []
+    #: What book A held just before the flatten, so a failure can say whether
+    #: there was ever a position to protect.
+    held_at_1540: dict[str, int] = {}
+
+    def build(scenario: Scenario):
+        # Crafted, because a recorded name would have hit its stop or faded
+        # long before 15:45 and there would be no resting child left to cancel.
+        # The wick on the first two bars is there for the reason widen_opening
+        # gives: without it the opening range low is the open itself and the
+        # rule stop lands a cent under the entry.
+        series = {
+            opened: widen_opening(crafted_bars(day, ramp(day, 100.0, 101.0)), 99.0),
+            resting: widen_opening(crafted_bars(day, ramp(day, 100.0, 101.0)), 99.0),
+        }
+        return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
+
+    def setup(context: RunContext) -> None:
+        """Watch the broker calls go past, in order, changing none of them."""
+        broker = context.broker
+        real_cancel = broker.cancel_order
+        real_place = broker.place_order
+        real_bracket = broker.bracket_order
+
+        def cancel_order(order_id):
+            timeline.append(("cancel", f"order {order_id}"))
+            return real_cancel(order_id)
+
+        def place_order(contract, order, order_ref):
+            timeline.append(("place", f"{order.get('action')} "
+                                      f"{order.get('totalQuantity')} "
+                                      f"{contract.get('symbol')} "
+                                      f"{order.get('orderType')}"))
+            return real_place(contract, order, order_ref)
+
+        def bracket_order(contract, entry, stop, target=None, order_ref=""):
+            timeline.append(("place", f"bracket {entry.get('action')} "
+                                      f"{entry.get('totalQuantity')} "
+                                      f"{contract.get('symbol')}"))
+            return real_bracket(contract, entry, stop, target, order_ref)
+
+        broker.cancel_order = cancel_order
+        broker.place_order = place_order
+        broker.bracket_order = bracket_order
+
+    def before_tick(context: RunContext, moment: datetime) -> None:
+        timeline.append(("tick", f"{moment:%H:%M}"))
+
+    def after_tick(context: RunContext, moment: datetime) -> None:
+        if f"{moment:%H:%M}" == "15:40":
+            held_at_1540.update(_positions(context, "BOOK_A"))
+
+    def _live(context: RunContext) -> list[dict]:
+        """Every order of book A's that the broker still counts as able to fill."""
+        return [o for o in (context.fake.open_orders().get("orders") or [])
+                if str(o.get("orderRef") or "").upper() == "BOOK_A"]
+
+    def _describe(order: dict) -> str:
+        """One working order in the words a person needs to go and look for it."""
+        return (f"{order.get('action')} {order.get('remaining')} "
+                f"{order.get('symbol')} {order.get('orderType')} "
+                f"(order {order.get('orderId')}, status {order.get('status')})")
+
+    def _sequence(from_at: str) -> list[tuple[str, str, str]]:
+        """Every broker call from one time of day on, in the order it was made.
+
+        Flat rather than grouped by tick on purpose. The cancel and the closing
+        order do not have to land on the same tick to be in the right order, and
+        as it turns out they do not: see the escalation note in check().
+        """
+        out: list[tuple[str, str, str]] = []
+        at = ""
+        for kind, detail in timeline:
+            if kind == "tick":
+                at = detail
+            elif at >= from_at:
+                out.append((at, kind, detail))
+        return out
+
+    def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
+        evidence: list[str] = []
+        failures: list[str] = []
+
+        ok, line = _every_tick_ran(context)
+        evidence.append(line)
+        if not ok:
+            failures.append(line)
+
+        # 1. The bracket really went out, both legs of it. Read off the broker's
+        #    own order book rather than off the loop's report of it, because the
+        #    whole question is what is sitting at the broker.
+        every = context.fake.all_orders("BOOK_A")
+        parents = [o for o in every if o.get("symbol") == opened
+                   and o.get("orderType") == "LMT" and o.get("parentId") is None]
+        children = [o for o in every if o.get("symbol") == opened
+                    and o.get("orderType") == "STP LMT"]
+        hung_off = (parents and children
+                    and children[0].get("parentId") == parents[0].get("orderId"))
+        if hung_off:
+            evidence.append(
+                f"book A's entry in {opened} went out as a real bracket: a limit "
+                f"parent (order {parents[0].get('orderId')}, "
+                f"{parents[0].get('action')} {parents[0].get('totalQuantity')} at "
+                f"{parents[0].get('lmtPrice')}) "
+                f"and a stop-limit child hung off it (order "
+                f"{children[0].get('orderId')}, trigger {children[0].get('auxPrice')}, "
+                f"limit {children[0].get('lmtPrice')})")
+        else:
+            failures.append(
+                f"book A never got a bracket out in {opened}, so there was no "
+                f"resting stop for the flatten to cancel and this scenario tested "
+                f"nothing: {len(parents)} limit parents, {len(children)} stop-limit "
+                f"children. {_why_no_entry(context, 'A')}. The reason is upstream of "
+                "this scenario.")
+
+        if parents and int(parents[0].get("filled") or 0) > 0:
+            evidence.append(
+                f"the parent filled {parents[0].get('filled')} shares at "
+                f"{parents[0].get('avgFillPrice')}, so the child was protecting real "
+                "shares and not an idea")
+        else:
+            failures.append(
+                f"book A's entry in {opened} never filled, so it held nothing during "
+                "the day and the resting stop this scenario is about was never armed. "
+                "The reason is upstream of this scenario.")
+
+        if held_at_1540.get(opened):
+            evidence.append(f"at 15:40, five minutes before the flatten, book A held "
+                            f"{held_at_1540[opened]} {opened}")
+        else:
+            failures.append(f"book A held no {opened} at 15:40, so there was nothing "
+                            f"to flatten: it held {held_at_1540 or 'nothing at all'}")
+
+        # 2. THE HEADLINE. Nothing of book A's may still be able to fill.
+        live = _live(context)
+        if live:
+            failures.append(
+                f"{len(live)} of book A's orders were STILL WORKING at the broker "
+                f"after the flatten: " + "; ".join(_describe(o) for o in live)
+                + ". Every one of them can fill on its own. A stop child left "
+                f"resting sells shares the book no longer owns, and the {resting} "
+                "entry left resting opens a position into a book that has written "
+                "itself down as flat and stopped watching.")
+        else:
+            evidence.append("no order of book A's was left working at the broker "
+                            "after the flatten, which is the whole point of this "
+                            "scenario")
+
+        # 3. Both of the two orders that had to be pulled were actually pulled,
+        #    named one at a time, because "nothing is working" would also be true
+        #    if they had filled instead.
+        for symbol, what in ((opened, "the stop-limit child of a filled entry"),
+                             (resting, "an entry that never filled")):
+            rows = [o for o in every if o.get("symbol") == symbol]
+            cancelled = [o for o in rows if o.get("status") == "Cancelled"]
+            if cancelled:
+                evidence.append(
+                    f"{symbol}: {len(cancelled)} of {len(rows)} orders were "
+                    f"cancelled at the broker, which is {what} coming off")
+            else:
+                failures.append(
+                    f"{symbol}: nothing was cancelled at the broker, and {what} "
+                    "should have been. Statuses were: "
+                    + ", ".join(f"{o.get('orderType')} {o.get('status')}"
+                                for o in rows))
+
+        # 4. THE ORDER OF OPERATIONS. Every cancel has to come before the first
+        #    closing order. The other way round leaves a live stop able to fill
+        #    against a position that has already been sold, and then the book is
+        #    short a name it never opened.
+        calls = _sequence("15:45")
+        cancels = [i for i, (_, kind, _) in enumerate(calls) if kind == "cancel"]
+        places = [i for i, (_, kind, _) in enumerate(calls) if kind == "place"]
+        if not cancels:
+            failures.append(
+                "the flatten cancelled nothing at all, so the order of the cancel "
+                "and the closing order was never tested. Broker calls from 15:45 "
+                "on: " + (", ".join(f"{at} {detail}" for at, _, detail in calls[:5])
+                          or "none"))
+        elif not places:
+            failures.append(
+                f"the flatten cancelled {len(cancels)} order(s) and then sent no "
+                "closing order at all, so the position was never sold and the order "
+                "of the two was never tested")
+        elif max(cancels) > min(places):
+            at, _, detail = calls[min(places)]
+            failures.append(
+                f"the flatten sent a closing order ({detail} at {at}) before it had "
+                f"finished cancelling: {len(cancels)} cancels, "
+                f"{len([i for i in cancels if i > min(places)])} of them after that "
+                "order went out. For that moment the book had a live stop and a live "
+                "closing order in the same name, and both can fill, which leaves it "
+                "short a position it never opened.")
+        else:
+            first_at, _, first_detail = calls[min(places)]
+            evidence.append(
+                f"the flatten's first {len(cancels)} broker calls were all cancels, "
+                f"and the first closing order ({first_detail}, sent at {first_at}) "
+                "came after every one of them, so the book never held a live stop "
+                "and a live closing order at the same moment")
+
+        # WORTH ESCALATING, and found by this scenario rather than by reading the
+        # code. The cancels at 15:45 are right and they work, and the closing
+        # order that should have followed them on the same tick was refused by
+        # the duplicate_order rule, naming the stop the flatten had just
+        # cancelled. main() reads the account's working orders once for the whole
+        # tick, so the duplicate check is looking at a list taken before the
+        # cancels and sees an order that is already gone. The position is closed
+        # on the next look instead, five minutes later here and thirty seconds
+        # later in production, which is why this is evidence and not a failure:
+        # the book is still flat well before the close. The fix is one fresh read
+        # of the working orders after a cancel, and it is in agent/loop.py.
+        stale = [r for r in context.ledger.rows_for_rule("duplicate_order")
+                 if r.at[11:16] >= "15:45"]
+        if stale:
+            evidence.append(
+                "WORTH ESCALATING: the first closing order of the flatten was refused "
+                f"by duplicate_order, {len(stale)} time(s), against an order the same "
+                "tick had already cancelled. main() reads the working orders once a "
+                "tick, so the duplicate check cannot see a cancel made after that "
+                "read. The position was closed on the next look, so nothing is left "
+                f"open, but the flatten is one tick slower than it reads: "
+                + str(stale[0].payload.get("detail"))[:130])
+
+        held = _positions(context, "BOOK_A")
+        if held:
+            failures.append("book A is not flat after the close, it still holds "
+                            f"{held}")
+        else:
+            evidence.append("book A is flat after the close")
+
+        cancelled_rule = context.ledger.rows_for_rule("working_order_cancelled")
+        if cancelled_rule:
+            evidence.append(
+                f"{len(cancelled_rule)} working_order_cancelled rows were written to "
+                "the ledger, so a person reading the sheet can see which orders came "
+                f"off and why: {str(cancelled_rule[0].payload.get('detail'))[:110]}")
+        else:
+            failures.append("nothing was written to the ledger under "
+                            "working_order_cancelled, so the cancels happened without "
+                            "leaving a trace anybody could audit")
+
+        return not failures, evidence, failures
+
+    return Scenario(
+        key="nothing_left_working",
+        title="Nothing is left working at the broker after the flatten",
+        proves="that the 15:45 and 15:55 flatten cancels every order the book has "
+               "resting BEFORE it sends the closing order, so a live account is "
+               "never left with a stop resting overnight for a position that no "
+               "longer exists, nor with an unfilled entry that could fill on the "
+               "next open into a book that believes it is flat",
+        day=day, symbols=(opened, resting), build_broker=build,
+        book_patches=only("A"),
+        decider=lambda s: StubDecider(
+            max_picks=2,
+            # The entry sits above a market that only climbs so it fills at
+            # once, and the stop is given far below rather than left to the
+            # default. It does not arrive at the broker at 90 all the same:
+            # protective_levels tightens it at fill time to the opening range
+            # low, 99.00 here, because the momentum books set
+            # use_opening_range_low_if_tighter. That is the real stop and it is
+            # still below every price the rest of the day trades at, which is
+            # all this scenario needs of it. No target at all, because the three
+            # momentum books stopped taking one on 2026-09-06 (item A2), and
+            # that is what makes this bracket exactly two legs.
+            script=[ScriptedPick(book="A", symbol=opened, at="09:35",
+                                 entry=100.50, stop=90.00, target=0.0),
+                    ScriptedPick(book="A", symbol=resting, at="09:35",
+                                 entry=95.00, stop=88.00, target=0.0)]),
+        setup=setup, before_tick=before_tick, after_tick=after_tick, check=check,
+    )
+
+
+# ==========================================================================
 # (e) A phantom position
 # ==========================================================================
 
@@ -1539,6 +1852,24 @@ def day_trade_counter(day: date_type) -> Scenario:
     dollars would have suffered is written down instead, which is how the cost
     of the rule gets measured rather than guessed.
 
+    WHAT MAKES IT A REAL TEST RATHER THAN A LEDGER READING. Both books really
+    open their position from a real shortlist and really fill it, and the last
+    word is each book's own counter file rather than a ledger row: book A's
+    reads four day trades at the end of the day and book C's still reads three.
+    A refusal that got logged and then let the round trip happen anyway would
+    show up as a four on book C and nowhere else at all.
+
+    WHICH STOP, AND WHY NOT BOOK C'S OWN. Both books trade on the 1.5 percent
+    stop a scripted pick carries by default rather than on book C's documented 8
+    percent, and that is the difference between testing the day trade rule and
+    testing something else. Given its real 8 percent stop, book C's stop-limit
+    child triggers at 92 and cannot fill against a bar that has already gapped
+    to 88, so the sixty second backstop markets out of the position instead, and
+    market_out_unfilled_stops never calls day_trade_check at all: the round trip
+    completes, no pdt_limit row is written, and the allowance is not consulted.
+    That is a real hole in agent/loop.py and it is worth fixing there. It is not
+    this scenario, which is about what the rule does when it is asked.
+
     ONE NAME EACH, ON PURPOSE. This used to put both books into the same
     ticker, which made it a scenario about symbol exclusivity as well as one
     about the day trade counter: with universe.symbol_exclusive on, book C is
@@ -1550,22 +1881,34 @@ def day_trade_counter(day: date_type) -> Scenario:
     for_a, for_c = "DROPA", "DROPC"
 
     def build(scenario: Scenario):
-        # The same shape twice, one name per book, because the two books have
-        # different stops: A's is 1.5 percent and C's is 8 percent.
+        # The same shape twice, one name per book, so each book falls through
+        # its own stop in its own ticker. Both stops are 1.5 percent below the
+        # fill, not book C's own 8 percent: a scripted pick carries the stop the
+        # script gives it, the default is 1.5, and protective_levels lets a
+        # model tighten a stop and never widen one, so the tighter number is the
+        # one that reaches the broker.
         shape = {
-            "09:40": (100.0, 100.0, 100.0, 100.0),      # the entry fills here
-            "09:45": (100.0, 100.0, 97.0, 97.0),        # through A's 1.5% stop
-            "09:50": (97.0, 97.0, 97.0, 97.0),          # C's entry fills here
-            "11:00": (97.0, 97.0, 88.0, 88.0),          # through C's 8% stop
+            "09:40": (100.0, 100.0, 100.0, 100.0),      # A's entry fills here
+            "09:45": (100.0, 100.0, 97.0, 97.0),        # C's entry fills at 100
+            "09:50": (97.0, 97.0, 97.0, 97.0),          # both stops are through
+            "11:00": (97.0, 97.0, 88.0, 88.0),          # and it keeps falling
             "11:30": (88.0, 88.0, 88.0, 88.0),
         }
         series = {for_a: crafted_bars(day, steps(day, shape, 100.0)),
                   for_c: crafted_bars(day, steps(day, shape, 100.0))}
         return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
 
+    #: What each book's counter read once the three earlier round trips were
+    #: seeded, before the day started. Kept because a scenario that seeds its
+    #: own starting point should show it rather than ask to be trusted on it.
+    seeded: dict[str, int] = {}
+
     def setup(context: RunContext) -> None:
         for book_id in ("A", "C"):
             seed_day_trades(context, book_id, 3, symbol="SEEDED")
+            counter = context.pdt_counter(book_id)
+            seeded[book_id] = (0 if counter is None
+                               else counter.count_last_5_business_days(context.day))
 
     def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
         evidence: list[str] = []
@@ -1629,6 +1972,57 @@ def day_trade_counter(day: date_type) -> Scenario:
             failures.append(f"book A never closed {for_a}, so the flag blocked it "
                             "when it should only have been written down")
 
+        # WHAT THE COUNTER ITSELF SAYS. This is the strongest line in the
+        # scenario and it is stronger than any single ledger row, because it is
+        # the number the rule is made of. Both books started on three seeded
+        # round trips. Book A's fourth went through, so its counter has to read
+        # four. Book C's fourth was refused, so its counter has to still read
+        # three: a refusal that let the round trip happen anyway would show up
+        # here as a four and nowhere else at all.
+        for book_id in ("A", "C"):
+            if seeded.get(book_id) == 3:
+                continue
+            failures.append(
+                f"book {book_id} started the day on {seeded.get(book_id)} day trades "
+                "and it has to be three, otherwise today's round trip is not the "
+                "fourth and the allowance is never reached. The seeding in setup() "
+                "did not take.")
+
+        for book_id, wanted, why in (
+                ("A", 4, "its fourth was allowed, so it has to have been counted"),
+                ("C", 3, "its fourth was refused, so it must never have happened")):
+            counter = context.pdt_counter(book_id)
+            if counter is None:
+                failures.append(f"book {book_id} has no day trade counter at all, so "
+                                "nothing about the allowance was measured")
+                continue
+            reading = counter.count_last_5_business_days(context.day)
+            line = (f"book {book_id}'s own counter reads {reading} day trades in five "
+                    f"business days, up from the {seeded.get(book_id, 0)} seeded "
+                    f"before today")
+            if reading == wanted:
+                evidence.append(f"{line}: {why}")
+            else:
+                failures.append(f"{line} and it should read {wanted}: {why}")
+
+        # And the refusal has to have been about shares the book really had. A
+        # book whose entry never filled has nothing to close, and the rule would
+        # then have refused something that could not have happened anyway, which
+        # is the shape this scenario used to have.
+        c_held = _positions(context, "BOOK_C")
+        if c_held.get(for_c):
+            evidence.append(
+                f"book C is still holding {c_held[for_c]} {for_c} at the end of the "
+                "day, which is the position it was refused permission to close. So "
+                "the refusal was about real shares, and a book meant to hold for "
+                "weeks is left holding them, which is the right answer")
+        else:
+            failures.append(
+                f"book C holds no {for_c} at the end of the day, so either its entry "
+                f"never filled or something closed it anyway: it holds "
+                f"{c_held or 'nothing'}. Either way the refusal above was not about "
+                "shares this book actually had.")
+
         counts = {ref: context.fake.day_trade_count(ref)
                   for ref in ("BOOK_A", "BOOK_C")}
         evidence.append(f"the broker's own round trip count for the day: {counts}")
@@ -1651,8 +2045,20 @@ def day_trade_counter(day: date_type) -> Scenario:
         book_patches=only("A", "C"),
         decider=lambda s: StubDecider(
             max_picks=1,
+            # Both picks take ScriptedPick's default 1.5 percent stop, book C
+            # included, and that is deliberate: see the note on which stop in
+            # the docstring above.
             script=[ScriptedPick(book="A", symbol=for_a, at="09:35"),
                     ScriptedPick(book="C", symbol=for_c, at="09:45")]),
+        # THE REGIME IS PINNED, and it has to be. The hard limit on book C only
+        # bites under the old rulebook, and which rulebook applies is read from
+        # the pdt block of config/guardrails.yaml, where it says unknown today
+        # and is treated as old_pdt. Tuesday's pre-flight writes the account's
+        # real answer into that line, and if it ever writes new_imd the sandbox
+        # copy inherits it and agent/pdt.py stops blocking anything at all. This
+        # scenario is about the old rulebook, so it says so rather than
+        # depending on what the pre-flight last wrote.
+        guardrail_overlay={"pdt": {"regime": "old_pdt"}},
         setup=setup, check=check,
     )
 
@@ -2195,6 +2601,7 @@ def all_scenarios(day: date_type = DEFAULT_DAY) -> list[Scenario]:
         every_guardrail(day),
         daily_loss_cap(day),
         flatten_at_close(day),
+        nothing_left_working(day),
         phantom_position(day),
         kill_switch(day),
         day_trade_counter(day),

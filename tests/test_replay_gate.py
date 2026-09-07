@@ -262,13 +262,18 @@ def test_every_fast_scenario_ran_a_whole_day(fast_reports):
 #: EVERY FAST SCENARIO IS ON THIS LIST NOW, which it has not been before.
 #:
 #: The list was three on the morning of 2026-09-06, five by the evening, and it
-#: is all nine of the fast ones after the loop follow-on pass. Each one that
-#: went on did so because a real gap in agent/loop.py closed, not because a
+#: is every one of the eleven fast ones after the loop follow-on pass. Each one
+#: that went on did so because a real gap in agent/loop.py closed, not because a
 #: scenario was made easier: the loop reads its own fills out of executions(),
 #: it alerts, it clears a halt whose reason has gone, it tells a dead Gateway
 #: from an empty account, it reads how old its quotes are, it cancels what it
 #: has resting when it flattens, and it will not send an order it already has
 #: working.
+#:
+#: nothing_left_working is the newest, and it is the one that watches the broker
+#: rather than the book file: it makes the loop open a real bracket in the
+#: morning and insists that by the close nothing of that book's can still fill,
+#: cancels before closing orders.
 #:
 #: A scenario here that starts failing is a regression. Read its failure lines
 #: before touching it: they say what changed and where, in sentences.
@@ -276,6 +281,7 @@ def test_every_fast_scenario_ran_a_whole_day(fast_reports):
     "fills_from_the_broker",
     "daily_loss_cap",
     "flatten_at_close",
+    "nothing_left_working",
     "phantom_position",
     "kill_switch",
     "day_trade_counter",
@@ -332,8 +338,9 @@ def test_every_fast_scenario_passes_and_none_is_missing_from_the_guard(fast_repo
     """
     guarded = {
         "fills_from_the_broker", "daily_loss_cap", "flatten_at_close",
-        "phantom_position", "kill_switch", "day_trade_counter", "gateway_down",
-        "competing_session_delayed_data", "rejected_order", "two_books_one_symbol",
+        "nothing_left_working", "phantom_position", "kill_switch",
+        "day_trade_counter", "gateway_down", "competing_session_delayed_data",
+        "rejected_order", "two_books_one_symbol",
     }
     assert set(fast_reports) == guarded, (
         "the fast scenarios and the regression guard have drifted apart: "

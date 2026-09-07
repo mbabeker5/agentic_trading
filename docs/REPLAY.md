@@ -35,7 +35,7 @@ broker offers exactly the same read methods as
 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/fake_broker.py` | Replays what those two recorded, and fills orders against it |
 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/stub_decider.py` | Stands in for `agent/decide.py`, so no model is called and the gate is free |
 | `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/harness.py` | Steps the real loop through a whole day against the fake broker, and reports |
-| `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/scenarios.py` | The twelve things the gate proves, one `Scenario` each |
+| `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/scenarios.py` | The thirteen things the gate proves, one `Scenario` each |
 
 Shared plumbing lives in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/replay/common.py`.
@@ -355,10 +355,11 @@ named by a key you can hand to `--scenario`.
 | Key | Bars | What it covers |
 |---|---|---|
 | `clean_day` | recorded | Requirements 1 to 3: the day runs, everything reaches the ledger, the books and the broker agree |
-| `clean_day_no_fill_bridge` | recorded | The same day with the harness fill bridge off, which measures what the loop can do on its own |
+| `fills_from_the_broker` | recorded | The loop reads its own fills out of `executions()`, so an order that filled after it was sent reaches the book file. It replaced `clean_day_no_fill_bridge`, which measured the gap this closed |
 | `every_guardrail` | recorded | Every rule id blocks an order and is written down |
 | `daily_loss_cap` | crafted | Requirement 4 |
 | `flatten_at_close` | crafted | Requirement 5, both halves: a position open at 15:50, and a book with nothing to sell |
+| `nothing_left_working` | crafted | The other half of requirement 5: a real bracket goes out in the morning and by the close nothing of that book's can still fill, with every cancel ahead of every closing order |
 | `phantom_position` | crafted | Requirement 6, in both its shapes: a mismatch with a book's name on it, and an orphan with nobody's |
 | `kill_switch` | crafted | Requirement 7, running the real `agent/kill_switch.py` against the fake broker |
 | `day_trade_counter` | crafted | Requirement 8 |
@@ -378,7 +379,7 @@ run on the real five minute bars of a real session.
 ```bash
 cd /Users/mtalib/workspace_repos/personal_repo/agentic_trading
 
-# The whole thing. Twelve scenarios, about twenty seconds, no network at all.
+# The whole thing. Thirteen scenarios, about twenty seconds, no network at all.
 ./venv312/bin/python -m agent.replay.harness --all
 
 # What it would run, and what each one proves.
@@ -387,13 +388,13 @@ cd /Users/mtalib/workspace_repos/personal_repo/agentic_trading
 # One scenario, repeatable, when you are chasing a single failure.
 ./venv312/bin/python -m agent.replay.harness --scenario kill_switch
 
-# Skip the three slow ones, which is what the tests do.
+# Skip the two slow ones, which is what the tests do.
 ./venv312/bin/python -m agent.replay.harness --all --fast
 
 # A different recorded session.
 ./venv312/bin/python -m agent.replay.harness --all --day 2026-09-03
 
-# The gate's own tests: the safety locks plus the nine fast scenarios, 15 seconds.
+# The gate's own tests: the safety locks plus the eleven fast scenarios, 15 seconds.
 ./venv312/bin/python -m pytest -q tests/test_replay_gate.py
 ```
 
