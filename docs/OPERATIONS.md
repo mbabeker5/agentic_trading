@@ -23,7 +23,7 @@ to do about it.
 | Guard | When it runs | What it can do |
 |---|---|---|
 | `agent/alerts.py` | whenever something calls it | send you a message four ways |
-| `agent/watchdog.py` | every 5 minutes in market hours, hourly otherwise | check six things, message you, start IB Gateway once |
+| `agent/watchdog.py` | every 5 minutes in market hours, hourly otherwise | check seven things, message you, start IB Gateway once |
 | `agent/preflight.py` | 09:00 on weekdays | check five things, stop the day's trading, message you |
 | `agent/kill_switch.sh` | when you run it | stop the loop, cancel every order, close every position |
 | `agent/deadman.py` | every 5 minutes 09:30 to 16:00 on weekdays | notice the loop has died while a book is exposed, message you, and pull the kill switch itself |
@@ -71,7 +71,7 @@ Test the whole chain any time. It is harmless:
 ```
 
 Every five minutes during the trading day, and once an hour through the night
-and the weekend, it checks six things:
+and the weekend, it checks seven things:
 
 1. `gateway_process`, IB Gateway is running.
 2. `gateway_port`, port 4002 is accepting connections. A running Gateway with
@@ -83,6 +83,10 @@ and the weekend, it checks six things:
 5. `loop_tick`, the trading loop has ticked within the last ten minutes. Only
    checked during market hours, and only when the loop's launchd job is loaded.
 6. `disk_free`, more than a gigabyte free.
+7. `time_zone`, the launchd jobs still fire at the right New York minute. See
+   the time zone section below. Checked at every run, market hours or not,
+   because the answer has nothing to do with the market being open and the
+   useful time to hear it is the evening before rather than 09:35 on the day.
 
 The hourly overnight runs are the whole point. On 2026-09-03 Gateway went down
 at 01:44 in the morning and nobody found out until Saturday lunchtime. With the
@@ -614,6 +618,61 @@ That writes the files and loads nothing. `--check` says whether they are up to
 date, `--install` copies them into `~/Library/LaunchAgents` and starts them, and
 `--uninstall` is the undo. The full explanation is in `docs/LAUNCHD.md`.
 
+## The time zone, and why nothing here says "keep the Mac on Eastern"
+
+launchd fires a job on the Mac's own clock, and there is no way to pin a time
+zone inside a plist. The market keeps New York hours whatever the Mac thinks.
+
+So the schedules in `config/launchd/templates/` are written in New York time and
+`scripts/gen_launchd.py` converts them. It asks the operating system what zone
+the Mac is in, works out the gap to New York in minutes, moves every wake up by
+that gap, and stamps the zone and the gap into each plist. On this Mac today
+every job is generated for `America/Los_Angeles` at -180 minutes, so the
+template's 09:30 becomes `Hour 6, Minute 30` and fires at 09:30 New York.
+
+**Setting the Mac to Eastern still works and is arguably tidier.** It just makes
+the conversion a no-op: the gap becomes zero, nothing moves, and the plists hold
+the template's own times. Either way is correct.
+
+Three things notice if the Mac changes zone, and none of them is somebody
+remembering to look:
+
+| What | When | What it does |
+|---|---|---|
+| `gen_launchd.py --check` | when run, and in the test suite | fails with `WRONG ZONE` |
+| the `time_zone` watchdog check | hourly, and every 5 min in market hours | messages you, with the fix in the text |
+| the `time_zone` pre-flight check | 09:00 weekdays | writes NO_TRADE_TODAY |
+
+The pre-flight one stops the day on purpose. A Mac that has changed zone has
+every job pointing at the wrong part of the day: the pre-flight may itself have
+run three hours late, the tick job will not wake at the open, and the dead man's
+handle will not be watching while the market is on. That is not a morning to be
+opening positions in, and the fix takes two minutes.
+
+The fix is always the same command. It rewrites all nine and reloads them:
+
+```
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install
+```
+
+**Why this is code rather than a note.** Until 2026-09-07 the docs said "keep the
+Mac on Eastern" and nothing enforced it. On the night of 2026-09-06 the Mac
+relinked `/etc/localtime` to `America/Los_Angeles` by itself, because macOS is
+set to choose the zone from the current location and nobody touched a setting.
+All nine jobs became three hours late in silence. A plist that says `Hour 9`
+looks correct in every way. Automatic zone selection is still switched on, so it
+can happen again on any night.
+
+The stamp records the offset as well as the zone name, because both United
+States zones change their clocks on the same day but London does not: for one
+week each autumn London is four hours from New York rather than five. Comparing
+the offset is what catches that. The arithmetic and the checking live in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/timezone_check.py`,
+so the generator, the watchdog and the pre-flight cannot disagree.
+
+Fuller version, including what `launchctl print` shows, in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md`.
+
 ## Where to look when something is odd
 
 ```
@@ -654,13 +713,9 @@ As of 2026-09-07:
   on 2026-09-06 and the last three on 2026-09-07. `launchctl list | grep agentic`
   shows them. Every book in `config/books.yaml` is still in dry run, so the tick
   job works out what it would trade and sends nothing.
-* **This Mac is set to Pacific, not Eastern, and launchd fires on the Mac's own
-  clock.** Checked with `date +%Z` on 2026-09-07 and it answered `PDT`, where
-  `docs/LAUNCHD.md` had recorded `EDT` on 2026-09-02. Nothing in a plist can pin
-  a time zone, so every one of the nine jobs currently wakes three hours late:
-  the 09:30 tick fires at 12:30 New York. Setting the Mac back to Eastern in
-  System Settings fixes all nine at once and needs no regeneration. Until that
-  is done the schedules are wrong, whatever the plists say.
+* This Mac is in Pacific and that is now handled rather than being a problem.
+  The jobs are generated for whatever zone the Mac is in, so they fire at the
+  right New York minute either way. See the time zone section below.
 * iMessage alerts are off until `IMESSAGE_TO` exists in
   `.secrets/alerts.env`. Slack and the screen banner work now.
 * Real time quotes are not arriving. The paper Gateway answered IBKR code

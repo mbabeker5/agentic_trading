@@ -143,20 +143,98 @@ The three extra times, and which book each belongs to:
 All of that lives in `config/launchd/templates/tick.template`, in English, and
 the generator does the counting.
 
-launchd works in whatever time zone the Mac is set to, and there is no way to
-pin a time zone inside the file.
+## The time zone, which is the subtle part
 
-**This Mac is in Pacific, and that is a live problem.** `date +%Z` answered
-`EDT` on 2026-09-02 and `PDT` on 2026-09-07, so the Mac moved in between.
-Nothing in a plist can pin a time zone, so every one of the nine jobs currently
-fires three hours late against New York: the 09:30 wake up lands at 12:30
-Eastern, after the open and after the pick.
+launchd fires a job on the Mac's own clock. There is no way to pin a time zone
+inside a plist, and there never has been. The market keeps New York hours
+whatever the Mac thinks.
 
-The fix is one setting and no regeneration: put the Mac back on Eastern in
-System Settings, General, Date and Time. Changing the times in the templates
-instead would be the wrong fix, because it hides the problem in nine files and
-breaks again the moment the Mac is corrected. Check with `date +%Z` before you
-trust a tick log after any travel.
+**You do not have to keep the Mac on Eastern.** The templates are written in New
+York time, because that is the only sane way to write a market schedule, and the
+generator converts them. It asks the operating system what zone the Mac is
+actually in, works out the gap to New York in minutes, moves every wake up by
+that gap, and stamps the zone and the gap into the plist it writes.
+
+On this Mac today that means every job is generated for `America/Los_Angeles` at
+-180 minutes, so the template's 09:30 comes out as `Hour 6, Minute 30` and fires
+at 09:30 New York. `launchctl print` shows the local hour and the stamp side by
+side:
+
+```
+AGENTIC_TRADING_PLIST_ZONE => America/Los_Angeles
+AGENTIC_TRADING_PLIST_SHIFT_MINUTES => -180
+...
+    "Minute" => 30
+    "Hour" => 6
+    "Weekday" => 1
+```
+
+Setting the Mac back to Eastern in System Settings, General, Date and Time still
+works perfectly well and is arguably tidier. It simply makes the conversion a
+no-op: the gap becomes zero, nothing is moved, and the plists hold the
+template's own times. Either way is correct, which is the point.
+
+A wake up pushed across midnight takes its weekday with it. The 17:00 daily
+backup becomes 22:00 the same evening in London and 06:00 the next morning in
+Tokyo, so on a Tokyo Mac Sunday's copy is taken on Monday. The shift is
+constant, so the mapping is one to one and the number of wake ups never changes
+whatever zone the Mac is in.
+
+### What happens when the Mac moves
+
+Three things notice, and none of them is a person remembering to check.
+
+| What | When | What it does |
+|---|---|---|
+| `gen_launchd.py --check` | whenever it is run, and in the test suite | fails with `WRONG ZONE`, naming both zones |
+| the `time_zone` watchdog check | hourly, and every five minutes in market hours | alerts you, with the fix in the message |
+| the `time_zone` pre-flight check | 09:00 weekdays | writes NO_TRADE_TODAY, so nothing opens |
+
+The fix is always the same one command, which rewrites all nine and reloads
+them:
+
+```
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install
+```
+
+### Why this is code and not a note in the docs
+
+Until 2026-09-07 this section said "keep the Mac on Eastern" and nothing
+enforced it. `date +%Z` answered `EDT` on 2026-09-02 and `PDT` on 2026-09-07,
+because on the night of the 6th the Mac relinked `/etc/localtime` to
+`America/Los_Angeles` by itself. macOS is set to choose the zone from the current
+location, `com.apple.timezone.auto` is `Active = 1`, and nobody touched a
+setting. Every one of the nine jobs became three hours late in silence: the
+09:30 tick would have fired at 12:30 New York, after the open and after the
+pick. A plist that says `Hour 9` looks correct in every way, which is exactly
+why nothing caught it.
+
+Automatic zone selection is still on, so this can happen again on any night. A
+note that everybody trusts and nobody rereads was not good enough.
+
+### Why the offset is recorded and not just the zone name
+
+Both United States zones change their clocks on the same day, so while the Mac
+is anywhere in the US the gap to New York is fixed all year and a plist
+generated in September is still right in January.
+
+That is not true elsewhere. The United Kingdom ends summer time on the last
+Sunday in October and the US on the first Sunday in November, so for one week
+each autumn London is four hours from New York rather than five, and for three
+weeks each spring the same thing happens in reverse. A plist generated outside
+those windows is an hour wrong inside them. So the stamp carries both the zone
+name and the gap in minutes, and all three checks above fail if either has
+moved. On a US Mac that means they fire when the Mac changes zone and never
+otherwise. On a London Mac they also fire on the two days a year the gap
+changes, which is precisely when the plists need rewriting.
+
+The arithmetic and the checking live in one file,
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/timezone_check.py`,
+so the generator, the watchdog and the pre-flight cannot disagree about the
+answer.
+
+`date +%Z` is still the quickest way to see where the Mac thinks it is, and
+`gen_launchd.py --check` is the quickest way to see whether the jobs agree.
 
 If the Mac is asleep at one of those times, launchd runs the job once when it
 wakes up, and no setting turns that off. That does no harm, because the loop
@@ -271,8 +349,12 @@ Work down this list.
    If that says the service could not be found, it is not loaded.
 2. **Is today a weekday, and is it between 09:25 and 16:00?** Outside that, no
    tick is due.
-3. **Is the Mac in Eastern?** `date +%Z`. If it says anything but `EST` or
-   `EDT`, the times in the plist are pointing at the wrong hours.
+3. **Do the jobs agree with the Mac's time zone?**
+   `python3 scripts/gen_launchd.py --check`. The Mac does not have to be in
+   Eastern, the plists are converted for whatever zone it is in, but if it has
+   moved since they were written this says `WRONG ZONE` and every job is firing
+   at the wrong minute. Fix it with `--install`. `date +%Z` shows where the Mac
+   thinks it is.
 4. **Was the Mac asleep?** Nothing runs while it sleeps.
 5. **Is IB Gateway up?** `nc -z 127.0.0.1 4002`. Silence means it is down, and
    the day's tick log will say so. Start it with
@@ -686,7 +768,11 @@ The `-` is the process id column and means the job is not running this second,
 which is right for a job waiting on its schedule. The `0` is the last exit
 status.
 
-**One thing is wrong and is not fixed by any of this.** The Mac is set to
-Pacific, so all nine fire three hours late against New York. See the time zone
-note further up. Fixing the Mac's time zone fixes all nine and needs no
-regeneration.
+**One thing was wrong when these were first loaded, and is fixed now.** The Mac
+had moved itself to Pacific overnight, so all nine were firing three hours late
+against New York. Rather than ask Mo to change a system setting that macOS can
+change back on its own, the generator now converts the New York schedules into
+whatever zone the Mac is in and three separate checks fail when it moves. See
+the time zone section further up. The nine were regenerated and reloaded for
+Pacific on 2026-09-07, and `launchctl print` shows `Hour 6` for the 09:xx New
+York wake ups.
