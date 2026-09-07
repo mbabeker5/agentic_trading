@@ -46,7 +46,7 @@
 #                  is no argument later about which version of the numbers and
 #                  the guardrails was signed off
 #
-# rules_commit is stamped on books A, B and E as of 2026-09-06: 03e5318. It says
+# rules_commit is stamped on books A, B and E as of 2026-09-06: f840f0f. It says
 # WHICH RULES THE BOOK RUNS. It is not a promotion: promoted_on is still empty on
 # all five books, every one of them is still on dry_run, and a book cannot be set
 # to tiny or full without both fields filled in. Books C and D keep an empty
@@ -55,7 +55,21 @@
 # WHEN TO MOVE IT (Mo, 2026-09-06). The stamp has to name the tree as it actually
 # stands, not the moment somebody said yes. It was first set to 273e928, the commit
 # carrying the Momentum v2 numbers Mo approved. Two later commits then changed
-# how the rules behave, so it moved forward to 03e5318.
+# how the rules behave, so it moved forward to 03e5318. Nine more followed on the
+# evening of 2026-09-06, every one of them found by the replay gate and every one
+# of them changing what a limit answers, so it moved again to f840f0f: an orphan
+# alerts instead of halting, a halt can clear and its reason is bounded, a
+# Gateway outage is no longer read as an empty account, a stale quote refuses an
+# entry, symbol exclusivity went back to refusing by default, fills come off the
+# broker's own executions, and the loop will not send an order it already has
+# resting.
+#
+# WHY NOT LATER THAN f840f0f. Three commits after it touch code and none of them
+# moves a limit: 158bc24 corrects the gate's own wording, 41a0c51 wires two
+# database writers and measures how long a tick took, d11323c deletes a constant
+# nothing read. That is exactly the "plumbing that leaves every limit answering
+# as it did" this rule excludes, so the stamp stays where the behaviour stopped
+# changing rather than following the newest hash.
 #
 # The rule from here: BEFORE THE FIRST TRADE, move this stamp whenever a commit
 # changes guardrail behaviour. Not for a typo, a comment or a test, and not for
@@ -182,9 +196,11 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 03e5318          # the git hash of the rules this book runs
+    rules_commit: f840f0f          # the git hash of the rules this book runs
     rules_commit_note: >-
-      Momentum v2 per Mo's decisions 2026-09-06
+      Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
+      loop and guardrail fixes the replay gate found on the evening of
+      2026-09-06. Moved from 03e5318 on 2026-09-06.
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -206,9 +222,11 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 03e5318          # the git hash of the rules this book runs
+    rules_commit: f840f0f          # the git hash of the rules this book runs
     rules_commit_note: >-
-      Momentum v2 per Mo's decisions 2026-09-06
+      Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
+      loop and guardrail fixes the replay gate found on the evening of
+      2026-09-06. Moved from 03e5318 on 2026-09-06.
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -270,9 +288,11 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 03e5318          # the git hash of the rules this book runs
+    rules_commit: f840f0f          # the git hash of the rules this book runs
     rules_commit_note: >-
-      Momentum v2 per Mo's decisions 2026-09-06
+      Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
+      loop and guardrail fixes the replay gate found on the evening of
+      2026-09-06. Moved from 03e5318 on 2026-09-06.
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-

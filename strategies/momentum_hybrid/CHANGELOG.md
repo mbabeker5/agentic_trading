@@ -2,6 +2,48 @@
 
 This file records every change to this strategy's numbers: what changed, on what date, and the git commit that carried it. The reason it exists is the ledger. A decision written down in the ledger in October has to be readable against the exact rules it was made under, not against whatever the rules became by December. Without a dated commit beside each set of numbers, a good month and a changed stop loss are impossible to tell apart. The strategy file beside this one is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_hybrid/strategy.yaml` and the spec it implements is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md`.
 
+## Loop and guardrail fixes from the replay gate, 2026-09-06
+
+Not a change to this strategy's numbers. Every number in `strategy.yaml` is
+exactly as Mo approved it in Momentum v2. What changed is the machinery those
+numbers are enforced by, and the stamp has to follow it, because a decision
+written in the ledger tonight was made under these fixes and not under the ones
+of this morning.
+
+Commit: f840f0f (moved from 03e5318)
+
+The replay gate found all nine, before any book could trade:
+
+- An unclaimed position at the broker tells somebody once a day and halts nobody
+  (`58dfa67`).
+- A halt can end, and its reason no longer grows without bound (`c482c91`).
+- A Gateway that is not answering is no longer read as an account holding
+  nothing, which had been halting every book for the rest of the day
+  (`ecd34f8`).
+- The loop reads how old its quotes are and refuses to open on a stale one, and
+  IBKR code 10197 and a delayed feed are now visible to it (`6166471`).
+- Cross-book symbol exclusivity defaults back to refusing, which is the review
+  team's instruction, and Mo decides whether it stays that way (`055f289`).
+- Fills come back off the broker's own executions and reach the book file
+  exactly once, deduplicated on IBKR's execution id (`0590a0c`).
+- The loop will not send an order it already has resting at the broker
+  (`f840f0f`). The gate had found seventy two identical cover orders in one run.
+- Nothing a book has resting survives the 15:45 flatten (`0a2edc5`).
+- The loop raises alerts, once per problem rather than once per tick
+  (`ec49be0`).
+
+The stamp deliberately does not follow the three commits after `f840f0f`.
+`158bc24` corrects the gate's own wording about which facts the loop gathers,
+`41a0c51` wires two database writers and records how long a tick took, and
+`d11323c` deletes a constant nothing read. None of them changes what an order
+check says yes or no to, and the rule at the top of
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/books.yaml`
+excludes plumbing that leaves every limit answering as it did.
+
+Nothing has traded. All five books are still on `dry_run` and `promoted_on` is
+still empty on every one of them, so this is still housekeeping rather than a
+version.
+
 ## Momentum v2, 2026-09-06
 
 Approved by Mo from the consolidated critique at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/research/momentum_spec_critique_2026-09-06.md`
