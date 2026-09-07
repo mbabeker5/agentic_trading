@@ -301,6 +301,14 @@ There is no "edit this order" on this path, so tightening a stop is two steps: c
 
 The child order ids are written into the book's state file as `working_orders` entries marked `is_child`, because an order that has to be cancelled later is an order whose id has to survive the tick that placed it.
 
+### A cancel this tick has made is not a duplicate
+
+The loop refuses to send an order it already has resting, and it looks in two places to decide: the book's own `working_orders`, and the account's working orders as the broker reports them. The second list is read once for the whole tick by `main()` and handed to all five books. That is deliberate, and it is not a shortcut. Five books each asking IB Gateway for the account's working orders in the same second is how a data pacing violation happens, and the fifth book's call really did time out at 45 seconds the first time this ran end to end.
+
+The cost of reading once was that the duplicate check could not see a cancel made after the read. So the 15:45 flatten cancelled the resting stop, correctly, and then had its own closing order refused, naming the very order it had just pulled. The same thing happened to the market backstop, which cancels a triggered stop-limit and sends a market order on the same side in the same name. Nothing was ever left open, because the position closed on the next look, five minutes later in the replay gate and thirty seconds later in production. What it cost was a flatten one tick slower than it reads, and on a fast close that is real.
+
+The read is still once a tick. A cancel now drops the order it pulled out of the list this tick already holds, which is `BookTick.forget_order` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`, called from all three places that cancel: the flatten, the stop move and the market backstop. Found by the `nothing_left_working` replay scenario rather than by anybody reading the code, and that scenario now fails if it comes back.
+
 Today this is all rehearsal. A dry run prints the legs it would have sent, one line each, under the order it would have placed. On a momentum book there are two of them and no more:
 
 ```

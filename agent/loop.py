@@ -1587,6 +1587,42 @@ class BookTick:
         if not self.quiet:
             print(f"  [{self.tag}] note: {message}")
 
+    def forget_order(self, order_id: Any) -> int:
+        """Drop one cancelled order from this tick's view of the working orders.
+
+        THE BUG THIS CLOSES, backlog item 16, found by the nothing_left_working
+        scenario rather than by reading the code. The flatten at 15:45 cancels
+        every order the book has resting and then sends its closing order, in
+        that order and deliberately so. But duplicate_order_reason reads
+        broker_orders, which main() fills in once for the whole tick, so it was
+        looking at a list taken BEFORE those cancels and refused the closing
+        order naming the very stop the same tick had just pulled. The position
+        was closed on the next look instead, five minutes later in the replay
+        gate and thirty seconds later in production, so nothing was left open
+        overnight. What it cost was a flatten one tick slower than it reads, and
+        on a fast close that is real.
+
+        The same shape hit the market backstop after a triggered stop-limit,
+        which cancels the stop and then sends a market order on the same side in
+        the same name.
+
+        The once a tick read stays exactly as it was. It is not a shortcut: five
+        books each asking IB Gateway for the account's working orders in the same
+        second is how a data pacing violation happens, and the fifth book's call
+        really did time out at 45 seconds the first time this ran end to end. So
+        a cancel edits the list this tick already holds instead of asking again.
+
+        Returns how many rows came out. Zero is a perfectly ordinary answer: an
+        order placed and cancelled inside one tick was never in the list.
+        """
+        wanted = str(order_id)
+        before = len(self.broker_orders)
+        self.broker_orders = [
+            row for row in self.broker_orders
+            if not isinstance(row, dict)
+            or str(row.get("orderId") or row.get("order_id") or "") != wanted]
+        return before - len(self.broker_orders)
+
     def record(self, state: bs.BookState, symbol: str, decision: str, rationale: str,
                model: str | None = None, cost: Any = None,
                prompt_hash: str = "") -> int | None:
@@ -3431,6 +3467,10 @@ def move_resting_stop(tick: BookTick, state: bs.BookState, position: bs.Position
                       f"({answer.get('error') or 'no reason given'}), so no new one was "
                       "placed and the old one is still the live stop")
             return
+        # Out of this tick's view of the broker's working orders as well, so
+        # nothing later in the tick is refused as a duplicate of a stop that is
+        # already gone. See BookTick.forget_order, backlog item 16.
+        tick.forget_order(order_id)
 
     placed = broker.place_order(contract_for({"symbol": symbol}), replacement, ref)
     new_id = placed.get("order_id")
@@ -3572,6 +3612,10 @@ def market_out_unfilled_stops(tick: BookTick, state: bs.BookState,
                           f"cancel ({exc}), so the market order below may leave a "
                           "duplicate resting at the broker")
         state.working_orders.pop(str(order_id), None)
+        # And out of this tick's view of the broker's working orders, or the
+        # market order below is refused as a duplicate of the stop that has just
+        # been cancelled. See BookTick.forget_order, backlog item 16.
+        tick.forget_order(order_id)
 
         intent = gr.OrderIntent(
             symbol=symbol, side="BUY" if position.is_short else "SELL",
@@ -4030,6 +4074,10 @@ def cancel_working_orders(tick: BookTick, state: bs.BookState,
                       "resting at the broker and the next tick tries again")
             continue
         state.working_orders.pop(str(order_id), None)
+        # And out of this tick's view of the broker's working orders, so the
+        # closing order that follows is not refused as a duplicate of the order
+        # just pulled. See BookTick.forget_order, backlog item 16.
+        tick.forget_order(order_id)
         cancelled += 1
         tick.rule("working_order_cancelled",
                   f"{symbol}: order {order_id} ({purpose}) was pulled because {why}",

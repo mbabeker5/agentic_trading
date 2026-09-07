@@ -1485,28 +1485,56 @@ def nothing_left_working(day: date_type) -> Scenario:
                 "came after every one of them, so the book never held a live stop "
                 "and a live closing order at the same moment")
 
-        # WORTH ESCALATING, and found by this scenario rather than by reading the
-        # code. The cancels at 15:45 are right and they work, and the closing
-        # order that should have followed them on the same tick was refused by
-        # the duplicate_order rule, naming the stop the flatten had just
-        # cancelled. main() reads the account's working orders once for the whole
-        # tick, so the duplicate check is looking at a list taken before the
-        # cancels and sees an order that is already gone. The position is closed
-        # on the next look instead, five minutes later here and thirty seconds
-        # later in production, which is why this is evidence and not a failure:
-        # the book is still flat well before the close. The fix is one fresh read
-        # of the working orders after a cancel, and it is in agent/loop.py.
+        # 5. AND ALL OF IT ON ONE TICK. The order of the two is checked above;
+        #    this is whether the flatten finishes the job in the look that starts
+        #    it, or has to come back for it. Backlog item 16, fixed 2026-09-06.
+        if cancels and places:
+            cancelled_at = calls[min(cancels)][0]
+            closed_at = calls[min(places)][0]
+            if cancelled_at == closed_at:
+                evidence.append(
+                    f"every one of those calls was on the {cancelled_at} tick, so the "
+                    "flatten cancelled and closed in one look rather than closing on "
+                    "the next one")
+            else:
+                failures.append(
+                    f"the flatten cancelled at {cancelled_at} and sent no closing "
+                    f"order until {closed_at}, a whole tick later. That is backlog "
+                    "item 16 back again: the closing order is being refused against "
+                    "an order this tick has already cancelled, because the duplicate "
+                    "check is reading the list main() took before the cancels.")
+
+        # WHAT THIS SCENARIO FOUND, and it found it by running rather than by
+        # anybody reading the code. The cancels at 15:45 were right and worked,
+        # and the closing order that should have followed them on the same tick
+        # was refused by the duplicate_order rule, naming the stop the flatten had
+        # just cancelled: main() reads the account's working orders once for the
+        # whole tick, so the duplicate check was looking at a list taken before
+        # the cancels. Nothing was ever left open, because the position closed on
+        # the next look, five minutes later here and thirty seconds later in
+        # production, which is why it was reported as evidence rather than as a
+        # failure. What it cost was a flatten one tick slower than it reads, and
+        # on a fast close that is real.
+        #
+        # Fixed on 2026-09-06 as backlog item 16: a cancel now drops the order it
+        # pulled out of this tick's own view of the working orders, see
+        # BookTick.forget_order in agent/loop.py. So from here on it is a failure
+        # and not a note.
         stale = [r for r in context.ledger.rows_for_rule("duplicate_order")
                  if r.at[11:16] >= "15:45"]
         if stale:
-            evidence.append(
-                "WORTH ESCALATING: the first closing order of the flatten was refused "
-                f"by duplicate_order, {len(stale)} time(s), against an order the same "
-                "tick had already cancelled. main() reads the working orders once a "
-                "tick, so the duplicate check cannot see a cancel made after that "
-                "read. The position was closed on the next look, so nothing is left "
-                f"open, but the flatten is one tick slower than it reads: "
+            failures.append(
+                f"the flatten's closing order was refused by duplicate_order "
+                f"{len(stale)} time(s) from 15:45 on, against an order the same tick "
+                "had already cancelled. A cancel has to drop the order it pulled out "
+                "of this tick's view of the working orders, or the flatten is a tick "
+                "slower than it reads: "
                 + str(stale[0].payload.get("detail"))[:130])
+        else:
+            evidence.append(
+                "nothing was refused by duplicate_order from 15:45 on, so the closing "
+                "order went out against a view of the working orders that the "
+                "flatten's own cancels had already been taken out of")
 
         held = _positions(context, "BOOK_A")
         if held:
@@ -1868,7 +1896,20 @@ def day_trade_counter(day: date_type) -> Scenario:
     market_out_unfilled_stops never calls day_trade_check at all: the round trip
     completes, no pdt_limit row is written, and the allowance is not consulted.
     That is a real hole in agent/loop.py and it is worth fixing there. It is not
-    this scenario, which is about what the rule does when it is asked.
+    this scenario, which is about what the rule does when it is asked. On this
+    day book C's backstop order is turned away by its own resting target, which
+    is a SELL in the same name, so the hole is closed by an accident of the
+    bracket rather than by the rule.
+
+    HOW BOOK A ACTUALLY GETS OUT, since backlog item 16 was fixed on 2026-09-06.
+    Its 1.5 percent stop-limit triggers at 98.50 with its limit just under that,
+    and the 09:50 bar is flat at 97, so the limit cannot fill either. Sixty
+    seconds later the backstop cancels the resting stop and sends a market order
+    on the same tick, and that is the order which closes the position. That
+    market order used to be refused by duplicate_order, naming the very stop the
+    same tick had just cancelled, so the ordinary exit closed the position a tick
+    later instead. The check below accepts either route, because which of the two
+    gets the book out is not what this scenario is about.
 
     ONE NAME EACH, ON PURPOSE. This used to put both books into the same
     ticker, which made it a scenario about symbol exclusivity as well as one
@@ -1965,9 +2006,26 @@ def day_trade_counter(day: date_type) -> Scenario:
                             f"{len(by_book.get('A', []))}")
 
         a_exits = _closings_placed(context, "A", for_a)
+        # The market backstop is a closing order too, and since backlog item 16
+        # was fixed it is the one that actually gets book A out. Its purpose is
+        # "stop" rather than "exit", so _closings_placed above cannot see it:
+        # that helper ignores stops on purpose, because a bracket's stop child
+        # goes out with the entry rather than as a decision to get out. This one
+        # IS a decision to get out, taken sixty seconds after the stop-limit
+        # triggered against a bar that had already fallen past its limit price.
+        a_backstop = [r for r in context.ledger.rows_for_rule("stop_backstop")
+                      if r.book_id == "A"
+                      and for_a in str(r.payload.get("detail") or "")]
         if a_exits:
             evidence.append(f"book A sent {len(a_exits)} closing orders for {for_a}, "
                             "so the flag did not stop it trading")
+        elif a_backstop and context.fake.day_trade_count("BOOK_A"):
+            evidence.append(
+                f"book A got out of {for_a} through the market backstop rather than "
+                "an ordinary exit order: its stop-limit triggered and could not fill, "
+                "so the resting stop was cancelled and the position went out at "
+                "market on that same tick. The flag did not stop it trading and the "
+                "round trip is counted.")
         else:
             failures.append(f"book A never closed {for_a}, so the flag blocked it "
                             "when it should only have been written down")

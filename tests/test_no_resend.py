@@ -336,3 +336,116 @@ def test_a_dry_run_says_it_would_not_send_the_second_one(sandbox, monkeypatch):
     assert answer.allowed is False
     assert "duplicate_order" in answer.rule_ids
     assert tick.refused == 1
+
+
+# ---------------------------------------------------------------------------
+# An order this tick has already cancelled is not a duplicate (item 16)
+# ---------------------------------------------------------------------------
+#
+# main() reads the account's working orders once for the whole tick and hands
+# the same list to all five books, on purpose: five books each asking IB
+# Gateway the same question in the same second is how a data pacing violation
+# happens, and the fifth book's call really did time out at 45 seconds the first
+# time this ran end to end. The cost of reading once was that the duplicate
+# check could not see a cancel made after that read, so the 15:45 flatten
+# cancelled the resting stop and then had its own closing order refused, naming
+# the order it had just pulled. The position closed on the next look, five
+# minutes later in the replay gate and thirty seconds later in production, so
+# nothing was ever left open overnight; what it cost was a flatten one tick
+# slower than it reads.
+#
+# The read is still once a tick. A cancel now edits the list this tick already
+# holds instead of asking for it again.
+
+
+def test_a_cancelled_order_comes_out_of_this_ticks_view_of_the_broker(sandbox):
+    """The whole of item 16, with no broker in it at all."""
+    state = short_book(sandbox)
+    tick = live_tick("B")
+    tick.broker_orders = [{"orderId": 44, "symbol": "RISER", "action": "BUY",
+                           "orderRef": "BOOK_B", "totalQuantity": 100}]
+    assert loop.duplicate_order_reason(tick, state, guard_for("B"), cover())
+
+    assert tick.forget_order(44) == 1
+    assert loop.duplicate_order_reason(tick, state, guard_for("B"), cover()) is None
+    assert tick.forget_order(44) == 0, (
+        "an order this tick's read never saw is not an error, it is an order "
+        "placed and cancelled inside the same tick")
+
+
+def test_the_flatten_gets_out_on_the_same_tick_it_cancels_the_stop(sandbox):
+    """A long with a real stop resting at the broker goes flat in one look.
+
+    The broker here is the replay FakeBroker rather than one of the hand written
+    fakes above, because the bug was about what the ACCOUNT looks like before and
+    after a cancel. A fake that has to be told what its own order book holds
+    could be told the answer the test wanted; this one keeps the order, gives it
+    an id, cancels it and reports it as cancelled on its own.
+
+    Exactly one cancel and exactly one closing order, in that order. Cancel
+    first is not a detail: a live stop and a live closing order in the same name
+    at the same moment can both fill, and then the book is short a position it
+    never opened.
+    """
+    from agent.replay.fake_broker import FakeBroker      # noqa: PLC0415
+
+    def bar(hour: int, minute: int, price: float = 100.0) -> dict:
+        return {"time": at(hour, minute).isoformat(), "open": price, "high": price,
+                "low": price, "close": price, "volume": 100_000, "average": price,
+                "barCount": 50}
+
+    broker = FakeBroker(bars={"AAPL": [bar(15, 40), bar(15, 45)]},
+                        account_id="DUT077572", now=at(15, 46).isoformat())
+
+    # The stop that a morning bracket left resting, as a real order at the
+    # broker with an id of its own.
+    resting = broker.place_order(
+        {"symbol": "AAPL", "secType": "STK", "exchange": "SMART", "currency": "USD"},
+        {"action": "SELL", "totalQuantity": 100, "orderType": "STP",
+         "auxPrice": 98.5, "tif": "DAY"}, "BOOK_A")
+    stop_id = str(resting["order_id"])
+
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000, root=sandbox)
+    state.put_position(bs.Position(
+        symbol="AAPL", qty=100, avg_cost=100.0, entry=100.0, side="long",
+        opened_on="2026-09-08", stop=98.5, trailing_high_or_low=100.0,
+        last_close=100.0, market_value=10000.0))
+    state.working_orders[stop_id] = {
+        "symbol": "AAPL", "purpose": "stop", "price": 98.5, "order_ref": "BOOK_A",
+        "placed_at": at(15, 40).isoformat(), "is_child": True}
+
+    guard = guard_for("A")
+    tick = live_tick("A", at(15, 46))
+    # THE ONCE A TICK READ, exactly as main() does it, taken before the cancel.
+    tick.broker_orders = broker.open_orders()["orders"]
+    assert any(str(row["orderId"]) == stop_id for row in tick.broker_orders)
+
+    calls: list[str] = []
+    real_cancel, real_place = broker.cancel_order, broker.place_order
+
+    def counted_cancel(order_id):
+        calls.append(f"cancel {order_id}")
+        return real_cancel(order_id)
+
+    def counted_place(contract, order, order_ref):
+        calls.append(f"place {order.get('action')} {order.get('totalQuantity')} "
+                     f"{contract.get('symbol')} {order.get('orderType')}")
+        return real_place(contract, order, order_ref)
+
+    broker.cancel_order = counted_cancel
+    broker.place_order = counted_place
+
+    loop.do_flatten(tick, state, loop.plan_for(tick.book, guard), guard, broker,
+                    bs.account_state_for(state, gr, at(15, 46), "DUT077572", False),
+                    loop.read_guards(sandbox))
+
+    assert calls == [f"cancel {stop_id}", "place SELL 100 AAPL LMT"], (
+        "one cancel and one closing order, on this tick, the cancel first")
+    assert tick.refused == 0, (
+        "the closing order used to be refused as a duplicate of the stop the "
+        "same tick had just cancelled")
+    assert tick.sent == 1
+    assert stop_id not in state.working_orders
+    assert not any(str(row.get("orderId")) == stop_id
+                   for row in broker.open_orders()["orders"]), (
+        "the stop is really gone from the broker, not just from the book file")
