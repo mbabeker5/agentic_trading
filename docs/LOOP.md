@@ -85,6 +85,16 @@ Also never sold at the close.
 
 A book on a thirty minute clock works out whether it is due from when it last looked, not from the minute hand. So a tick missed because the Mac was asleep does not push the whole day out of step.
 
+### Weekends and market holidays
+
+A day the US market is shut is the `closed` phase for every book, from midnight to midnight. Weekends always were. Holidays are as well, since 2026-09-07, and they come from `schedule.holidays` in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml`, which names the closures left in 2026: Labor Day, Thanksgiving and Christmas. Add next year's in December.
+
+On a closed day no book sweeps, scans, picks, flattens or writes the day up, and the reason on the phase names the date, so a line in `loop.log` reads `phase=closed` and `why=2026-09-07 is a US market holiday`. The holiday is checked before the sweeps on purpose: there is nothing for book C's 07:00 or book D's 07:30 sweep to gather for, because the pick it feeds cannot happen either.
+
+The tick itself still runs. Reconciliation still compares the books against the broker, each book still saves its state file, each still gets its line in the log, and the heartbeat is still touched. That last one matters most: `agent/deadman.py` flattens the account when the heartbeat goes stale, so a holiday that skipped the tick entirely would be far worse than one that traded.
+
+`agent/guardrails.py` holds the one answer, `is_trading_day`, and `is_regular_hours` asks it, so the phase the loop picks and the order checks cannot disagree about what a closed day is.
+
 ### How often the loop wakes up, and who decides
 
 Since Momentum v2 the cadence is a number the books work out, not a number in the launchd job (item A14). A momentum book asks to be looked at every 30 seconds between 09:35 and 11:00 while it is holding a position or has a working order, and every 5 minutes the rest of the time. The insider and Congress books have no fast window at all, so they always ask for their own five or thirty minutes. The reason for the fast window is the stop: a stop this tight needs sub-minute resolution, even with the stop itself resting at the broker.
@@ -415,6 +425,8 @@ A book whose quotes are not live is halted, cause `market_data`, which means it 
 
 Now the code is kept, the book is halted for as long as it lasts, and the alert says what it means and what to do about it: close the TWS window or the mobile app and it clears itself on the next tick.
 
-### Holidays are known to the day trade counter and to nothing else
+### Holidays were known to the day trade counter and to nothing else, until 2026-09-07
 
-`schedule.holidays` in `config/guardrails.yaml` is read by `agent/pdt.py` to work out what a business day is. The order checks in `agent/guardrails.py` still know about weekends only. The loop will happily decide it is a trading day on Thanksgiving; the shortlist will be empty and nothing will happen, but the log will say `manage` rather than `closed`.
+Fixed, backlog item 9. `schedule.holidays` had named Labor Day since commit `96c50c7` and only `agent/pdt.py` and `agent/deadman.py` read it, so the loop called Monday 2026-09-07 an ordinary trading day: book D ran its 07:30 Congress sweep that morning, and the momentum books would have run the pre-open, the opening range and the 09:35 pick against a shut market. `is_trading_day` in `agent/guardrails.py` is now the one answer, `is_regular_hours` asks it, and the loop puts every book in the `closed` phase all day. See "Weekends and market holidays" above.
+
+What still knows only about weekends: `entries_allowed_now`, `must_flatten_now`, `must_flatten_at_market_now`, `next_tick_seconds` and `trading_days_between` in `agent/guardrails.py`. None of them can be reached on a holiday now that the phase is `closed`, so it costs nothing today. It would matter if anything ever called them from outside the loop.

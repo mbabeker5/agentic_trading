@@ -17,7 +17,7 @@ Improvements ranked by how much risk they remove, highest first. Operational ite
 | 6b | Watchdog verifies a restart by new pid and fresh login time, not by the start script's exit code | A dead Gateway reported as restarted | operational | shipped c0d29f9 |
 | 7 | Portability: single project root, generated launchd, MIGRATION.md | Cannot move to the Mac Mini without a rewrite | operational | shipped |
 | 8 | Fill quality tracking: decided price versus fill price per book | Paper results that hide slippage | operational | ledger columns shipped c2e995a; loop passes decision price in the Momentum v2 pass |
-| 9 | Holiday calendar in guardrails | Loop treats a market holiday as a trading day | operational | queued |
+| 9 | Holiday calendar in guardrails | Loop treats a market holiday as a trading day | operational | shipped f8e719a |
 | 10 | Consolidated quote feed ($10 IBKR bundle) | Pricing limit orders off a fifth of the market | data, Mo's call | proposed |
 | 11 | Second free data source for Congress trades | Single volunteer-run mirror going stale | data | proposed |
 | 12 | Go live ramp (Mo's decision D4, 2026-09-06): 10 percent of intended size for 10 sessions, then 25, then 50, then full, with an automatic drop back to paper on a cap breach, an unreconciled position, a crash holding a position, two daily cap hits in five sessions, drawdown over 8 percent, or live slippage above twice paper | Going live at full size on a machine that has never handled real money | operational | ladder and demotion triggers written into config/books.yaml as `live_ramp` and a per book `ramp_step`; the code that enforces the session count and the demotion triggers is NOT built |
