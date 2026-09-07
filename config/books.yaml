@@ -46,7 +46,7 @@
 #                  is no argument later about which version of the numbers and
 #                  the guardrails was signed off
 #
-# rules_commit is stamped on books A, B and E as of 2026-09-06: 51da883. It says
+# rules_commit is stamped on books A, B and E as of 2026-09-07: 38912d9. It says
 # WHICH RULES THE BOOK RUNS. It is not a promotion: promoted_on is still empty on
 # all five books, every one of them is still on dry_run, and a book cannot be set
 # to tiny or full without both fields filled in. Books C and D keep an empty
@@ -218,14 +218,16 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 51da883          # the git hash of the rules this book runs
+    rules_commit: 38912d9          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
       loop and guardrail fixes the replay gate found on the evening of
       2026-09-06, then to the flatten refusing to trust a feed it cannot read,
       and then to a cancel this tick has made no longer counting as an order
       still resting, so the flatten gets out on the tick it cancels the stop.
-      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06.
+      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06,
+      then to 38912d9 on 2026-09-07, when a position no book claims began
+      halting every book (hub ruling, backlog item 0b).
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -247,14 +249,16 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 51da883          # the git hash of the rules this book runs
+    rules_commit: 38912d9          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
       loop and guardrail fixes the replay gate found on the evening of
       2026-09-06, then to the flatten refusing to trust a feed it cannot read,
       and then to a cancel this tick has made no longer counting as an order
       still resting, so the flatten gets out on the tick it cancels the stop.
-      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06.
+      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06,
+      then to 38912d9 on 2026-09-07, when a position no book claims began
+      halting every book (hub ruling, backlog item 0b).
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-
@@ -316,14 +320,16 @@ books:
     ramp_step:                   # empty until this book trades real money. See
                                  # the go live ramp at the top of this file.
     promoted_on:                 # empty until the hub approves this book
-    rules_commit: 51da883          # the git hash of the rules this book runs
+    rules_commit: 38912d9          # the git hash of the rules this book runs
     rules_commit_note: >-
       Momentum v2 per Mo's decisions 2026-09-06, carried forward to the nine
       loop and guardrail fixes the replay gate found on the evening of
       2026-09-06, then to the flatten refusing to trust a feed it cannot read,
       and then to a cancel this tick has made no longer counting as an order
       still resting, so the flatten gets out on the tick it cancels the stop.
-      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06.
+      Moved 03e5318 to f840f0f to b04298a to 51da883, all on 2026-09-06,
+      then to 38912d9 on 2026-09-07, when a position no book claims began
+      halting every book (hub ruling, backlog item 0b).
     start_date: 2026-09-08
     end_date: 2026-10-06
     notes: >-

@@ -83,12 +83,31 @@ every day, or a comma separated list of day names such as "friday" or
 have a five minute grid during the day and an hourly one at night without
 firing twice at 10:00.
 
-ONE THING TO WATCH. launchd works in the Mac's own time zone. There is no
-setting inside a plist that pins one. The market keeps New York hours whatever
-the Mac thinks, so every one of these jobs also sets TZ so the scripts agree,
-but the WAKE UP TIMES are the Mac's local clock. Move to a Mac set to another
-time zone and either set that Mac to Eastern or shift every time in the
-templates. The generated files say so at the top.
+THE TIME ZONE, WHICH IS THE SUBTLE PART. launchd fires a job on the Mac's own
+clock and there is no setting inside a plist that pins a zone. The market keeps
+New York hours whatever the Mac thinks.
+
+So every [schedule] line is written in New York time and this script converts
+it. It asks the operating system what zone the Mac is actually in, works out the
+gap to New York in minutes, moves every wake up by that gap, and stamps the zone
+and the gap into the plist it writes. On a Mac in Pacific, "every 5 minutes from
+09:30 to 16:00" comes out as 06:30 to 13:00 local, which is the same real
+moments. On a Mac in Eastern the gap is zero and the conversion changes nothing.
+
+A wake up pushed across midnight takes its weekday with it, because a job that
+fires on Sunday at 22:00 New York is a Monday job in Tokyo.
+
+--check refuses to pass when the stamp no longer matches the Mac, which is how
+this stops being a note in the docs that everybody trusts and nobody rereads.
+agent/watchdog.py asks the same question every hour and agent/preflight.py asks
+it at 09:00, so a zone that moves overnight is caught rather than discovered
+from a day of ticks that never happened. All of that lives in
+agent/timezone_check.py, which is the one place that knows the answer.
+
+Why this exists: on the night of 2026-09-06 this Mac relinked /etc/localtime to
+America/Los_Angeles on its own, because macOS was set to pick the zone from the
+current location, and all nine jobs silently became three hours late. Nothing
+noticed, because a plist that says "Hour 9" looks correct in every way.
 
 A FILE IN THAT FOLDER MAY NOT BE A TEMPLATE AT ALL, whatever its name suggests.
 A whole finished plist with {ROOT} written through it, made by hand, holds no
@@ -112,6 +131,7 @@ order under any circumstances.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import plistlib
 import re
@@ -119,6 +139,33 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _load_timezone_check():
+    """Import agent/timezone_check.py without this script being a package.
+
+    From THIS FILE's own folder and never from --root. A test runs the generator
+    with --root pointing at a throwaway copy of the templates folder, which has
+    no agent/ beside it, and the zone arithmetic still has to work there.
+
+    It is stdlib only on the other side, so importing it costs nothing and does
+    not break the promise that this script runs on a fresh Mac before the
+    virtual environment exists.
+    """
+    here = Path(__file__).resolve().parent.parent / "agent" / "timezone_check.py"
+    spec = importlib.util.spec_from_file_location("agentic_timezone_check", here)
+    if spec is None or spec.loader is None:      # pragma: no cover
+        raise ImportError(f"cannot load {here}")
+    module = importlib.util.module_from_spec(spec)
+    # In sys.modules BEFORE it runs. A frozen dataclass in there asks
+    # sys.modules for its own module while the class is being built, and gets
+    # None and an AttributeError if the module is not registered yet.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+tz = _load_timezone_check()
 
 # ------------------------------------------------------------------ where things are
 
@@ -226,6 +273,23 @@ def expand_rule(rule: str) -> list[tuple[int, int, int]]:
         raise TemplateError(f"{rule!r} ends before it starts")
     times = list(range(start, end + 1, step))
     return [(d, t // 60, t % 60) for d in days for t in times]
+
+
+def to_local(entries: list[dict[str, int]], shift: int) -> list[dict[str, int]]:
+    """New York wake ups moved onto the Mac's clock.
+
+    A constant shift, so it is a one to one mapping and the number of wake ups
+    never changes, which is what lets EXPECTED_WAKE_UPS in tests/test_paths.py
+    stay a single number per job whatever zone the Mac is in.
+
+    Re-sorted afterwards, because a wrap across midnight moves entries to
+    another weekday and two runs of this script must write the same bytes.
+    """
+    if shift == 0:
+        return list(entries)
+    moved = [tz.shift_entry(entry["Weekday"], entry["Hour"], entry["Minute"], shift)
+             for entry in entries]
+    return [{"Weekday": w, "Hour": h, "Minute": m} for w, h, m in sorted(moved)]
 
 
 def expand_schedule(rules: list[str]) -> list[dict[str, int]]:
@@ -412,13 +476,24 @@ def parse_template(path: Path) -> dict:
 # ------------------------------------------------------------------ writing a plist
 
 def substitutions(root: Path, venv_python: Path, home: Path,
-                  label_prefix: str, claude: str) -> dict[str, str]:
+                  label_prefix: str, claude: str,
+                  local_zone: str = tz.MARKET_ZONE,
+                  shift: int = 0) -> dict[str, str]:
+    """The placeholder table, plus the two values the conversion needs.
+
+    local_zone and shift default to New York and zero, which is the same as no
+    conversion at all. That default is for callers that only care about the
+    paths, and for the tests that predate the conversion. main() always passes
+    the real answers.
+    """
     return {
         "{ROOT}": str(root),
         "{VENV_PYTHON}": str(venv_python),
         "{HOME}": str(home),
         "{LABEL_PREFIX}": label_prefix,
         "{CLAUDE}": claude,
+        "{LOCAL_ZONE}": local_zone,
+        "{SHIFT_MINUTES}": str(shift),
     }
 
 
@@ -432,11 +507,50 @@ def _xml(text: str) -> str:
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def zone_note(local_zone: str, shift: int) -> list[str]:
+    """The lines in the generated plist that say what was converted into what.
+
+    Written for whoever opens the file at 09:31 wondering why nothing fired.
+    Kept free of any double hyphen, because XML forbids that inside a comment.
+    """
+    if shift == 0:
+        return [
+            f"  TIME ZONE: this Mac is in {local_zone}, the market's own zone, so",
+            "  the wake up times below are New York times exactly as the template",
+            "  writes them. Nothing was converted.",
+        ]
+    hours = abs(shift) / 60
+    way = "behind" if shift < 0 else "ahead of"
+    example_w, example_h, example_m = tz.shift_entry(1, 9, 30, shift)
+    days = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+            "Saturday")
+    return [
+        f"  TIME ZONE: this Mac is in {local_zone}, which is {hours:g} hours "
+        f"{way}",
+        f"  New York. The template's schedule is written in "
+        f"{tz.MARKET_ZONE}, and every",
+        f"  wake up below has been moved by {shift} minutes so that it lands on the",
+        "  New York minute the template asked for. Monday 09:30 New York is "
+        f"{days[example_w]}",
+        f"  {example_h:02d}:{example_m:02d} on this Mac's clock, and that is what "
+        "launchd is given.",
+        "",
+        "  Move this Mac to another zone and every time below is wrong. Run the",
+        "  generator again and it fixes itself. The watchdog and the pre-flight",
+        "  both check this every day, so a zone that moves overnight is caught.",
+    ]
+
+
 def render(template: dict, subs: dict[str, str]) -> str:
     """One template plus one set of substitutions to one plist, as text."""
     label = f"{subs['{LABEL_PREFIX}']}.{template['name']}"
     root = subs["{ROOT}"]
-    entries = expand_schedule([fill(rule, subs) for rule in template["schedule"]])
+    local_zone = subs.get("{LOCAL_ZONE}", tz.MARKET_ZONE)
+    shift = int(subs.get("{SHIFT_MINUTES}", "0"))
+
+    # The template's times are New York times. These are the Mac's.
+    market_entries = expand_schedule([fill(rule, subs) for rule in template["schedule"]])
+    entries = to_local(market_entries, shift)
 
     comment = fill(template["comment"], subs)
     if "--" in comment:
@@ -457,9 +571,10 @@ def render(template: dict, subs: dict[str, str]) -> str:
         f"  from {root}/config/launchd/templates/{template['source'].name}",
         "",
         "  launchd works in this Mac's own local time. There is no setting in here",
-        "  that pins a time zone, so the times below are this Mac's clock. The",
-        "  market keeps New York hours whatever the Mac thinks. Keep the Mac on",
-        "  Eastern, or change every time in the template and generate again.",
+        "  that pins a time zone, so the times below are this Mac's clock, and the",
+        "  market keeps New York hours whatever the Mac thinks.",
+        "",
+    ] + zone_note(local_zone, shift) + [
         "",
         "  NOT LOADED by writing this file. Loading is a separate, deliberate step,",
         "  one command, written out in full in:",
@@ -500,9 +615,16 @@ def render(template: dict, subs: dict[str, str]) -> str:
             f"    <string>{_xml(fill(template['stdin'], subs))}</string>",
         ]
 
+    # The stamp. agent/timezone_check.py reads these two back out of the
+    # installed plist and says whether they still describe the Mac, which is
+    # what the watchdog, the pre-flight and --check all ask.
+    environment = dict(template["environment"])
+    environment[tz.ZONE_KEY] = local_zone
+    environment[tz.SHIFT_KEY] = str(shift)
+
     lines += ["", "    <key>EnvironmentVariables</key>", "    <dict>"]
-    for key in sorted(template["environment"]):
-        value = fill(template["environment"][key], subs)
+    for key in sorted(environment):
+        value = fill(environment[key], subs)
         lines.append(f"      <key>{_xml(key)}</key><string>{_xml(value)}</string>")
     lines += [
         "    </dict>",
@@ -517,7 +639,7 @@ def render(template: dict, subs: dict[str, str]) -> str:
         "    <key>RunAtLoad</key>",
         f"    <{'true' if template['run_at_load'] else 'false'}/>",
         "",
-        f"    <!-- {len(entries)} wake ups a week. -->",
+        f"    <!-- {len(entries)} wake ups a week, on this Mac's clock. -->",
         "    <key>StartCalendarInterval</key>",
         "    <array>",
     ]
@@ -582,6 +704,55 @@ def generate(root: Path, out_dir: Path, subs: dict[str, str]) -> dict[Path, str]
     return written
 
 
+def check_zone(out_dir: Path, label_prefix: str, local_zone: str, shift: int,
+               root: Path, skip: set[str] | None = None) -> int:
+    """Do the plists on disk still describe this Mac's clock? Returns problems.
+
+    Read out of the files rather than worked out again, because the stamp is
+    the only record of what the times in a plist actually mean. A plist with no
+    stamp was written before the conversion existed and is reported as needing
+    a regeneration rather than as a fault, which is the same restraint the
+    watchdog shows.
+    """
+    if not out_dir.is_dir():
+        return 0
+    # A plist rendered by hand from a finished plist in the templates folder
+    # carries no stamp and never will, because nothing here wrote it. Judging
+    # it would mean telling you to regenerate a file this script cannot make.
+    ignore = skip or set()
+    plists = [path for path in sorted(out_dir.glob(f"{label_prefix}.*.plist"))
+              if path.name not in ignore]
+    if not plists:
+        return 0
+
+    unstamped = [path for path in plists if tz.read_stamp(path) is None]
+    stamps = {path: tz.read_stamp(path) for path in plists}
+    wrong = {path: stamp for path, stamp in stamps.items()
+             if stamp and (stamp.zone != local_zone or stamp.shift != shift)}
+
+    if unstamped:
+        print(f"NO ZONE  {len(unstamped)} plist(s) carry no time zone stamp, so "
+              "there is no way to tell")
+        print("         what clock their wake up times are on. Generate again.")
+        for path in unstamped[:3]:
+            print(f"         {path}")
+        return 1
+
+    if not wrong:
+        print(f"zone     {local_zone}, {shift} minutes from {tz.MARKET_ZONE}, "
+              "matches every plist")
+        return 0
+
+    example = sorted(wrong.values(), key=lambda s: s.zone)[0]
+    print(f"WRONG ZONE  the plists were written for {example.zone} at "
+          f"{example.shift} minutes from {tz.MARKET_ZONE},")
+    print(f"            and this Mac is now in {local_zone} at {shift} minutes. "
+          f"{len(wrong)} of {len(plists)}")
+    print("            plist(s) are firing at the wrong minute of the day.")
+    print(f"            Fix it, which also loads them:  {tz.fix_command(root)}")
+    return 1
+
+
 def do_install(files: list[Path]) -> int:
     """Copy the plists into ~/Library/LaunchAgents and ask launchd to load them.
 
@@ -643,6 +814,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--claude", default=None,
                         help="path to the claude command for the headless jobs "
                              "(default: found on this Mac)")
+    parser.add_argument("--local-zone", default=None,
+                        help="the zone to convert the New York schedules into "
+                             "(default: whatever /etc/localtime says this Mac "
+                             "is set to). Only pass this to see what another "
+                             "machine's files would look like.")
     parser.add_argument("--check", action="store_true",
                         help="say whether the files on disk already match, change nothing")
     parser.add_argument("--install", action="store_true",
@@ -658,7 +834,20 @@ def main(argv: list[str] | None = None) -> int:
     home = Path(args.home).expanduser() if args.home else Path.home()
     claude = args.claude or find_claude()
 
-    subs = substitutions(root, venv_python, home, args.label_prefix, claude)
+    # The zone the wake up times get converted into, and the gap in minutes
+    # that does the converting. Asked once here so that every plist in one run
+    # carries the same stamp even if the run straddles a clock change.
+    try:
+        local_zone = args.local_zone or tz.system_zone_name()
+        shift = tz.shift_minutes(local_zone)
+    except tz.ZoneUnknown as exc:
+        print(f"ERROR: {exc}\n\nThis script will not guess a time zone. Every "
+              "wake up time in every plist depends\non the answer, and a wrong "
+              "guess is a day of ticks that never happened.", file=sys.stderr)
+        return 2
+
+    subs = substitutions(root, venv_python, home, args.label_prefix, claude,
+                         local_zone, shift)
 
     try:
         rendered = generate(root, out_dir, subs)
@@ -672,6 +861,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         problems = 0
         template_dir = root / "config" / "launchd" / "templates"
+
+        # The zone first, on its own, before any file is compared. A Mac that
+        # has moved zone makes every plist differ, and "DIFFERS, no longer
+        # matches its template" would send you looking at a template that is
+        # perfectly fine. This says what actually happened.
+        hand_made = {f"{args.label_prefix}.{job_name_from_filename(path)}.plist"
+                     for path in pre_rendered_templates(root)}
+        problems += check_zone(out_dir, args.label_prefix, local_zone, shift,
+                               root, hand_made)
 
         # Start from the templates, not from the plists on disk. A template that
         # nobody ever generated has no plist to compare, so a check that walks
@@ -725,10 +923,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if problems:
             print(f"\n{problems} problem(s) above. A plist that is missing or "
-                  "out of date is fixed by\nrunning this script without --check. "
-                  "An orphan has to be deleted by hand,\non purpose, because a "
-                  "loaded job's file is not something this script\nshould remove "
-                  "behind your back.")
+                  "out of date is fixed by\nrunning this script without --check, "
+                  "and a wrong time zone by running it\nwith --install, which "
+                  "rewrites them and reloads them in one step. An orphan\nhas to "
+                  "be deleted by hand, on purpose, because a loaded job's file is "
+                  "not\nsomething this script should remove behind your back.")
         return 1 if problems else 0
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -742,6 +941,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nroot:        {root}")
     print(f"venv python: {venv_python}")
     print(f"claude:      {claude}")
+    print(f"this Mac:    {local_zone}")
+    if shift:
+        moved = tz.shift_entry(1, 9, 30, shift)
+        print(f"converted:   every wake up moved {shift} minutes from "
+              f"{tz.MARKET_ZONE}, so 09:30")
+        print(f"             New York fires at {moved[1]:02d}:{moved[2]:02d} on "
+              "this Mac's clock")
+    else:
+        print(f"converted:   nothing, this Mac is already on {tz.MARKET_ZONE}")
     print("\nNothing has been loaded. To load, and only when you mean it:")
     print(f"  python3 {root}/scripts/gen_launchd.py --install")
 

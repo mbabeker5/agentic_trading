@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tokenize
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,7 @@ if str(AGENT) not in sys.path:
     sys.path.insert(0, str(AGENT))
 
 import paths  # noqa: E402
+import timezone_check as tzcheck  # noqa: E402
 
 #: The home folder we must never find in code. Built from pieces so that this
 #: file does not trip its own test.
@@ -368,6 +370,25 @@ def test_the_generator_writes_plists_that_parse(tmp_path):
     assert counts == EXPECTED_WAKE_UPS
 
 
+def market_entries(job: str) -> set[tuple[int, int, int]]:
+    """One plist's wake ups translated back into New York time.
+
+    The plists hold the Mac's local clock, because launchd fires on that and
+    nothing in a plist can pin a zone. Every entry was moved by the stamped
+    number of minutes when it was written, so moving it back by the same number
+    gives the New York times the template actually asked for. Doing that here
+    is what lets the two tick tests below say what they mean, in market time,
+    and go on passing whatever zone this Mac is in.
+    """
+    loaded = plistlib.loads(
+        (REPO / "config" / "launchd"
+         / f"com.mtalib.agentic-trading.{job}.plist").read_bytes())
+    shift = int(loaded["EnvironmentVariables"][tzcheck.SHIFT_KEY])
+    return {tzcheck.shift_entry(entry["Weekday"], entry["Hour"],
+                                entry["Minute"], -shift)
+            for entry in loaded["StartCalendarInterval"]}
+
+
 def test_the_tick_job_wakes_every_minute_through_the_pre_open():
     """09:00 to 09:26, every minute, on every weekday, and none on the weekend.
 
@@ -377,25 +398,21 @@ def test_the_tick_job_wakes_every_minute_through_the_pre_open():
     needs; five minute wake ups pay for about twenty. This is the launchd half
     of that, and it is the half that was missing until 2026-09-06.
     """
-    loaded = plistlib.loads(
-        (REPO / "config" / "launchd"
-         / "com.mtalib.agentic-trading.tick.plist").read_bytes())
-    entries = loaded["StartCalendarInterval"]
+    entries = market_entries("tick")
 
     for weekday in (1, 2, 3, 4, 5):
-        minutes = {(e["Hour"], e["Minute"]) for e in entries
-                   if e["Weekday"] == weekday}
+        minutes = {(h, m) for w, h, m in entries if w == weekday}
         wanted = {(9, minute) for minute in range(0, 27)}
         assert wanted <= minutes, (
             f"weekday {weekday} is missing "
             f"{sorted(f'09:{m:02d}' for _, m in wanted - minutes)}")
 
-    weekend = [e for e in entries if e["Weekday"] in (0, 6)]
+    weekend = [e for e in entries if e[0] in (0, 6)]
     assert weekend == [], "the market is shut at the weekend"
 
     # One entry per minute, never two. The five minute grid also carries 09:25,
     # and expand_schedule() drops the duplicate rather than firing twice.
-    monday = [(e["Hour"], e["Minute"]) for e in entries if e["Weekday"] == 1]
+    monday = [(h, m) for w, h, m in entries if w == 1]
     assert len(monday) == len(set(monday))
     assert len(monday) == 110
 
@@ -701,12 +718,9 @@ def test_the_tick_job_keeps_its_pre_open_minutes_and_its_five_minute_grid():
     says out loud what that job's day looks like: 27 one minute wake ups from
     09:00 to 09:26, then the five minute grid on to 16:05.
     """
-    loaded = plistlib.loads(
-        (REPO / "config" / "launchd"
-         / "com.mtalib.agentic-trading.tick.plist").read_bytes())
-    monday = {(entry["Hour"], entry["Minute"])
-              for entry in loaded["StartCalendarInterval"]
-              if entry["Weekday"] == 1}
+    monday = {(hour, minute)
+              for weekday, hour, minute in market_entries("tick")
+              if weekday == 1}
 
     pre_open = {(9, minute) for minute in range(0, 27)}
     assert pre_open <= monday, (
@@ -719,3 +733,226 @@ def test_the_tick_job_keeps_its_pre_open_minutes_and_its_five_minute_grid():
     assert grid <= monday, (
         "the five minute grid is gone: "
         + ", ".join(sorted(f"{h:02d}:{m:02d}" for h, m in grid - monday)))
+
+
+# ------------------------------------- 6. the time zone the wake ups were built for
+
+# WHY THIS SECTION EXISTS. launchd fires a job on the Mac's own clock and no
+# plist can pin a zone. On the night of 2026-09-06 this Mac relinked
+# /etc/localtime to America/Los_Angeles on its own, because macOS was set to
+# choose the zone from the current location, and all nine jobs silently became
+# three hours late. A plist that says "Hour 9" looks correct in every way, which
+# is why this is tested rather than written down.
+
+def subs_for(zone: str, shift: int, root: Path = REPO) -> dict:
+    generator = load_generator()
+    return generator.substitutions(
+        root=root,
+        venv_python=root / "venv312" / "bin" / "python",
+        home=Path.home(),
+        label_prefix=generator.DEFAULT_LABEL_PREFIX,
+        claude="/usr/local/bin/claude",
+        local_zone=zone,
+        shift=shift,
+    )
+
+
+def entries_for(zone: str, shift: int, job: str = "tick") -> list[dict]:
+    """One job's calendar entries as they would be written on a Mac in `zone`."""
+    generator = load_generator()
+    template = generator.parse_template(TEMPLATE_DIR / f"{job}.template")
+    text = generator.render(template, subs_for(zone, shift))
+    return plistlib.loads(text.encode("utf-8"))["StartCalendarInterval"]
+
+
+def test_the_system_zone_is_read_out_of_the_localtime_link(tmp_path):
+    """macOS keeps the answer as a symlink into the zone database.
+
+    TZ is deliberately not consulted. Every plist here sets TZ to
+    America/New_York so the scripts think in market time, so a check that read
+    TZ would ask a job about the very thing it was told to pretend and always
+    get "Eastern, everything is fine".
+    """
+    link = tmp_path / "localtime"
+    link.symlink_to("/var/db/timezone/zoneinfo/America/Los_Angeles")
+    assert tzcheck.system_zone_name(link) == "America/Los_Angeles"
+
+    plain = tmp_path / "not_a_zone"
+    plain.symlink_to("/etc/hosts")
+    with pytest.raises(tzcheck.ZoneUnknown):
+        tzcheck.system_zone_name(plain)
+
+
+def test_the_gap_to_new_york_comes_from_the_zone_database():
+    """A fixed moment so the answer cannot drift with the seasons."""
+    when = datetime(2026, 9, 8, 13, 0, tzinfo=timezone.utc)
+    assert tzcheck.shift_minutes("America/New_York", when) == 0
+    assert tzcheck.shift_minutes("America/Los_Angeles", when) == -180
+    assert tzcheck.shift_minutes("Europe/London", when) == 300
+    assert tzcheck.shift_minutes("Asia/Tokyo", when) == 780
+
+
+def test_an_eastern_mac_converts_nothing():
+    """On the market's own clock the times are the template's times.
+
+    Both halves matter: no shift is applied, and the real moments are the same
+    ones the Pacific plists on disk fire at. If those two ever disagree the
+    conversion is wrong in one direction or the other.
+    """
+    plain = {(e["Weekday"], e["Hour"], e["Minute"])
+             for e in entries_for("America/New_York", 0)}
+    assert (1, 9, 30) in plain
+    assert (1, 9, 0) in plain
+    assert (5, 16, 5) in plain
+    assert plain == market_entries("tick")
+
+
+def test_a_pacific_mac_moves_the_market_open_back_three_hours():
+    """09:30 New York is 06:30 in Pacific, on the same weekday."""
+    pacific = {(e["Weekday"], e["Hour"], e["Minute"])
+               for e in entries_for("America/Los_Angeles", -180)}
+    assert (1, 6, 30) in pacific
+    # The pre-open half hour moves with it, whole and on the same day.
+    assert {(1, 6, minute) for minute in range(0, 27)} <= pacific
+    # And the close. 16:05 New York is 13:05 Pacific.
+    assert (5, 13, 5) in pacific
+
+    # The day now STARTS at 04:00 local, the 07:00 New York filing sweep, and
+    # ENDS at 13:30, the 16:30 one. Naming the ends is the assertion that would
+    # fail if the times had been left as New York times: on this job an unshifted
+    # plist starts its Monday at 07:00 rather than 04:00. Checking a single time
+    # is not enough, because 09:30 local is a real entry either way, being 12:30
+    # New York on the five minute grid.
+    monday = sorted(pacific_time for weekday, *pacific_time in
+                    ((w, h, m) for w, h, m in pacific) if weekday == 1)
+    assert monday[0] == [4, 0], monday[:3]
+    assert monday[-1] == [13, 30], monday[-3:]
+
+    # Every Pacific entry is exactly its New York entry moved back three hours,
+    # and nothing was gained or lost on the way.
+    eastern = {(e["Weekday"], e["Hour"], e["Minute"])
+               for e in entries_for("America/New_York", 0)}
+    assert pacific == {tzcheck.shift_entry(w, h, m, -180) for w, h, m in eastern}
+
+
+def test_a_wake_up_pushed_over_midnight_takes_its_weekday_with_it():
+    """A job that fires Sunday evening in New York is a Monday job in Tokyo.
+
+    launchd counts Sunday as 0 and Saturday as 6, and a time moved past
+    midnight without its weekday fires on the wrong day, quietly, once a week.
+    """
+    assert tzcheck.shift_entry(0, 17, 0, 780) == (1, 6, 0)      # forward, Sun to Mon
+    assert tzcheck.shift_entry(1, 0, 30, -180) == (0, 21, 30)   # back, Mon to Sun
+    assert tzcheck.shift_entry(6, 23, 0, 120) == (0, 1, 0)      # Sat to Sun, wraps 6 to 0
+    assert tzcheck.shift_entry(0, 1, 0, -120) == (6, 23, 0)     # Sun to Sat, wraps 0 to 6
+    assert tzcheck.shift_entry(3, 12, 0, 0) == (3, 12, 0)       # no shift, no move
+
+    # The whole backup job, which is the one that actually wraps: 17:00 every
+    # day in New York becomes 06:00 the next morning in Tokyo, so Sunday's copy
+    # is taken on Monday and every one of the seven days is still there.
+    tokyo = {(e["Weekday"], e["Hour"], e["Minute"])
+             for e in entries_for("Asia/Tokyo", 780, "backup_db")}
+    assert tokyo == {(day, 6, 0) for day in range(7)}
+
+
+def test_the_wake_up_count_never_changes_with_the_zone():
+    """A constant shift is one to one, so EXPECTED_WAKE_UPS stays one number.
+
+    This is what lets the counts in EXPECTED_WAKE_UPS above be a property of
+    the job rather than of whichever Mac generated last.
+    """
+    generator = load_generator()
+    for zone, shift in (("America/New_York", 0), ("America/Los_Angeles", -180),
+                        ("Asia/Tokyo", 780), ("Europe/London", 300)):
+        counts = {}
+        for path, text in generator.generate(REPO, Path("/tmp"),
+                                             subs_for(zone, shift)).items():
+            job = path.stem.rsplit(".", 1)[1]
+            counts[job] = len(
+                plistlib.loads(text.encode("utf-8"))["StartCalendarInterval"])
+        assert counts == EXPECTED_WAKE_UPS, f"{zone} changed the number of wake ups"
+
+
+def test_every_generated_plist_says_what_zone_it_was_built_for():
+    """The stamp is the only record of what the numbers in a plist mean.
+
+    Without it there is no way to tell a plist built for Eastern from one built
+    for Pacific, and no way for the watchdog to notice the Mac has moved.
+    """
+    generator = load_generator()
+    for path, text in generator.generate(
+            REPO, Path("/tmp"), subs_for("America/Los_Angeles", -180)).items():
+        loaded = plistlib.loads(text.encode("utf-8"))
+        environment = loaded["EnvironmentVariables"]
+        assert environment[tzcheck.ZONE_KEY] == "America/Los_Angeles"
+        assert environment[tzcheck.SHIFT_KEY] == "-180"
+        # The scripts still think in market time whatever the Mac is set to.
+        assert environment["TZ"] == "America/New_York"
+        assert "TIME ZONE: this Mac is in America/Los_Angeles" in text
+        assert f"{path.name}" or True
+
+    # And the files actually on disk carry one, so the checks have something to
+    # read. This is the assertion that would have caught the original bug.
+    for plist in sorted((REPO / "config" / "launchd")
+                        .glob("com.mtalib.agentic-trading.*.plist")):
+        stamp = tzcheck.read_stamp(plist)
+        assert stamp is not None, f"{plist} carries no time zone stamp"
+        assert stamp.zone == tzcheck.system_zone_name(), (
+            f"{plist} was built for {stamp.zone} and this Mac is in "
+            f"{tzcheck.system_zone_name()}. Run: python3 "
+            "scripts/gen_launchd.py --install")
+
+
+def test_check_fails_when_the_mac_has_changed_zone(tmp_path):
+    """The whole point. A Mac that moves must not fail quietly.
+
+    Generate for Pacific, then ask the same question as if the Mac were in
+    Eastern, which is what happens when somebody corrects the setting or the
+    Mac wanders back on its own.
+    """
+    root = temp_project(tmp_path)
+    assert run_generator(root, "--local-zone", "America/Los_Angeles").returncode == 0
+    assert run_generator(root, "--check",
+                         "--local-zone", "America/Los_Angeles").returncode == 0
+
+    moved = run_generator(root, "--check", "--local-zone", "America/New_York")
+    assert moved.returncode != 0, moved.stdout
+    assert "WRONG ZONE" in moved.stdout
+    assert "America/Los_Angeles" in moved.stdout
+    assert "America/New_York" in moved.stdout
+    assert "gen_launchd.py --install" in moved.stdout, (
+        "the message has to say how to fix it, because the person reading it is "
+        "reading it at 09:31 wondering why nothing fired")
+
+
+def test_the_verdict_is_quiet_when_no_job_is_installed(tmp_path):
+    """Same restraint as the watchdog's heartbeat check.
+
+    Nothing loaded is not a fault, it is a Mac that has not been set up, and a
+    check that shouted about it would be shouting on every fresh clone.
+    """
+    empty = tmp_path / "nothing"
+    (empty / "config" / "launchd").mkdir(parents=True)
+    link = tmp_path / "localtime"
+    link.symlink_to("/var/db/timezone/zoneinfo/America/Los_Angeles")
+
+    verdict = tzcheck.check(empty, home=tmp_path / "no_home", link=link)
+    assert verdict.ok
+    assert "no launchd job is installed" in verdict.detail
+
+
+def test_the_verdict_fails_when_the_installed_jobs_were_built_elsewhere(tmp_path):
+    """What the watchdog and the pre-flight both call, at its unhappy answer."""
+    root = temp_project(tmp_path)
+    assert run_generator(root, "--local-zone", "Asia/Tokyo").returncode == 0
+    link = tmp_path / "localtime"
+    link.symlink_to("/var/db/timezone/zoneinfo/America/Los_Angeles")
+
+    verdict = tzcheck.check(root, home=tmp_path / "no_home", link=link,
+                            when=datetime(2026, 9, 8, 13, 0, tzinfo=timezone.utc))
+    assert not verdict.ok
+    assert "Asia/Tokyo" in verdict.detail
+    assert "America/Los_Angeles" in verdict.detail
+    assert "gen_launchd.py --install" in verdict.fix
+    assert verdict.stamped_shift == 780
+    assert verdict.current_shift == -180
