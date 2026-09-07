@@ -131,6 +131,20 @@ A halted book:
 
 If `agent/reconcile.py` cannot be imported at all, every book is halted for that tick and the line `reconciliation unavailable, halting all books` goes in the log. That is deliberate: a missing referee means the answer is no.
 
+### When the broker could not be read, nothing is compared and the line says so
+
+There are three questions here and they have three different answers. Could the referee be asked at all? Did it have two pictures to compare? And is it safe for a book to open something? A tick where IB Gateway answered nothing at all takes the blind path higher up this page and never reaches reconciliation. A tick where only one or two reads failed does reach it, and until 2026-09-07 it printed `everything matched`, because an answer that never arrived and an account holding nothing look identical from here.
+
+That happened three times on 2026-09-07, at 07:37, 09:40 and 09:48. The positions read and the open orders read both gave up after 45 seconds, the account was shown as worth 0.00 with 0 positions, and the report said everything matched. Nothing was wrongly halted, which is what the earlier outage fix was for, but that is the one line a reader trusts most and it described a comparison that never happened.
+
+The line now reads, word for word:
+
+```
+Reconciliation: not checked: the broker could not be read (positions timed out, open orders timed out)
+```
+
+and the orphan check is reported as not run, because a holding nobody claims cannot be spotted on a tick where the holdings never arrived. **No book is halted for it.** An unreadable broker is not a book being wrong about what it holds, and halting five books every time the Gateway hiccups is exactly the failure the outage fix exists to prevent. Only the wording changes.
+
 ### Positions nobody claims
 
 The paper account holds one share of SPY from the manual test on 2026-09-02, and there is a working order id 4 with no tag on it from the same session. Neither belongs to a book, and the two are treated differently on purpose.

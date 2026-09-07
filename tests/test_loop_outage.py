@@ -254,3 +254,108 @@ def test_the_loop_carries_straight_on_when_the_broker_comes_back(sandbox, sent,
     assert len(state.all_positions()) == 1
     assert state.halted is False, (
         "the outage must not have left a halt behind to be cleared")
+
+
+# ---------------------------------------------------------------------------
+# Backlog item 19: a read that never came back is not a comparison that passed
+# ---------------------------------------------------------------------------
+
+#: What agent/mcp_client.py really said on 2026-09-07, word for word. It holds
+#: neither "timeout" nor "timed out", which is why those three ticks were not
+#: read as an outage and carried on with an empty account.
+SLOW = ("the MCP server took longer than 45 seconds to answer tools/call. "
+        "IB Gateway is usually the slow part when this happens.")
+
+
+class Slow(Healthy):
+    """The 07:37, 09:40 and 09:48 ticks of 2026-09-07, exactly as they happened.
+
+    Both reads run out of time in a way that does not look like the Gateway
+    being gone, so the tick carries on. What it carries on with is an empty
+    positions map and an empty order book, which is the lie.
+    """
+
+    def account_summary(self, account=None):
+        raise RuntimeError(SLOW)
+
+    def portfolio(self, account=None, include_pnl=True):
+        raise RuntimeError(SLOW)
+
+    def open_orders(self, account=None, include_all=True):
+        raise RuntimeError(SLOW)
+
+
+class HalfSlow(Healthy):
+    """The holdings arrive and the working orders do not."""
+
+    def open_orders(self, account=None, include_all=True):
+        raise RuntimeError(SLOW)
+
+
+def test_a_read_that_ran_out_of_time_is_written_down_by_name(sandbox):
+    facts = loop.read_broker_facts(Slow(), "DUT077572")
+    assert facts.available is True, "it answered, slowly and then not at all"
+    assert facts.unread_for_reconciliation() == ["positions timed out",
+                                                 "open orders timed out"]
+
+
+def test_a_read_that_failed_some_other_way_says_so_rather_than_guessing(sandbox):
+    facts = loop.read_broker_facts(Awkward(), "DUT077572")
+    assert facts.unread_for_reconciliation() == ["positions could not be read"]
+
+
+def test_the_account_summary_is_not_part_of_the_comparison(sandbox):
+    """Reconciliation compares holdings and orders. It never asks what it is worth."""
+    facts = loop.read_broker_facts(HalfSlow(), "DUT077572")
+    assert facts.unread_for_reconciliation() == ["open orders timed out"]
+
+
+def test_nothing_read_means_not_checked_rather_than_everything_matched():
+    outcome = loop.run_reconciliation(
+        [], [], {"A": {}, "B": {}}, None,
+        unread=["positions timed out", "open orders timed out"])
+    assert outcome.checked is False
+    assert outcome.note == ("not checked: the broker could not be read "
+                            "(positions timed out, open orders timed out)")
+    assert outcome.ok is False, "nothing was compared, so nothing passed"
+
+
+def test_a_tick_that_could_not_read_the_broker_halts_nobody():
+    """The wording changes and nothing else. ecd34f8 is not being undone."""
+    outcome = loop.run_reconciliation(
+        [], [], {"A": {}, "B": {}}, None, unread=["open orders timed out"])
+    assert outcome.books_to_halt == []
+    assert outcome.books_agree is True
+    assert outcome.available is True
+
+
+def test_reads_that_arrived_are_compared_exactly_as_before():
+    outcome = loop.run_reconciliation([], [], {"A": {}}, None, unread=[])
+    assert outcome.checked is True
+    assert outcome.note == "everything matched"
+
+
+def test_the_tick_says_not_checked_and_the_orphan_check_did_not_run(sandbox, sent,
+                                                                    capsys):
+    _book_holding_aapl(sandbox)
+    assert loop.main(["--now", "2026-09-08 11:05"], broker=Slow()) == 0
+
+    printed = capsys.readouterr().out
+    assert "Reconciliation: not checked: the broker could not be read " \
+           "(positions timed out, open orders timed out)" in printed
+    assert "everything matched" not in printed
+    assert "orphan check: not run, because the broker could not be read" in printed
+    assert "BROKER UNAVAILABLE" not in printed, "this one answered, badly"
+
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000, root=sandbox)
+    assert state.halted is False, "no book is halted for an unreadable broker"
+    assert len(state.all_positions()) == 1
+
+
+def test_an_orphan_is_still_found_on_a_tick_that_could_read_the_broker(sandbox,
+                                                                      sent, capsys):
+    """The other half of the same rule: a real read still gets a real check."""
+    assert loop.main(["--now", "2026-09-08 11:05"], broker=Healthy()) == 0
+    printed = capsys.readouterr().out
+    assert "orphan check: not run" not in printed
+    assert "AAPL" in printed, "nobody claims the AAPL the account holds"

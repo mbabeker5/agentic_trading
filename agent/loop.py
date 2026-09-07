@@ -797,6 +797,21 @@ class ReconcileOutcome:
     books_to_halt, because an orphan halts every book without naming any of them,
     and it is what tells the reconciliation alert apart from the orphan alert:
     one finding, one message.
+
+    checked is the third question, and it is not the same as either of the other
+    two:
+
+        available    could the referee be asked at all?
+        checked      did it have two pictures to compare?
+        books_agree  is it safe for any book to open something?
+
+    On 2026-09-07 the answer to the middle one was no on three ticks (07:37,
+    09:40 and 09:48) and nothing said so. The positions read and the open orders
+    read had both timed out, so reconciliation was handed an empty account and
+    an empty order book, found nothing to disagree about, and printed
+    "everything matched". Nothing was wrongly halted, which is what ecd34f8 was
+    for, but that is the one line a reader trusts most and it described a
+    comparison that never happened. Backlog item 19.
     """
 
     available: bool
@@ -807,6 +822,10 @@ class ReconcileOutcome:
     unclaimed: list = field(default_factory=list)
     mismatched_books: list = field(default_factory=list)
     note: str = ""
+    #: False when the broker reads reconciliation needs did not come back, so
+    #: there was nothing to compare. Nobody is halted for it: an unreadable
+    #: broker is not a book being wrong.
+    checked: bool = True
 
     @property
     def unexpected_orphans(self) -> list:
@@ -823,6 +842,10 @@ class ReconcileOutcome:
         nobody expected turned up. The last of those halts every book, and the
         orphan check is repeated here rather than trusted to books_to_halt so
         that the answer is the same however this record was built.
+
+        A tick where the broker could not be read is deliberately NOT one of
+        them. Nothing was compared and nothing is known to be wrong, so nothing
+        is halted, exactly as on 2026-09-07. Only the wording changes.
         """
         return (self.available and not self.books_to_halt
                 and not self.unexpected_orphans)
@@ -878,7 +901,8 @@ def broker_orders_for_reconcile(rows: list[dict]) -> list[dict]:
 
 
 def run_reconciliation(broker_positions: list, broker_open_orders: list,
-                       books_state: dict, orphans: Any) -> ReconcileOutcome:
+                       books_state: dict, orphans: Any,
+                       unread: list | None = None) -> ReconcileOutcome:
     """Ask agent/reconcile.py whether the books and the broker agree.
 
     Five books share one account, so the only thing saying which book owns a
@@ -889,7 +913,22 @@ def run_reconciliation(broker_positions: list, broker_open_orders: list,
     When that module is missing, or its answer cannot be read, every book is
     halted for the tick. A halted book still closes positions, because refusing
     to close is its own kind of risk, and it opens nothing.
+
+    unread is what read_broker_facts could not get this tick, in plain words,
+    for example ["positions timed out", "open orders timed out"]. When either of
+    the two reads this comparison needs is in there, there is nothing to compare
+    and the answer is "not checked", not "everything matched". NOBODY IS HALTED
+    FOR IT: an unreadable broker is not a book being wrong about its own
+    holdings, and halting five books every time IB Gateway hiccups is the bug
+    ecd34f8 was written to stop. The only thing that changes is the sentence.
     """
+    missing = [str(item).strip() for item in (unread or []) if str(item).strip()]
+    if missing:
+        return ReconcileOutcome(
+            available=True, ok=False, checked=False,
+            note=("not checked: the broker could not be read ("
+                  + ", ".join(missing) + ")"))
+
     if reconcile_mod is None or getattr(reconcile_mod, "reconcile", None) is None:
         return ReconcileOutcome(
             available=False, ok=False, books_to_halt=list(books_state),
@@ -4860,6 +4899,36 @@ def looks_like_an_outage(exc: BaseException) -> bool:
     return any(phrase in message for phrase in OUTAGE_PHRASES)
 
 
+#: The two reads reconciliation compares the book files against. If either of
+#: them did not come back there is nothing to compare, and the tick has to say
+#: so rather than mistake an empty answer for an empty account.
+RECONCILE_READS = ("positions", "open orders")
+
+
+#: How agent/mcp_client.py says a read ran out of time. Its own sentence is
+#: "the MCP server took longer than 45 seconds to answer tools/call", which
+#: contains neither "timeout" nor "timed out", which is why it is listed here by
+#: hand. That wording is also why 2026-09-07's three blind ticks were not read
+#: as an outage at all: none of OUTAGE_PHRASES matches it either. Whether it
+#: SHOULD count as an outage is a separate question and deliberately not
+#: answered here, because that would blind the whole tick rather than reword one
+#: line, and blinding a tick stops positions being managed.
+TIMEOUT_PHRASES = ("timed out", "timeout", "took longer than")
+
+
+def read_failure_phrase(what: str, exc: Exception) -> str:
+    """Why one broker read did not come back, in words, for a log line.
+
+    "positions timed out" or "open orders could not be read". Short on purpose:
+    it gets joined with the others into one sentence a reader takes in at a
+    glance, and the full exception is already in facts.problems and the tick log.
+    """
+    message = f"{type(exc).__name__}: {exc}".lower()
+    if any(phrase in message for phrase in TIMEOUT_PHRASES):
+        return f"{what} timed out"
+    return f"{what} could not be read"
+
+
 @dataclass
 class BrokerFacts:
     """One read of the shared account, in the shapes the rest of the tick wants.
@@ -4873,6 +4942,15 @@ class BrokerFacts:
     available is False when the broker could not be reached at all. That is NOT
     the same thing as an account holding nothing, and everything downstream has
     to know which of the two it is looking at.
+
+    unread is the middle case, and it is the one that caught us out on
+    2026-09-07. One read can fail in a way that does not look like the Gateway
+    being gone: a timeout, a refusal, a reply nobody could parse. The tick
+    carries on, which is right, but the answer that never arrived is an empty
+    dictionary and an empty list, which look exactly like a flat account with no
+    working orders. Anything comparing against them has to know the difference,
+    so each failed read is written down here by name, in words a reader
+    understands, for example {"positions": "positions timed out"}.
     """
 
     values: dict = field(default_factory=dict)
@@ -4882,6 +4960,18 @@ class BrokerFacts:
     problems: list = field(default_factory=list)
     available: bool = True
     outage: str = ""
+    #: Read name to the plain sentence saying it did not come back.
+    unread: dict = field(default_factory=dict)
+
+    def unread_for_reconciliation(self) -> list:
+        """The reads reconciliation compares against, and did not get.
+
+        Empty means both pictures arrived and a comparison is worth making. The
+        account summary is deliberately not in here: reconciliation never looks
+        at what the account is worth, only at what it holds and what it has
+        working.
+        """
+        return [self.unread[name] for name in RECONCILE_READS if name in self.unread]
 
 
 def alert_on_guard_files(guards: Guards, now: datetime) -> None:
@@ -5005,6 +5095,19 @@ def report_orphans(outcome: ReconcileOutcome, now: datetime, rules: str,
     against a wrong picture because of it. It is written down and alerted, and
     it halts nobody, exactly as before.
     """
+    if not outcome.checked:
+        # Nothing was compared, so nothing can be said about orphans either. An
+        # orphan is a holding at the broker that no book claims, and on a tick
+        # where the broker's holdings never arrived that check could not have
+        # fired however clean the account is.
+        print("  orphan check: not run, because the broker could not be read")
+        ledger_writer.log_rule(
+            now, "reconciliation_not_checked", f"{outcome.note} [rules {rules}]",
+            "nothing was compared this tick and the orphan check did not run. No "
+            "book is halted for it: an unreadable broker is not a book being wrong",
+            dry_run=not write_ledger)
+        return 0
+
     said = 0
     for orphan in outcome.orphans:
         symbol = str(getattr(orphan, "symbol", "") or "").upper()
@@ -5079,7 +5182,9 @@ def read_broker_facts(broker: broker_mod.Broker,
     A failure that looks like the Gateway being absent marks the whole read
     unavailable rather than being written down as one missing answer. Anything
     else, a malformed reply or a permission the account does not have, is a
-    problem to note and carry on from.
+    problem to note and carry on from. Either way the read is written down in
+    facts.unread, because a caller that gets an empty answer has to be able to
+    tell "nothing there" from "nobody answered".
     """
     facts = BrokerFacts()
 
@@ -5087,6 +5192,7 @@ def read_broker_facts(broker: broker_mod.Broker,
         try:
             return call()
         except Exception as exc:             # noqa: BLE001
+            facts.unread[what] = read_failure_phrase(what, exc)
             if looks_like_an_outage(exc):
                 facts.available = False
                 if not facts.outage:
@@ -5352,7 +5458,8 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
 
     outcome = run_reconciliation(broker_positions_for_reconcile(broker_positions),
                                  broker_orders_for_reconcile(broker_orders),
-                                 books_state, expected_orphans())
+                                 books_state, expected_orphans(),
+                                 unread=facts.unread_for_reconciliation())
     print(f"\nReconciliation: {outcome.note}")
     for line in outcome.lines[:10]:
         print(f"  {line}")
