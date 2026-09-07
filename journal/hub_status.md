@@ -1,6 +1,6 @@
 # Hub status
 
-Written 2026-09-07 about 10:05 New York by the Tuesday worker. Overwritten each
+Written 2026-09-07 about 14:10 New York by the Tuesday worker. Overwritten each
 time, so this file is always now and never a history.
 
 ## THE ONE THING MO MUST DO BEFORE TUESDAY
@@ -50,16 +50,19 @@ not an option tonight.
    the watchdog said ok. Restarted 04:12 and 09:48 New York; reads go from
    20 minute hangs to under 3 seconds. Write-up:
    `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/journal/gateway_reads_2026-09-07.md`.
-   Follow-ups in flight: (a) wall-clock deadline on MCP reads, a hard cap on a
-   tick in run_tick.sh, a deadline on the pre-flight, bounded recorder reads
-   (agent running); (b) a watchdog check that does a real bounded read after
-   connecting so a Gateway that logs in but cannot answer counts as down and
-   gets restarted (not started yet, next).
+   Follow-ups LANDED: (a) a wall-clock deadline on every MCP read (`2a90b2b`),
+   a 240 second cap on one tick in run_tick.sh (`8e2a509`), a 10 minute budget
+   on the pre-flight that writes NO_TRADE_TODAY if the broker cannot be read in
+   time (`b9c6a62`), bounded recorder reads (`86fb6c3`); (b) a watchdog
+   `ib_answers` check that does a real 20 second positions read after logging
+   in, restarts the Gateway once per outage when it fails, falls back to a spare
+   client id on a 326 collision, and bounds the whole run at 90 seconds
+   (`122254d` to `ba1a769`), verified read-only against the live Gateway.
 4. **Monday rehearsal: RUNNING, and it has already paid for itself.** Found:
    the Mac sleep above; reads with no deadline hang jobs for hours; the loop
    treats a holiday as a trading day (book D ran its sweep, momentum books
    waited for a 09:30 open) because only deadman and pdt read
-   `schedule.holidays` (agent fixing now, backlog item 9); the pre-flight was
+   `schedule.holidays` (FIXED `f8e719a`, backlog item 9 shipped; live ticks now show phase=closed for the holiday); the pre-flight was
    killed by its 10 minute launchd ExitTimeOut on an earlier run; watchdog
    client id 250 collided with its own hung earlier copy. The deadman ran at
    09:40 and correctly said the market is shut. Next checkpoints 16:43 New York
@@ -67,4 +70,4 @@ not an option tonight.
 5. **Tuesday 09:38 checks: scheduled**, not started.
 
 ## Stays as ruled
-All five books dry_run. Shorting off. Suite 1595 passing at `46ce775`.
+All five books dry_run. Shorting off. Suite 1689 passing at `ba1a769`. Tree clean, everything pushed.
