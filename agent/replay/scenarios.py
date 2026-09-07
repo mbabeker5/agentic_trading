@@ -400,17 +400,24 @@ def _reconciled_every_tick(context: RunContext) -> tuple[bool, list[str]]:
 # ==========================================================================
 
 
-def clean_day(day: date_type, fill_bridge: bool = True) -> Scenario:
-    key = "clean_day" if fill_bridge else "clean_day_no_fill_bridge"
-    title = ("A whole recorded day, five books, nothing broken"
-             if fill_bridge else
-             "The same day with the harness fill bridge switched off")
+def clean_day(day: date_type) -> Scenario:
+    """A whole recorded day with nothing broken, run against the real loop.
+
+    There used to be a second copy of this scenario, clean_day_no_fill_bridge,
+    which ran the same day with the harness fill bridge switched off so that the
+    size of a gap in the loop was measured rather than argued about. The gap was
+    that agent/loop.py never read executions(), so a resting order that filled
+    later existed at the broker and not in any book file. It was closed on
+    2026-09-06 by ingest_fills(), the bridge is gone, and there is nothing left
+    for a second copy of this day to measure. What replaced it is
+    fills_from_the_broker below, which tests the ingestion itself on a crafted
+    day where a limit order fills two ticks after it was sent.
+    """
+    key = "clean_day"
+    title = "A whole recorded day, five books, nothing broken"
     proves = ("that the loop runs 09:25 to 16:05 without a person touching it, "
               "that the books and the broker agree at every tick, and that the "
-              "momentum books are flat at the close"
-              if fill_bridge else
-              "what the loop does on its own, with nothing standing in for the "
-              "fill ingestion it does not have")
+              "momentum books are flat at the close")
 
     def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
         evidence: list[str] = []
@@ -531,39 +538,205 @@ def clean_day(day: date_type, fill_bridge: bool = True) -> Scenario:
         else:
             evidence.append("every book wrote its end of day summary after the close")
 
-        if not fill_bridge:
-            # This variant exists to put the loop's own fill ingestion on the
-            # record. It passes either way and says which world we are in.
-            book_positions = {ref: _positions(context, ref)
-                              for ref in ("BOOK_A", "BOOK_B", "BOOK_C", "BOOK_D",
-                                          "BOOK_E")}
-            any_known = any(book_positions.values())
-            broker_has = {s: q for s, q in context.fake.positions.items() if q}
-            if broker_has and not any_known:
-                evidence.append(
-                    "THE KNOWN GAP IS STILL THERE: the broker filled "
-                    f"{fills} orders and holds {broker_has}, and not one book file "
-                    "knows about any of it. agent/loop.py records a fill only from "
-                    "what place_order handed straight back, so a resting order that "
-                    "fills later is never noticed. Everything downstream of a fill "
-                    "in this gate runs on the harness fill bridge.")
-                failures.clear()      # the gap is the finding, not a gate failure
-                failures.append(
-                    "not a gate failure, a measurement: the loop cannot see a fill "
-                    "that arrives after place_order returned")
-                return True, evidence, []
-            evidence.append(
-                "the loop DID pick up its own fills without the bridge, so the gap "
-                "this scenario was written to measure has been closed. Rewrite this "
-                "scenario, and the fill bridge in agent/replay/harness.py can go.")
-            return True, evidence, []
+        # Every fill the broker made has to be in exactly one book file. This is
+        # the loop's own ingestion, with nothing standing in for it: the harness
+        # counts what filled and applies none of it.
+        watched = len(context.watcher.applied)
+        if watched:
+            evidence.append(f"the broker filled {watched} order(s) and the loop read "
+                            "every one of them back out of executions() itself, with "
+                            "nothing in the harness applying a fill")
 
         return not failures, evidence, failures
 
     return Scenario(
-        key=key, title=title, proves=proves, day=day, fill_bridge=fill_bridge,
+        key=key, title=title, proves=proves, day=day,
         slow=True,
         decider=lambda s: StubDecider(max_picks=3),
+        check=check,
+    )
+
+
+# ==========================================================================
+# (a2) A fill that arrives after the order call reaches the book file
+# ==========================================================================
+
+
+def fills_from_the_broker(day: date_type) -> Scenario:
+    """A limit entry that fills two ticks later still reaches the book file.
+
+    THE SCENARIO THIS REPLACED. clean_day_no_fill_bridge ran the whole recorded
+    day with the harness fill bridge switched off, to measure a gap in the loop:
+    agent/loop.py recorded a fill only from what place_order() handed straight
+    back, so a resting order that filled later existed at the broker and did not
+    exist in any book file. On a clean day the fake broker filled nineteen
+    orders and not one book file knew.
+
+    The gap closed on 2026-09-06 with ingest_fills(), so there was nothing left
+    for that scenario to measure. This tests the ingestion itself instead, and
+    on a crafted day rather than a recorded one, because a recorded day cannot
+    be asked to leave an order resting for exactly two ticks.
+
+    How the day is built. WAIT opens at 100 and does nothing until 10:30, when
+    it drops to 96. Book A is told to buy it at 09:35 with a limit of 97, which
+    is below the market, so the order rests. Nothing fills at 09:35, nothing
+    fills at 10:00, and the bar at 10:30 goes through the limit.
+
+    What it proves, one check each:
+
+      the book file does NOT hold it while the order is only resting
+      the book file DOES hold it on the tick after the bar that filled it
+      the share count, the average cost and entries_opened_today are right
+      the working order is gone from the book file once it is filled
+      the fill reached the ledger's Trades tab with the decision price on it
+      the same execution was not applied twice, which is what the exec id is for
+    """
+    wait, other = "WAIT", "OTHER"
+    watch: dict[str, dict] = {}
+
+    def build(scenario: Scenario):
+        series = {
+            wait: crafted_bars(day, steps(day, {"10:30": 96.0}, 100.0)),
+            other: crafted_bars(day, flat(50.0)),
+        }
+        return crafted_broker(series,
+                              daily=daily_history(day, prior_closes(series)))
+
+    def after_tick(context: RunContext, moment: datetime) -> None:
+        at = f"{moment:%H:%M}"
+        if at in ("09:35", "10:00", "10:25", "10:35", "10:40"):
+            state = context.state_for("BOOK_A")
+            watch[at] = {
+                "positions": _positions(context, "BOOK_A"),
+                "working": {str(k): dict(v) for k, v in
+                            (state.working_orders or {}).items()
+                            if isinstance(v, dict)},
+                "entries": int(state.entries_opened_today),
+                "fills_seen": list(getattr(state, "fills_seen", []) or []),
+                # The broker's own per book view, read at the SAME moment. Read
+                # at the close it would be empty, because a momentum book is
+                # flat by then, and the comparison would say nothing.
+                "broker": {s: int(held.qty) for s, held
+                           in context.fake.book_positions("BOOK_A").items()},
+            }
+
+    def check(context: RunContext) -> tuple[bool, list[str], list[str]]:
+        evidence: list[str] = []
+        failures: list[str] = []
+
+        ok, line = _every_tick_ran(context)
+        evidence.append(line)
+        if not ok:
+            failures.append(line)
+
+        resting = watch.get("10:00", {})
+        if resting.get("positions"):
+            failures.append(
+                f"book A held {resting['positions']} at 10:00, before the bar that "
+                "filled its order. Something invented a position out of an order "
+                "that was only resting.")
+        elif resting.get("working"):
+            evidence.append(
+                f"at 10:00 book A had {len(resting['working'])} order(s) resting "
+                "and held nothing, which is the state the old loop could never "
+                "get out of")
+        else:
+            failures.append(
+                "book A had nothing resting at 10:00, so its limit entry was "
+                f"never placed and nothing here was tested: {_why_no_entry(context)}")
+
+        after = watch.get("10:35") or watch.get("10:40") or {}
+        held = after.get("positions") or {}
+        if held.get(wait):
+            evidence.append(
+                f"the bar at 10:30 filled the order and book A held {held[wait]} "
+                f"{wait} on the next tick, read out of executions() by the loop "
+                "itself with nothing in the harness applying it")
+        else:
+            failures.append(
+                f"the bar at 10:30 went through book A's limit and the book file "
+                f"still holds {held}. This is the bug the harness fill bridge used "
+                "to cover: a fill that arrives after place_order returned never "
+                "reaches the book.")
+
+        if held.get(wait) and after.get("entries") != 1:
+            failures.append(
+                f"book A opened one position and entries_opened_today says "
+                f"{after.get('entries')}. Every per day entry limit is counted off "
+                "that number.")
+        elif held.get(wait):
+            evidence.append("entries_opened_today was put up to 1 by the fill, "
+                            "which is what every per day entry limit counts")
+
+        if held.get(wait) and after.get("working"):
+            still = {k: v.get("purpose") for k, v in after["working"].items()}
+            if any(purpose == "entry" for purpose in still.values()):
+                failures.append(
+                    f"the entry filled and book A still lists it as working: "
+                    f"{still}. A book waiting on an order that has already filled "
+                    "counts its money twice.")
+        elif held.get(wait):
+            evidence.append("the working order was marked filled and taken out of "
+                            "the book file")
+
+        if after.get("fills_seen"):
+            evidence.append(
+                f"the execution id was written into the book file "
+                f"({len(after['fills_seen'])} of them), which is what stops the "
+                "same fill being applied a second time after a restart")
+        elif held.get(wait):
+            failures.append(
+                "a fill was applied and no execution id was remembered, so the "
+                "next tick would apply it again")
+
+        # The arithmetic, against the broker's own per book view at the same
+        # moment. A fill counted twice shows up here and nowhere else.
+        book_view = after.get("broker") or {}
+        if book_view != held:
+            failures.append(
+                f"the book file says {held} and the broker's per book view says "
+                f"{book_view}. A fill counted twice looks exactly like this.")
+        else:
+            evidence.append(f"the book file and the broker's own per book view "
+                            f"agree: {held}")
+
+        trades = [row for row in context.ledger.rows
+                  if row.tab == "Trades"
+                  and str(row.payload.get("symbol") or "").upper() == wait]
+        if trades:
+            with_price = [row for row in trades
+                          if row.payload.get("decision_price") not in (None, "")]
+            if with_price:
+                evidence.append(
+                    f"{len(trades)} fill(s) reached the Trades tab, "
+                    f"{len(with_price)} of them carrying the decision price the "
+                    "slippage columns are worked out from")
+            else:
+                failures.append(
+                    "the fill reached the Trades tab with no decision price on it, "
+                    "so the slippage columns stay blank and the live ramp's "
+                    "slippage trigger cannot be measured")
+        else:
+            failures.append(f"no fill for {wait} reached the ledger's Trades tab. "
+                            f"Rows written: {len(context.ledger.rows)}")
+
+        return not failures, evidence, failures
+
+    return Scenario(
+        key="fills_from_the_broker",
+        title="A limit order that fills two ticks later reaches the book file",
+        proves="that the loop reads the broker's own executions rather than "
+               "believing what the order call handed back, that a fill updates the "
+               "position, the average cost, the entry count and the working order, "
+               "and that an execution id cannot be applied twice",
+        day=day, symbols=(wait, other), build_broker=build,
+        book_patches=only("A"),
+        strategy_overlays={"momentum_hybrid": {"schedule": {"entries_until": "11:00"}}},
+        decider=lambda s: StubDecider(
+            max_picks=1,
+            script=[ScriptedPick(book="A", symbol=wait, at="09:35", entry=97.0,
+                                 stop=94.0, target=0.0, qty_hint=100)]),
+        after_tick=after_tick,
         check=check,
     )
 
@@ -672,13 +845,13 @@ def every_guardrail(day: date_type) -> Scenario:
                            context.account_state("A", gross_exposure=100_000.0),
                            note="a book already 100 percent invested")
 
-        # symbol_exclusive: another book is already in the name. It refuses by
-        # default, because universe.symbol_exclusive is true in
-        # config/guardrails.yaml, and Mo has not decided otherwise. Set that to
-        # false and the same order comes back allowed with a note on it, which
-        # is what the hub's commit 03e5318 did and what tests/test_books.py
-        # covers on both sides. Either way agent/reconcile.py checks each ticker
-        # as a whole by adding up what every book holding it believes.
+        # symbol_exclusive: another book is already in the name. This scenario
+        # forces universe.symbol_exclusive on in its own settings copy, because
+        # the point here is that the rule CAN refuse and that line is Mo's to
+        # set. With it off the same order comes back allowed with a note on it,
+        # which is what commit 03e5318 did and what tests/test_books.py covers
+        # on both sides. Either way agent/reconcile.py checks each ticker as a
+        # whole by adding up what every book holding it believes.
         context.probe_rule(
             "A", entry(symbol="TAKEN"),
             context.account_state("A", symbols_held_elsewhere={"TAKEN": "B"}),
@@ -782,6 +955,13 @@ def every_guardrail(day: date_type) -> Scenario:
         proves="that every rule id agent/guardrails.py can emit blocks an order and "
                "reaches the ledger with the rule id and the book on it",
         day=day, slow=True,
+        # ONE TICKER, ONE BOOK IS FORCED ON FOR THIS SCENARIO, whichever way
+        # config/guardrails.yaml has it. That line is Mo's to set and it has
+        # been moved twice in a day. This scenario's job is to prove that every
+        # rule id CAN refuse an order, and a rule switched off by a setting is
+        # untested rather than proven, so the setting is overridden here rather
+        # than the scenario going red every time the default moves.
+        guardrail_overlay={"universe": {"symbol_exclusive": True}},
         strategy_overlays={
             # Books A and E. A is scripted onto the blacklisted name.
             "momentum_hybrid": {"universe": {"blacklist": [top]}},
@@ -1341,17 +1521,29 @@ def day_trade_counter(day: date_type) -> Scenario:
     so book A's order goes out and the refusal that a live account under 25,000
     dollars would have suffered is written down instead, which is how the cost
     of the rule gets measured rather than guessed.
+
+    ONE NAME EACH, ON PURPOSE. This used to put both books into the same
+    ticker, which made it a scenario about symbol exclusivity as well as one
+    about the day trade counter: with universe.symbol_exclusive on, book C is
+    locked out of a name book A got to first, and the scenario failed for a
+    reason that had nothing to do with day trades. A scenario should test one
+    thing, so the two books now fall through their own stops in their own names
+    and it reads the same whichever way that setting points.
     """
-    name = "DROP"
+    for_a, for_c = "DROPA", "DROPC"
 
     def build(scenario: Scenario):
-        series = {name: crafted_bars(day, steps(day, {
-            "09:40": (100.0, 100.0, 100.0, 100.0),      # book A's entry fills here
-            "09:45": (100.0, 100.0, 97.0, 97.0),        # through book A's 1.5% stop
-            "09:50": (97.0, 97.0, 97.0, 97.0),          # book C's entry fills here
-            "11:00": (97.0, 97.0, 88.0, 88.0),          # through book C's 8% stop
+        # The same shape twice, one name per book, because the two books have
+        # different stops: A's is 1.5 percent and C's is 8 percent.
+        shape = {
+            "09:40": (100.0, 100.0, 100.0, 100.0),      # the entry fills here
+            "09:45": (100.0, 100.0, 97.0, 97.0),        # through A's 1.5% stop
+            "09:50": (97.0, 97.0, 97.0, 97.0),          # C's entry fills here
+            "11:00": (97.0, 97.0, 88.0, 88.0),          # through C's 8% stop
             "11:30": (88.0, 88.0, 88.0, 88.0),
-        }, 100.0))}
+        }
+        series = {for_a: crafted_bars(day, steps(day, shape, 100.0)),
+                  for_c: crafted_bars(day, steps(day, shape, 100.0))}
         return crafted_broker(series, daily=daily_history(day, prior_closes(series)))
 
     def setup(context: RunContext) -> None:
@@ -1382,18 +1574,18 @@ def day_trade_counter(day: date_type) -> Scenario:
                             "and its fourth closing order was not refused. pdt_limit "
                             f"rows for C: {len(by_book.get('C', []))}")
 
-        c_exits = _closings_placed(context, "C", name)
+        c_exits = _closings_placed(context, "C", for_c)
         if c_exits:
             failures.append(f"book C sent {len(c_exits)} closing orders for "
-                            f"{name} even though the day trade rule refused them")
+                            f"{for_c} even though the day trade rule refused them")
         else:
-            evidence.append(f"book C sent no closing order for {name}, so the refusal "
-                            "held all the way to the broker")
+            evidence.append(f"book C sent no closing order for {for_c}, so the "
+                            "refusal held all the way to the broker")
 
         if context.fake.day_trade_count("BOOK_C"):
             evidence.append(
                 "WORTH ESCALATING: book C made a round trip in "
-                f"{name} anyway. Its stop was already resting at the broker as the "
+                f"{for_c} anyway. Its stop was already resting at the broker as the "
                 "child of the entry bracket, and a resting stop fires whatever the "
                 "day trade counter says. So the pdt hard limit on books C and D can "
                 "refuse the loop's own closing order and still not stop the round "
@@ -1412,13 +1604,13 @@ def day_trade_counter(day: date_type) -> Scenario:
                             f"pdt_limit row was written. Rows for A: "
                             f"{len(by_book.get('A', []))}")
 
-        a_exits = _closings_placed(context, "A", name)
+        a_exits = _closings_placed(context, "A", for_a)
         if a_exits:
-            evidence.append(f"book A sent {len(a_exits)} closing orders for {name}, so "
-                            "the flag did not stop it trading")
+            evidence.append(f"book A sent {len(a_exits)} closing orders for {for_a}, "
+                            "so the flag did not stop it trading")
         else:
-            failures.append(f"book A never closed {name}, so the flag blocked it when "
-                            "it should only have been written down")
+            failures.append(f"book A never closed {for_a}, so the flag blocked it "
+                            "when it should only have been written down")
 
         counts = {ref: context.fake.day_trade_count(ref)
                   for ref in ("BOOK_A", "BOOK_C")}
@@ -1438,9 +1630,12 @@ def day_trade_counter(day: date_type) -> Scenario:
         title="The fourth day trade is refused on book C and only flagged on book A",
         proves="that the pattern day trader allowance blocks the books that hold for "
                "weeks and is measured, not enforced, on the books that day trade",
-        day=day, symbols=(name,), build_broker=build,
+        day=day, symbols=(for_a, for_c), build_broker=build,
         book_patches=only("A", "C"),
-        decider=lambda s: StubDecider(max_picks=1),
+        decider=lambda s: StubDecider(
+            max_picks=1,
+            script=[ScriptedPick(book="A", symbol=for_a, at="09:35"),
+                    ScriptedPick(book="C", symbol=for_c, at="09:45")]),
         setup=setup, check=check,
     )
 
@@ -1979,7 +2174,7 @@ def all_scenarios(day: date_type = DEFAULT_DAY) -> list[Scenario]:
     """Every scenario the gate runs, in the order docs/REPLAY.md lists them."""
     return [
         clean_day(day),
-        clean_day(day, fill_bridge=False),
+        fills_from_the_broker(day),
         every_guardrail(day),
         daily_loss_cap(day),
         flatten_at_close(day),

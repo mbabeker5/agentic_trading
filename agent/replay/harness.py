@@ -52,27 +52,26 @@ happened yet. So before running the tick at 09:35 the broker is advanced to
 to 09:35 before the tick would let the loop see and fill against a bar from its
 own future, and every number the gate produced after that would be worthless.
 
-THE FILL BRIDGE, AND THE HOLE IT COVERS
----------------------------------------
-agent/loop.py records a fill in one place only: submit(), from what
-place_order() hands straight back. There is no code anywhere in that file that
-reads executions() or turns a working order into a position later. Grep it: the
-word `executions` does not appear.
+WHERE FILLS COME FROM
+---------------------
+The loop used to record a fill in one place only: submit(), from what
+place_order() handed straight back. Nothing in that file read executions() or
+turned a working order into a position later. Against the real MCP broker a
+marketable order comes back already filled, so that mostly worked. Against
+anything that fills a resting order later, including this harness and including
+a real limit order that fills at 10:20, the loop never learned: the position
+existed at the broker and did not exist in the book file, reconciliation called
+it an orphan, and the day fell apart.
 
-Against the real MCP broker a marketable order comes back already filled, so
-that mostly works. Against anything that fills a resting order later, including
-this harness and including a real limit order that fills at 10:20, the loop
-never learns. The position exists at the broker and does not exist in the book
-file, reconciliation calls it an orphan, and the day falls apart.
-
-That is a real gap in the loop, not in the harness, and it is reported rather
-than quietly patched. But every other scenario needs fills to exist, so the
-harness carries a FillBridge that reads the broker's own executions after each
-tick and applies them with agent/loop.py's own record_fill(), which is the same
-arithmetic the loop would use. It is on by default because otherwise nothing
-downstream can be tested, `fill_bridge_used` is written into every report, and
-the clean day scenario runs it once with the bridge OFF to prove the gap is
-real.
+CLOSED ON 2026-09-06. agent/loop.py's ingest_fills() now reads executions at the
+start of every tick and again after every order, matches them to the book's own
+working orders, and deduplicates on IBKR's execution id. The harness used to
+carry a FillBridge that did that job for it, and docs/REPLAY.md said the day the
+loop picked up its own fills the bridge should go. It has: leaving it in place
+applied every fill twice, which is how it was noticed, and two books came out of
+a replay holding the exact negative of what they had been seeded with. What is
+left is FillWatcher, which counts what the broker filled and writes nothing
+anywhere, so a scenario can check the book files against it.
 """
 
 from __future__ import annotations
@@ -342,8 +341,21 @@ class LedgerCapture:
 
     def log_trade(self, row: dict, book_id: Any = None, model: Any = None,
                   **kwargs) -> bool:
+        """One fill, with everything the loop passed beside the row as well.
+
+        The keyword arguments are kept rather than dropped, because
+        decision_price and decision_time arrive that way and they are what the
+        ledger's slippage columns are worked out from. A capture that threw them
+        away would let a fill reach the sheet with blank slippage and the gate
+        would call that a pass.
+        """
+        payload = dict(row)
+        payload.setdefault("model", model)
+        for name, value in kwargs.items():
+            if name != "dry_run":
+                payload.setdefault(name, value)
         self.rows.append(LedgerRow("Trades", str(row.get("at") or ""),
-                                   str(book_id or ""), dict(row)))
+                                   str(book_id or ""), payload))
         return True
 
     def log_decision(self, timestamp: Any, symbol: str, decision: str,
@@ -658,80 +670,38 @@ def _refuse_unless_fake(broker: Any) -> None:
             "that is safe is that the broker cannot reach IBKR.")
 
 
-# ------------------------------------------------------------- the fill bridge
+# --------------------------------------------------- watching the broker's fills
 
 
-class FillBridge:
-    """Puts the broker's fills into the book files, because the loop does not.
+class FillWatcher:
+    """Reads the broker's fills and applies none of them. A witness, not a bridge.
 
-    agent/loop.py only ever records a fill that place_order() handed straight
-    back. A resting order that fills later is never noticed: the position exists
-    at the broker and does not exist in the book file, and the next
-    reconciliation calls it an orphan.
+    THIS USED TO BE A BRIDGE. agent/loop.py recorded a fill in exactly one
+    place, from whatever place_order() handed straight back, and nothing
+    anywhere read executions(), so a resting order that filled later existed at
+    the broker and did not exist in the book file. The harness stood in for the
+    missing feature: it read the fake broker's own executions after each tick
+    and applied them with the loop's own record_fill(). docs/REPLAY.md said in
+    as many words that the day the loop picked up its own fills, the bridge
+    should go.
 
-    This reads the fake broker's own executions after each tick and applies the
-    new ones with agent/loop.py's own record_fill(), so the arithmetic is the
-    loop's rather than the harness's, and clears the matching working order.
+    That day is 2026-09-06. agent/loop.py's ingest_fills() reads executions at
+    the start of every tick and after every order, deduplicated on IBKR's own
+    execution id. Leaving the bridge in place applied every fill TWICE, which is
+    how it was noticed: two books came out of a replay holding the exact
+    negative of what they had been seeded with.
 
-    It is a stand in for a loop feature that does not exist. Every GateReport
-    says whether it was used, and the clean day scenario runs once with it
-    switched off so the gap is on the record rather than papered over.
+    So all that is left is the counting. This says how many fills the broker
+    produced, which is what a scenario checks the book files against, and it
+    writes nothing anywhere.
     """
 
-    def __init__(self, loop_module, book_state_module, guardrails_module,
-                 books_yaml: Path | str | None = None, pdt_module=None):
-        self.loop = loop_module
-        self.bs = book_state_module
-        self.gr = guardrails_module
-        self.books_yaml = Path(books_yaml) if books_yaml else None
-        self.pdt = pdt_module
+    def __init__(self):
         self.seen: set[str] = set()
         self.applied: list[SeenFill] = []
-        self._guards: dict[str, Any] = {}
-        self._counters: dict[str, Any] = {}
 
-    def guard_for(self, book_id: str):
-        """This book's real settings, loaded once and kept.
-
-        record_fill() in agent/loop.py takes the guardrails so it can put a stop
-        and a target on a brand new position. Handing it None would leave every
-        replayed position with a zero stop, which is the exact hole the loop
-        closed on 2026-09-06, so the gate would be testing a world that no
-        longer exists.
-        """
-        if self.books_yaml is None:
-            return None
-        if book_id not in self._guards:
-            try:
-                self._guards[book_id] = self.gr.load_book_guardrails(
-                    str(self.books_yaml), book_id)
-            except Exception:                    # noqa: BLE001
-                self._guards[book_id] = None
-        return self._guards[book_id]
-
-    def counter_for(self, book_id: str):
-        """This book's day trade counter, or None when agent/pdt.py is missing.
-
-        The loop only tells the counter about a fill that place_order handed
-        straight back, the same gap this whole class covers. Without this the
-        day trade scenario could never see a round trip, because nothing would
-        ever have told the counter about the opening half of one.
-        """
-        if self.pdt is None:
-            return None
-        if book_id not in self._counters:
-            guard = self.guard_for(book_id)
-            try:
-                self._counters[book_id] = (self.pdt.counter_for(guard)
-                                           if guard is not None
-                                           else self.pdt.DayTradeCounter(book_id))
-            except Exception:                    # noqa: BLE001
-                self._counters[book_id] = None
-        return self._counters[book_id]
-
-    def apply(self, broker: ReplayBroker, books: Iterable, day: date_type,
-              now: datetime) -> list[SeenFill]:
-        """Every fill the broker has that no book file knows about yet."""
+    def watch(self, broker: ReplayBroker, books: Iterable) -> list[SeenFill]:
+        """Every fill the broker has that this watcher has not counted yet."""
         fresh: list[SeenFill] = []
         for book in books:
             order_ref = str(book.order_ref)
@@ -739,64 +709,25 @@ class FillBridge:
                 answer = broker.fake.executions(order_ref=order_ref) or {}
             except Exception:                    # noqa: BLE001
                 continue
-            rows = [r for r in (answer.get("fills") or [])
-                    if str(r.get("order_ref") or r.get("orderRef") or "") == order_ref]
-            new = [r for r in rows if str(r.get("execId")) not in self.seen]
-            if not new:
-                continue
-            state = self.bs.load_state(book.book_id, order_ref, day,
-                                       capital=book.capital_usd)
-            for row in new:
-                self.seen.add(str(row.get("execId")))
-                shares = int(_number(row.get("shares")))
-                price = _number(row.get("price"))
-                if shares <= 0 or price <= 0:
+            for row in (answer.get("fills") or []):
+                if str(row.get("order_ref") or row.get("orderRef") or "") != order_ref:
                     continue
-                side = "BUY" if str(row.get("side")).upper() in ("BUY", "BOT") else "SELL"
-                intent = self.gr.OrderIntent(
-                    symbol=str(row.get("symbol")), side=side, qty=shares,
-                    limit_price=round(price, 2), purpose="entry",
-                    book_id=book.book_id)
-                try:
-                    self.loop.record_fill(state, intent, float(shares), price, now,
-                                          self.guard_for(book.book_id))
-                except TypeError:
-                    # The older five argument record_fill, before brackets.
-                    self.loop.record_fill(state, intent, float(shares), price, now)
-                counter = self.counter_for(book.book_id)
-                if counter is not None:
-                    try:
-                        counter.record_fill(
-                            str(row.get("symbol")), side, shares,
-                            datetime.fromisoformat(str(row.get("time"))),
-                            fill_id=str(row.get("execId") or "") or None)
-                    except Exception:            # noqa: BLE001
-                        pass
+                exec_id = str(row.get("execId"))
+                if exec_id in self.seen:
+                    continue
+                self.seen.add(exec_id)
                 seen = SeenFill(
                     at=str(row.get("time") or ""), order_ref=order_ref,
-                    symbol=str(row.get("symbol")), side=side, shares=shares,
-                    price=price, commission=_number(row.get("commission")),
-                    exec_id=str(row.get("execId")),
-                    reason=str(row.get("reason") or ""))
+                    symbol=str(row.get("symbol")),
+                    side=("BUY" if str(row.get("side")).upper() in ("BUY", "BOT")
+                          else "SELL"),
+                    shares=int(_number(row.get("shares"))),
+                    price=_number(row.get("price")),
+                    commission=_number(row.get("commission")),
+                    exec_id=exec_id, reason=str(row.get("reason") or ""))
                 fresh.append(seen)
                 self.applied.append(seen)
-                self._clear_working(state, row)
-            self.bs.save_state(state)
         return fresh
-
-    @staticmethod
-    def _clear_working(state, row: dict) -> None:
-        """Drop the working order this fill belongs to, whole or in part."""
-        order_id = str(row.get("orderId") or "")
-        held = state.working_orders.get(order_id)
-        if not isinstance(held, dict):
-            return
-        left = int(_number(held.get("remaining"), _number(held.get("qty")))) \
-            - int(_number(row.get("shares")))
-        if left <= 0:
-            state.working_orders.pop(order_id, None)
-        else:
-            held["remaining"] = left
 
 
 # ---------------------------------------------------------------- the scenario
@@ -824,7 +755,6 @@ class Scenario:
     start: clock_time = DAY_START
     end: clock_time = DAY_END
     slow: bool = False
-    fill_bridge: bool = True
 
     #: Builds the FakeBroker. Defaults to the fetched history for `symbols`.
     build_broker: Callable[["Scenario"], FakeBroker] | None = None
@@ -856,7 +786,7 @@ class TickRecord:
     at: str
     exit_code: int
     orders_placed: int
-    fills_applied: int
+    fills_seen: int
     rule_ids: list[str]
     reconcile_note: str
     halted_books: list[str]
@@ -874,7 +804,6 @@ class GateReport:
     day: str
     evidence: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
-    fill_bridge_used: bool = True
     ticks: int = 0
     orders_placed: int = 0
     fills: int = 0
@@ -892,7 +821,7 @@ class GateReport:
             "key": self.key, "title": self.title, "proves": self.proves,
             "passed": self.passed, "day": self.day,
             "evidence": self.evidence, "failures": self.failures,
-            "fill_bridge_used": self.fill_bridge_used, "ticks": self.ticks,
+            "ticks": self.ticks,
             "orders_placed": self.orders_placed, "fills": self.fills,
             "rule_ids_fired": sorted(self.rule_ids_fired),
             "alerts": self.alerts, "halts": self.halts,
@@ -928,7 +857,7 @@ class RunContext:
         self.reconcile_notes: list[str] = []
         self.tick_output: dict[str, str] = {}
         self.notes: list[str] = []
-        self.bridge: FillBridge | None = None
+        self.watcher = FillWatcher()
         self.books: list = []
         #: Rule ids that only fired because a probe pushed a crafted order at
         #: them. Kept apart from the rest so a report can never claim the loop
@@ -1458,7 +1387,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
     report = GateReport(key=scenario.key, title=scenario.title,
                         proves=scenario.proves, passed=False,
                         day=f"{scenario.day:%Y-%m-%d}",
-                        fill_bridge_used=scenario.fill_bridge)
+                        )
 
     saved_env = {ROOT_ENV_VAR: os.environ.get(ROOT_ENV_VAR),
                  LIVE_ENV_VAR: os.environ.get(LIVE_ENV_VAR)}
@@ -1486,9 +1415,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
 
         registry = gr.load_books(sandbox.books_yaml)
         context.books = list(registry.enabled_books())
-        context.bridge = (FillBridge(loop, bs, gr, sandbox.books_yaml,
-                                     modules.get("pdt"))
-                          if scenario.fill_bridge else None)
+        context.watcher = FillWatcher()
 
         _write_shortlists(context, fake)
         if scenario.setup is not None:
@@ -1505,18 +1432,13 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
             if fake.now is None or fake.now <= moment - timedelta(seconds=1):
                 fake.advance_to(moment - timedelta(seconds=1))
 
-            # The bridge runs BEFORE the tick, not after, because that is where
-            # the loop's own fill ingestion would sit: the bars ran, the resting
-            # orders filled, and the book files have to say so before the loop
-            # reconciles them against the broker. Running it after the tick
-            # leaves every filled order looking, for one whole tick, like a
-            # working order the broker has lost, and reconciliation halts the
-            # book for it.
-            fresh: list[SeenFill] = []
-            if context.bridge is not None:
-                fresh = context.bridge.apply(replay, context.books, scenario.day,
-                                             moment)
-                context.fills.extend(fresh)
+            # Count whatever filled while the bars ran, and apply none of it.
+            # The loop's own ingest_fills() does the applying now, at the start
+            # of its own tick, which is where a real one would too: the bars
+            # ran, the resting orders filled, and the book files have to say so
+            # before the loop reconciles them against the broker.
+            fresh = context.watcher.watch(replay, context.books)
+            context.fills.extend(fresh)
 
             if scenario.before_tick is not None:
                 scenario.before_tick(context, moment)
@@ -1538,7 +1460,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
             context.ticks.append(TickRecord(
                 at=at, exit_code=int(code),
                 orders_placed=len(replay.orders) - before_orders,
-                fills_applied=len(fresh),
+                fills_seen=len(fresh),
                 rule_ids=sorted(ledger.rule_ids()),
                 reconcile_note=_reconcile_note(text),
                 halted_books=sorted(context.halted_books()),
@@ -1557,10 +1479,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
         last = eastern(scenario.day, scenario.end) + timedelta(minutes=TICK_MINUTES)
         with contextlib.suppress(FakeBrokerError):
             fake.advance_to(last)
-        if context.bridge is not None:
-            context.fills.extend(context.bridge.apply(
-                replay, context.books, scenario.day,
-                eastern(scenario.day, scenario.end)))
+        context.fills.extend(context.watcher.watch(replay, context.books))
 
         report.ticks = len(context.ticks)
         report.orders_placed = len(replay.orders)
@@ -1713,9 +1632,6 @@ def summarise(reports: list[GateReport]) -> str:
             lines.append(f"      + {line}")
         for line in report.failures:
             lines.append(f"      ! {line}")
-        if not report.fill_bridge_used:
-            lines.append("      (ran with the fill bridge OFF, so this is the loop "
-                         "exactly as it stands)")
         lines.append("")
     fired: set[str] = set()
     for report in reports:

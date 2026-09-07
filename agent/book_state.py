@@ -22,6 +22,8 @@ What is in it, and why each piece has to survive a restart:
                            the best price seen since, which is what a trailing
                            stop follows
     working_orders         orders sent and not yet filled, by broker order id
+    fills_seen             the execution ids already applied, so reading the
+                           day's fills again cannot count one twice
     shortlist              the names the scanner or the sweep found this morning
     picks                  what the model or the rules chose from that shortlist
     entries_opened_today   how many brand new names it has opened today, which
@@ -158,6 +160,10 @@ class BookState:
     swept_at: dict = field(default_factory=dict)
     last_manage_at: str | None = None
     triggered: dict = field(default_factory=dict)
+    #: IBKR's own execution ids for every fill already applied to this book
+    #: today. Reading the day's executions again after a restart must not count
+    #: the same fill twice, and the exec id is the only thing that can say so.
+    fills_seen: list = field(default_factory=list)
     tick_count: int = 0
     last_tick: str | None = None
     last_phase: str | None = None

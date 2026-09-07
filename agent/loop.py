@@ -1903,6 +1903,12 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     this Mac's memory. Everything else, an exit or a flatten, is one plain
     order: there is nothing left to protect.
 
+    What actually filled is NOT taken from what this call handed back. The order
+    goes out, the row is written, and then ingest_fills() reads the broker's own
+    executions. One path from a fill into a book file, deduplicated on IBKR's
+    execution id, so an order that filled instantly and one that fills at 10:20
+    are handled by the same code.
+
     Nothing reaches this today. It exists so the live path is real, visible code
     with its locks on it rather than something to be invented in a hurry later.
     """
@@ -1932,31 +1938,9 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
                 "submitted" if result.get("working") else "rejected"))
 
     if filled > 0:
-        tick.say(f"filled {filled:g} {intent.symbol} at {price:.4f}, confirmed by "
-                 f"{result.get('confirmed_by')}")
-        for message in record_fill(state, intent, filled, price, tick.now, guard):
-            tick.note(f"{intent.symbol}: {message}")
-        counter = make_day_trade_counter(guard)
-        if counter is not None:
-            try:
-                counter.record_fill(intent.symbol, intent.side, int(round(filled)),
-                                    tick.now,
-                                    fill_id=str(result.get("order_id") or "") or None)
-            except Exception as exc:         # noqa: BLE001
-                tick.note(f"the day trade counter would not record the fill: {exc}")
-        # Item A15: every fill carries the facts the decision was made on, so
-        # slippage, risk and selection can be read back at the end of the month.
-        facts = trade_facts(state, intent.symbol, guard)
-        ledger_writer.log_trade(
-            {"symbol": intent.symbol, "side": intent.side, "qty": filled,
-             "price": price, "notional": round(filled * price, 2),
-             "order_ref": guard.order_ref, "purpose": intent.purpose,
-             "strategy_signal": facts.get("candle") or "",
-             "notes": facts_line(facts)},
-            book_id=tick.book.book_id, model=tick.book.model or "none",
-            decision_price=facts.get("decision_price"),
-            decision_time=facts.get("decision_time"),
-            dry_run=not tick.write_ledger)
+        tick.say(f"the broker says {filled:g} {intent.symbol} filled at "
+                 f"{price:.4f}, confirmed by {result.get('confirmed_by')}. "
+                 "Reading the executions back to be sure.")
     elif result.get("working"):
         order_id = str(result.get("order_id") or f"pending-{intent.symbol}")
         state.working_orders[order_id] = {
@@ -1969,7 +1953,294 @@ def submit(tick: BookTick, state: bs.BookState, intent: gr.OrderIntent,
     else:
         tick.note(f"the broker did not fill and is not working {intent.symbol}: "
                   f"{result.get('error') or 'no reason given'}")
+
+    # AFTER EVERY ORDER, read the broker's own executions rather than believing
+    # what the order call said. There is one path from a fill into a book file
+    # and this is it, so a fill that came back with the order and a fill that
+    # turns up two ticks later are handled by the same code and deduplicated by
+    # the same execution id. docs/MCP_SERVER.md records a market order that
+    # filled and came back isError=true, which is the other half of why nothing
+    # here trusts the reply.
+    ingest_fills(tick, state, guard, broker)
     return result
+
+
+# ------------------------------------------------- fills, read back off the broker
+
+#: The keys a broker execution row might carry each fact under. IBKR's own
+#: words first, then the snake case the MCP server sometimes uses.
+EXEC_ID_KEYS = ("execId", "exec_id", "executionId", "execution_id")
+EXEC_ORDER_KEYS = ("orderId", "order_id", "permId", "perm_id")
+EXEC_REF_KEYS = ("orderRef", "order_ref", "ref")
+EXEC_SHARES_KEYS = ("shares", "qty", "quantity", "cumQty", "filled")
+EXEC_PRICE_KEYS = ("price", "avgPrice", "avg_price", "avgFillPrice")
+EXEC_TIME_KEYS = ("time", "timestamp", "datetime", "at")
+
+
+def _text(row: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def normalise_execution(row: dict) -> dict:
+    """One broker execution in the six fields the loop needs, whatever it was called.
+
+    Read tolerantly on purpose. The replay broker and the MCP server do not
+    agree on the spelling of any of these, and a fill dropped because a key was
+    named differently is a position the book does not know it has.
+    """
+    side = str(row.get("side") or row.get("action") or "").strip().upper()
+    if side.startswith("B"):
+        side = "BUY"
+    elif side.startswith("S"):
+        side = "SELL"
+    return {
+        "exec_id": _text(row, EXEC_ID_KEYS),
+        "order_id": _text(row, EXEC_ORDER_KEYS),
+        "order_ref": _text(row, EXEC_REF_KEYS).upper(),
+        "symbol": str(row.get("symbol") or "").strip().upper(),
+        "side": side,
+        "shares": abs(_number(_first_present(row, EXEC_SHARES_KEYS))),
+        "price": _number(_first_present(row, EXEC_PRICE_KEYS)),
+        "commission": _number(row.get("commission")),
+        "at": _text(row, EXEC_TIME_KEYS),
+    }
+
+
+def read_executions(broker: broker_mod.Broker, order_ref: str,
+                    notes: list[str]) -> list[dict]:
+    """Every fill the broker has for one book, normalised and in time order.
+
+    The replay broker can filter by order reference itself, which is the half
+    IBKR cannot give us; the real one cannot, so the filtering is done here as
+    well. Either way only this book's fills come back, because a fill attributed
+    to the wrong book is worse than a fill nobody noticed.
+    """
+    ref = str(order_ref or "").upper()
+    answer: dict = {}
+    try:
+        answer = broker.executions(order_ref=ref) or {}
+    except TypeError:
+        try:
+            answer = broker.executions() or {}
+        except Exception as exc:             # noqa: BLE001
+            notes.append(f"the fills could not be read, so a fill that arrived "
+                         f"since the last tick is not in this book yet: {exc}")
+            return []
+    except Exception as exc:                 # noqa: BLE001
+        notes.append(f"the fills could not be read, so a fill that arrived since "
+                     f"the last tick is not in this book yet: {exc}")
+        return []
+
+    rows = answer.get("fills") or answer.get("executions") or []
+    out = [normalise_execution(row) for row in rows if isinstance(row, dict)]
+    return sorted([row for row in out
+                   if row["symbol"] and row["shares"] > 0
+                   and (not row["order_ref"] or row["order_ref"] == ref)],
+                  key=lambda row: (row["at"], row["exec_id"]))
+
+
+def working_order_for(state: bs.BookState, row: dict) -> tuple[str, dict] | None:
+    """The working order one fill belongs to: by order id first, then by name."""
+    orders = state.working_orders or {}
+    order_id = row.get("order_id") or ""
+    if order_id and isinstance(orders.get(str(order_id)), dict):
+        return str(order_id), orders[str(order_id)]
+    for key, order in orders.items():
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol") or "").upper() != row["symbol"]:
+            continue
+        if _number(order.get("remaining"), _number(order.get("qty"))) <= 0:
+            continue
+        return str(key), order
+    return None
+
+
+def purpose_of_fill(state: bs.BookState, row: dict, order: dict | None) -> str:
+    """entry, exit, stop or flatten, from the order it belongs to or from the book.
+
+    An order the book remembers says what it was for. One it does not, which is
+    what a stop resting at the broker looks like after a restart, is worked out
+    from the position: a fill pointing the other way to something held is
+    closing it, and anything else is opening one.
+    """
+    if isinstance(order, dict):
+        wanted = str(order.get("purpose") or "").strip().lower()
+        if wanted in ("entry", "exit", "stop", "flatten"):
+            return wanted
+    held = state.position(row["symbol"])
+    if held is not None and held.qty:
+        closing = (row["side"] == "SELL") if held.qty > 0 else (row["side"] == "BUY")
+        if closing:
+            return "exit"
+    return "entry"
+
+
+def ingest_fills(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
+                 broker: broker_mod.Broker,
+                 broker_orders: list | None = None) -> list[dict]:
+    """Read the broker's own fills into this book. Returns the ones newly applied.
+
+    THE HOLE THIS CLOSES, and it was the most important thing the first gate run
+    found. agent/loop.py recorded a fill in exactly one place, from whatever
+    place_order() handed straight back. Nothing anywhere read executions(), and
+    nothing turned a resting order into a position later. Against a live market
+    a marketable order comes back already filled, so that mostly worked. Against
+    a limit order that fills at 10:20 it did not: the position existed at the
+    broker and the book file had never heard of it. The gate's fake broker
+    filled nineteen orders on a clean day and not one book file knew.
+
+    So there is now exactly ONE path from a fill into a book, and this is it.
+    submit() no longer applies what the broker handed back; it records the order
+    and then calls this. That matters because two paths would mean two chances to
+    count the same fill twice, and IBKR's execution id is what stops that: an id
+    already in state.fills_seen is skipped, so reading the day's fills again
+    after a restart cannot double a position.
+
+    Run at the start of every tick and again after every order, because those
+    are the two moments when a fill the book has not seen can exist.
+    """
+    seen = {str(one) for one in (state.fills_seen or [])}
+    fresh: list[dict] = []
+    for row in read_executions(broker, guard.order_ref or tick.tag, tick.notes):
+        exec_id = row["exec_id"]
+        if exec_id and exec_id in seen:
+            continue
+        apply_execution(tick, state, guard, row)
+        if exec_id:
+            seen.add(exec_id)
+            state.fills_seen = sorted(seen)
+        fresh.append(row)
+
+    close_orders_the_broker_no_longer_has(tick, state, broker_orders)
+    return fresh
+
+
+def apply_execution(tick: BookTick, state: bs.BookState, guard: gr.Guardrails,
+                    row: dict) -> None:
+    """One fill into the book file, the database and the ledger."""
+    symbol = row["symbol"]
+    shares = row["shares"]
+    price = row["price"]
+    found = working_order_for(state, row)
+    order_id, order = found if found else (None, None)
+    purpose = purpose_of_fill(state, row, order)
+
+    try:
+        intent = gr.OrderIntent(
+            symbol=symbol, side=row["side"] or "BUY", qty=int(round(shares)),
+            limit_price=(round(price, 2) if price > 0 else None), purpose=purpose,
+            book_id=tick.book.book_id)
+    except Exception as exc:                 # noqa: BLE001
+        tick.note(f"{symbol}: a fill of {shares:g} at {price} could not be read "
+                  f"({exc}), so it is NOT in this book. Reconciliation will "
+                  "catch it on this tick.")
+        return
+
+    # The facts the decision was made on, read BEFORE the position moves, so the
+    # slippage columns compare the price we decided at with the price we got.
+    facts = trade_facts(state, symbol, guard)
+    for message in record_fill(state, intent, shares, price, tick.now, guard):
+        tick.note(f"{symbol}: {message}")
+
+    tick.say(f"filled {shares:g} {symbol} at {price:.4f} ({purpose}), "
+             f"execution {row['exec_id'] or 'unnumbered'}")
+
+    db_order_id = None
+    if isinstance(order, dict):
+        db_order_id = order.get("db_order_id")
+        left = _number(order.get("remaining"), _number(order.get("qty"))) - shares
+        order["remaining"] = max(0.0, round(left, 4))
+        order["status"] = "filled" if order["remaining"] <= 0 else "partially_filled"
+        if order["remaining"] <= 0:
+            state.working_orders.pop(str(order_id), None)
+        if db_order_id:
+            db_call("update_order_status", int(db_order_id), order["status"],
+                    broker_order_id=row["order_id"] or None)
+
+    db_call("record_fill", ts=(row["at"] or tick.now),
+            order_id=(int(db_order_id) if db_order_id else None),
+            exec_id=row["exec_id"] or None, symbol=symbol, side=intent.side,
+            qty=int(round(shares)), price=price,
+            commission=(row["commission"] or None),
+            decision_price=facts.get("decision_price"))
+
+    ledger_writer.log_trade(
+        {"symbol": symbol, "side": intent.side, "qty": shares, "price": price,
+         "notional": round(shares * price, 2), "order_ref": guard.order_ref,
+         "purpose": purpose, "commission": row["commission"] or None,
+         "strategy_signal": facts.get("candle") or "",
+         "notes": facts_line(facts)},
+        book_id=tick.book.book_id, model=tick.book.model or "none",
+        decision_price=facts.get("decision_price"),
+        decision_time=facts.get("decision_time"),
+        dry_run=not tick.write_ledger)
+
+    counter = make_day_trade_counter(guard)
+    if counter is not None:
+        try:
+            counter.record_fill(symbol, intent.side, int(round(shares)),
+                                _fill_moment(row, tick.now),
+                                fill_id=row["exec_id"] or None)
+        except Exception as exc:             # noqa: BLE001
+            tick.note(f"the day trade counter would not record the fill: {exc}")
+
+
+def _fill_moment(row: dict, fallback: datetime) -> datetime:
+    """When the fill happened, from the broker's own stamp when it gave one."""
+    when = row.get("at")
+    if not when:
+        return fallback
+    try:
+        moment = datetime.fromisoformat(str(when))
+    except ValueError:
+        return fallback
+    return moment if moment.tzinfo else moment.replace(tzinfo=fallback.tzinfo)
+
+
+def close_orders_the_broker_no_longer_has(tick: BookTick, state: bs.BookState,
+                                          broker_orders: list | None) -> int:
+    """Mark cancelled the orders this book thinks are working and the broker does not.
+
+    A book file that remembers an order forever is as wrong as one that forgets
+    a fill. An order pulled by hand in Gateway, expired at the close, or
+    cancelled by its one-cancels-the-other group leaves the book waiting on
+    something that no longer exists, and the account wide exposure counts money
+    against a name nobody is trading.
+
+    Only orders placed on an EARLIER tick are judged. An order sent seconds ago
+    may simply not be in the list that was read at the top of this tick, and
+    calling that a cancellation would throw away a live order's id.
+    """
+    if broker_orders is None:
+        return 0
+    live = {str(row.get("orderId") or row.get("order_id"))
+            for row in broker_orders if isinstance(row, dict)}
+    gone = 0
+    for order_id, order in list((state.working_orders or {}).items()):
+        if not isinstance(order, dict) or str(order_id) in live:
+            continue
+        placed = str(order.get("placed_at") or "")
+        if not placed or placed >= tick.now.isoformat():
+            continue
+        symbol = str(order.get("symbol") or "").upper()
+        purpose = str(order.get("purpose") or "entry")
+        state.working_orders.pop(str(order_id), None)
+        gone += 1
+        tick.note(f"{symbol}: order {order_id} ({purpose}) is no longer working at "
+                  "the broker and never filled, so this book has stopped waiting "
+                  "for it")
+        tick.rule("order_cancelled",
+                  f"{symbol}: order {order_id} ({purpose}) placed at {placed} is "
+                  "gone from the broker with nothing filled",
+                  "removed from this book's working orders")
+        if order.get("db_order_id"):
+            db_call("update_order_status", int(order["db_order_id"]), "cancelled")
+    return gone
 
 
 def record_fill(state: bs.BookState, intent: gr.OrderIntent, filled: float,
@@ -4450,6 +4721,42 @@ def read_broker_facts(broker: broker_mod.Broker,
     return facts
 
 
+def read_every_book_its_fills(books, guards_by_book: dict, now: datetime,
+                              rules: str, write_ledger: bool,
+                              broker: broker_mod.Broker,
+                              broker_orders: list | None) -> int:
+    """Read the broker's fills into every book, once, at the top of the tick.
+
+    Returns how many fills were newly applied across all the books.
+
+    Its own pass rather than the first thing in each book's turn, because it has
+    to happen BEFORE reconciliation and reconciliation runs once for all five
+    books. A fill nobody has read yet looks exactly like a disagreement: the
+    book is waiting on an order the broker no longer has and does not hold a
+    position the broker says it does, which is a mismatch, which is a halt.
+
+    One executions() call per book per tick and no more. Five books asking IB
+    Gateway the same question in the same second is how a pacing violation
+    happens, and it is what actually happened the first time this ran end to
+    end.
+    """
+    applied = 0
+    for book in books:
+        guard = guards_by_book.get(book.book_id)
+        if guard is None:
+            continue
+        tick = BookTick(book, now, rules, write_ledger)
+        tick.phase = "fills"
+        state = bs.load_state(book.book_id, book.order_ref, now.date(),
+                              capital=book.capital_usd)
+        before = dict(state.working_orders or {})
+        fresh = ingest_fills(tick, state, guard, broker, broker_orders)
+        if fresh or before != (state.working_orders or {}):
+            bs.save_state(state)
+        applied += len(fresh)
+    return applied
+
+
 def broker_unavailable_tick(facts: BrokerFacts, books, now: datetime, rules: str,
                             args) -> int:
     """The whole tick when IB Gateway did not answer. Nothing is decided, nothing moves.
@@ -4612,8 +4919,32 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                                dry_run=not args.write_ledger)
         return 3
 
-    # Reconciliation before anything else. If the books and the broker do not
-    # agree about who owns what, sizing the next order would be guesswork.
+    # THE FILLS FIRST, BEFORE ANYTHING IS COMPARED WITH ANYTHING. This has to
+    # come before reconciliation and not after it. A book that sent a limit
+    # order at 09:35 and had it filled at 09:38 looks, to a reconciliation that
+    # runs first, like a book waiting on an order the broker has lost and
+    # holding a position it never bought, so it is halted for a disagreement
+    # that existed only because nobody had read the fill yet. That is exactly
+    # what happened on the first run of this: eight problems across three books
+    # at 09:40 on an otherwise clean day.
+    guards_by_book: dict[str, gr.Guardrails] = {}
+    for book in books:
+        try:
+            guards_by_book[book.book_id] = gr.load_book_guardrails(
+                args.books_file, book.book_id)
+        except gr.GuardrailError as exc:
+            print(f"\n[{book.order_ref}] cannot load this book's limits, so it is "
+                  f"skipped this tick: {exc}")
+            ledger_writer.log_rule(now, "book_settings_broken",
+                                   f"book {book.book_id}: {exc} [rules {rules}]",
+                                   "this book was skipped this tick",
+                                   book_id=book.book_id, dry_run=not args.write_ledger)
+
+    read_every_book_its_fills(books, guards_by_book, now, rules,
+                              args.write_ledger, broker, broker_orders)
+
+    # Reconciliation next. If the books and the broker do not agree about who
+    # owns what, sizing the next order would be guesswork.
     books_state: dict[str, dict] = {}
     for book in books:
         state = bs.load_state(book.book_id, book.order_ref, now.date(),
@@ -4655,16 +4986,9 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     any_daily = False
 
     for book in books:
-        try:
-            guard = gr.load_book_guardrails(args.books_file, book.book_id)
-        except gr.GuardrailError as exc:
-            print(f"\n[{book.order_ref}] cannot load this book's limits, so it is "
-                  f"skipped this tick: {exc}")
-            ledger_writer.log_rule(now, "book_settings_broken",
-                                   f"book {book.book_id}: {exc} [rules {rules}]",
-                                   "this book was skipped this tick",
-                                   book_id=book.book_id, dry_run=not args.write_ledger)
-            continue
+        guard = guards_by_book.get(book.book_id)
+        if guard is None:
+            continue                    # said so above, when they would not load
 
         tick, state = run_book(book, guard, now, guards, broker, account_id,
                                broker_positions, rules, args.write_ledger,
