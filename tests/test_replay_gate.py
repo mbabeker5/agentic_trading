@@ -259,47 +259,89 @@ def test_every_fast_scenario_ran_a_whole_day(fast_reports):
 
 
 @needs_history
-#: flatten_at_close came OFF this list on 2026-09-06, and two others went on.
-#: Worth a sentence, because it used to pass.
+#: EVERY FAST SCENARIO IS ON THIS LIST NOW, which it has not been before.
 #:
-#: It passed for the wrong reason. Before Momentum v2 the replay's synthetic
-#: shortlist carried no industry, so the sector cap refused every entry, so no
-#: book ever held anything, so there was nothing left working at the close for
-#: the scenario to complain about. Once the shortlist grew the fields the real
-#: scanner now writes, entries went out, and the scenario immediately found a
-#: real bug: an entry goes out as a bracket, a parent and a resting stop child,
-#: and NOTHING CANCELS EITHER OF THEM at the flatten. agent/loop.py calls
-#: cancel_order in exactly two places, moving a stop and the sixty second market
-#: backstop, and neither of them runs at 15:45.
+#: The list was three on the morning of 2026-09-06, five by the evening, and it
+#: is all nine of the fast ones after the loop follow-on pass. Each one that
+#: went on did so because a real gap in agent/loop.py closed, not because a
+#: scenario was made easier: the loop reads its own fills out of executions(),
+#: it alerts, it clears a halt whose reason has gone, it tells a dead Gateway
+#: from an empty account, it reads how old its quotes are, it cancels what it
+#: has resting when it flattens, and it will not send an order it already has
+#: working.
 #:
-#: In a live account that is a stop resting at the broker for a position that no
-#: longer exists, plus an unfilled entry that could fill on the next open into a
-#: book that believes it is flat. It belongs to the loop follow-on, backlog item
-#: 0, and it is written down there.
-#:
-#: gateway_down, rejected_order and two_books_one_symbol went on in the same
-#: pass, because all three now pass and a guard that does not name them would
-#: not notice them breaking.
+#: A scenario here that starts failing is a regression. Read its failure lines
+#: before touching it: they say what changed and where, in sentences.
 @pytest.mark.parametrize("key", [
+    "fills_from_the_broker",
     "daily_loss_cap",
+    "flatten_at_close",
+    "phantom_position",
     "kill_switch",
+    "day_trade_counter",
     "gateway_down",
+    "competing_session_delayed_data",
     "rejected_order",
     "two_books_one_symbol",
 ])
 def test_the_scenarios_that_pass_today_still_pass(fast_reports, key):
     """A regression guard, not a specification.
 
-    These five pass against the loop as it stands on 2026-09-06. The other fast
-    scenarios fail, and they are deliberately not asserted on here: the day one
-    of them starts passing is the day somebody fixed the loop, and a test that
-    went red for that would be telling the wrong story.
-
-    This list is expected to grow. If a scenario here starts failing, read its
-    failure lines before touching it. They say what changed and where.
+    The two slow ones, clean_day and every_guardrail, are not in here because
+    this fixture skips anything marked slow. They are covered by running the
+    gate itself, which is step 4 of the promotion checklist in docs/REPLAY.md.
     """
     report = fast_reports[key]
     assert report.passed, f"{key} failed: " + "; ".join(report.failures)
+
+
+def test_the_facts_behind_the_rules_are_still_gathered():
+    """Every rule that reads a gathered fact has something in the loop filling it.
+
+    Read out of agent/loop.py rather than trusted, because a comment saying a
+    field is wired up is worth nothing the day somebody deletes the line that
+    wires it. Each of these was genuinely unfilled until 2026-09-06, and every
+    one of those fields defaults to a value meaning all clear, which is the
+    quietest way for a safety net to stop working.
+    """
+    source = (REAL_ROOT / "agent" / "loop.py").read_text(encoding="utf-8")
+    wiring = {
+        "halted": ("halted=halted", "limit_state=limit_state"),
+        "weekly_loss_cap": ("account_state.week_pnl = ",),
+        "monthly_loss_cap": ("account_state.month_pnl = ",),
+        "losing_streak_pause": ("account_state.consecutive_losing_days = ",),
+        "sector_cap": ("sector=sector_for(", "account_state.sector_exposure = "),
+        "account_symbol_cap": ("account_state.symbol_exposure_all_books = ",
+                               "account_state.account_equity = "),
+    }
+    assert set(wiring) == set(scenarios_mod.FACTS_BEHIND_THE_RULES)
+    for rule_id, needles in wiring.items():
+        for needle in needles:
+            assert needle in source, (
+                f"{rule_id} reads a fact and nothing in agent/loop.py fills it any "
+                f"more: {needle!r} is gone. That rule now defaults to all clear.")
+
+
+@needs_history
+def test_every_fast_scenario_passes_and_none_is_missing_from_the_guard(fast_reports):
+    """The list above has to be the whole of the fast set, not most of it.
+
+    A scenario added to agent/replay/scenarios.py and forgotten here would be a
+    scenario nobody notices breaking, which is the same failure the gate exists
+    to prevent one level down.
+    """
+    guarded = {
+        "fills_from_the_broker", "daily_loss_cap", "flatten_at_close",
+        "phantom_position", "kill_switch", "day_trade_counter", "gateway_down",
+        "competing_session_delayed_data", "rejected_order", "two_books_one_symbol",
+    }
+    assert set(fast_reports) == guarded, (
+        "the fast scenarios and the regression guard have drifted apart: "
+        f"not guarded {sorted(set(fast_reports) - guarded)}, "
+        f"guarded but gone {sorted(guarded - set(fast_reports))}")
+    failed = {key: report.failures for key, report in fast_reports.items()
+              if not report.passed}
+    assert not failed, failed
 
 
 @pytest.mark.parametrize("key", ["day_trade_counter", "rejected_order"])
@@ -307,14 +349,16 @@ def test_a_scenario_that_could_not_test_anything_says_so(fast_reports, key):
     """A scenario blocked upstream must not read as a pass or as its own failure.
 
     Both of these need the loop to open a position before they can test
-    anything. As of 2026-09-06 no book can, because `sector_cap` refuses every
-    entry whose industry it was not told, and nothing in agent/loop.py sets
-    `OrderIntent.sector`. The right behaviour then is to fail loudly and name
-    the reason as upstream, which is what this checks.
+    anything. Both do open one today, so both pass and this test is quiet. It
+    stays because the machinery it checks is what stopped the gate lying the
+    last time no book could open anything at all: `sector_cap` was refusing
+    every entry whose industry it had not been told, and without this the two
+    scenarios would have read as their own failures rather than as one upstream
+    one.
     """
     report = fast_reports[key]
     if report.passed:
-        return          # the loop can open positions again, which is the good case
+        return          # the loop can open positions, which is the good case
     assert any("upstream of this scenario" in line for line in report.failures), (
         f"{key} failed without saying whether the fault was its own: "
         + "; ".join(report.failures))

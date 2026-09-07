@@ -87,33 +87,48 @@ GUARDRAIL_RULE_IDS = (
     "account_symbol_cap", "sector_cap", "entries_per_day",
 )
 
-#: Rules whose facts agent/loop.py does not yet gather, so the loop cannot reach
-#: them however the day goes. They are proven here by probe and the report says
-#: so, because a rule that only a probe can reach is a rule with nothing behind
-#: it in production.
+#: Rules that read a fact somebody has to go and get: the field each one reads,
+#: and what fills that field in.
 #:
-#: Every one of these reads a field on AccountState or OrderIntent that
-#: agent/book_state.py's account_state_for() and agent/loop.py's _entry_intent()
-#: do not set, and every one of those fields defaults to a value meaning all
-#: clear. They are checked against the loop rather than written out by hand, in
-#: _not_wired_up() below, so this list cannot go stale on its own.
+#: This was called NOT_WIRED_UP until 2026-09-06, and the name was the truth.
+#: Every one of these read a field on AccountState or OrderIntent that nothing
+#: filled, and every one of those fields defaults to a value meaning all clear,
+#: which is the quietest way there is for a safety net to stop working: it looks
+#: present, it is tested on its own, and in production nothing ever reaches it.
+#: What looked like twenty seven guardrails was twenty one. One of the six was
+#: worse than dormant. sector_cap refuses any entry whose industry it was not
+#: told, so with nothing setting OrderIntent.sector it refused every entry every
+#: momentum book worked out.
 #:
-#: This dictionary shrank on 2026-09-06. agent/loop.py now fills every one of
-#: these fields on the way to the guardrails: the halt facts off IBKR's tick 49,
-#: the week and month figures and the losing day count out of the book's own
-#: earlier state files, the industry off the shortlist row, and the account wide
-#: symbol figures from reading all five book files once a tick. What is left
-#: here is checked against the loop rather than trusted, so an entry that is no
-#: longer true fails rather than lying.
-NOT_WIRED_UP_FIELDS = {
-    "halted": "halted and limit_state",
-    "weekly_loss_cap": "week_pnl",
-    "monthly_loss_cap": "month_pnl",
-    "losing_streak_pause": "consecutive_losing_days",
-    "sector_cap": "sector",
-    "account_symbol_cap": "symbol_exposure_all_books and account_equity",
+#: All six are filled now, and the second half of each line below says by what.
+#: A probe still reaches most of them, and that is a different and much smaller
+#: complaint: the loop gathers the fact, and the recorded day simply did not
+#: produce the condition. A book that is not four percent down this week cannot
+#: trip the weekly cap however well wired it is.
+#:
+#: test_the_facts_behind_the_rules_are_still_gathered in
+#: /Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_replay_gate.py
+#: reads agent/loop.py for each of these rather than trusting this comment, so a
+#: line that stops being true goes red instead of going unnoticed.
+FACTS_BEHIND_THE_RULES = {
+    "halted": ("OrderIntent.halted and limit_state",
+               "loop.tradeable_now(), off IBKR's tick type 49 and its "
+               "limit-up limit-down band"),
+    "weekly_loss_cap": ("AccountState.week_pnl",
+                        "loop.loss_history(), out of the book's own earlier "
+                        "state files"),
+    "monthly_loss_cap": ("AccountState.month_pnl",
+                         "loop.loss_history(), the same way"),
+    "losing_streak_pause": ("AccountState.consecutive_losing_days",
+                            "loop.loss_history(), the same way"),
+    "sector_cap": ("OrderIntent.sector and AccountState.sector_exposure",
+                   "loop.sector_for() off the shortlist row, and "
+                   "loop.sector_exposure_for() across the book"),
+    "account_symbol_cap": ("AccountState.symbol_exposure_all_books and "
+                           "account_equity",
+                           "loop.read_account_wide(), reading all five book "
+                           "files once a tick"),
 }
-NOT_WIRED_UP = tuple(NOT_WIRED_UP_FIELDS)
 
 #: The five minute grid a crafted day is written on, 09:25 to 16:05.
 CRAFTED_START = clock_time(9, 25)
@@ -919,18 +934,20 @@ def every_guardrail(day: date_type) -> Scenario:
             failures.append("these rule ids never fired, so they are untested rather "
                             "than proven: " + ", ".join(missing))
 
-        stranded = sorted(r for r in NOT_WIRED_UP if r in probed)
+        stranded = sorted(r for r in FACTS_BEHIND_THE_RULES if r in probed)
         if stranded:
             evidence.append(
-                "NOT WIRED UP, and this is the important line in this scenario: "
-                + ", ".join(f"{r} reads {NOT_WIRED_UP_FIELDS[r]}" for r in stranded)
-                + ". Every one of those fields is left at the value that means all "
-                "clear, because nothing on the way from agent/book_state.py's "
-                "account_state_for() through agent/loop.py sets them. The rules "
-                "work when a probe hands them the facts. In production they cannot "
-                "fire however the day goes, so what looks like "
-                f"{len(GUARDRAIL_RULE_IDS)} guardrails is "
-                f"{len(GUARDRAIL_RULE_IDS) - len(stranded)}.")
+                "these rules read a fact somebody has to go and get, and a probe "
+                "reached them rather than the day: "
+                + "; ".join(f"{r} reads {FACTS_BEHIND_THE_RULES[r][0]}, filled by "
+                            f"{FACTS_BEHIND_THE_RULES[r][1]}" for r in stranded)
+                + ". Every one of those fields WAS left at the value meaning all "
+                "clear until 2026-09-06, which made what looked like "
+                f"{len(GUARDRAIL_RULE_IDS)} guardrails "
+                f"{len(GUARDRAIL_RULE_IDS) - len(stranded)}. They are filled now, "
+                "so a probe reaching one only means the recorded day did not "
+                "produce the condition: a book that is not four percent down this "
+                "week cannot trip the weekly cap however well wired it is.")
 
         for rule_id in ("blacklist", "whitelist", "no_shorts", "daily_loss_cap",
                         "entries_per_day"):

@@ -314,27 +314,37 @@ entry through `max_shares_for` so it cannot ask for more than the caps allow.
 The third pile is the one to read. The list below was seven rules when it was
 written; `symbol_exclusive` left it when the hub stopped it refusing anything,
 and it is back in `GUARDRAIL_RULE_IDS` now that `universe.symbol_exclusive` in
-`config/guardrails.yaml` decides whether it refuses or reports. The six that
-remain can only be reached by a probe because the fact each of them checks is a
-field the loop never fills, and every one of those fields defaults to a value
-meaning all clear:
+`config/guardrails.yaml` decides whether it refuses or reports. Six others read
+a fact somebody has to go and get, and until the evening of 2026-09-06 nothing
+went and got any of them, so every one of the six sat at the value that means
+all clear. They are filled now, and this is what fills each one:
 
-| Rule | Reads | Set by |
+| Rule | Reads | Filled by |
 |---|---|---|
-| `halted` | `OrderIntent.halted`, `OrderIntent.limit_state` | nothing |
-| `weekly_loss_cap` | `AccountState.week_pnl` | nothing |
-| `monthly_loss_cap` | `AccountState.month_pnl` | nothing |
-| `losing_streak_pause` | `AccountState.consecutive_losing_days` | nothing |
-| `sector_cap` | `OrderIntent.sector` | nothing |
-| `account_symbol_cap` | `AccountState.symbol_exposure_all_books`, `account_equity` | nothing |
+| `halted` | `OrderIntent.halted`, `OrderIntent.limit_state` | `tradeable_now()`, off IBKR's tick type 49 and the limit-up limit-down band |
+| `weekly_loss_cap` | `AccountState.week_pnl` | `loss_history()`, out of the book's own earlier state files |
+| `monthly_loss_cap` | `AccountState.month_pnl` | `loss_history()`, the same way |
+| `losing_streak_pause` | `AccountState.consecutive_losing_days` | `loss_history()`, the same way |
+| `sector_cap` | `OrderIntent.sector`, `AccountState.sector_exposure` | `sector_for()` off the shortlist row, and `sector_exposure_for()` across the book |
+| `account_symbol_cap` | `AccountState.symbol_exposure_all_books`, `account_equity` | `read_account_wide()`, reading all five book files once a tick |
 
-They work when a probe hands them the facts. They cannot fire in production
-however the day goes. What looks like twenty seven guardrails is twenty, and one
-of the six is worse than dormant: `sector_cap` refuses any entry whose
-industry it was not told, so with nothing setting `OrderIntent.sector` it
-currently refuses every entry every momentum book works out. The clean day
-scenario reports any rule that refused ten or more orders as a stopped machine
-rather than a guardrail doing its job, which is how that turned up.
+Every one of those is in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`, and
+`test_the_facts_behind_the_rules_are_still_gathered` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_replay_gate.py`
+reads that file for each of them rather than trusting this table, so a line here
+that stops being true goes red instead of going unnoticed.
+
+A probe still reaches five of the six, and that is a much smaller complaint than
+the one it replaced. The loop gathers the fact; the recorded day simply did not
+produce the condition. A book that is not four percent down this week cannot
+trip the weekly cap however well wired it is. What it used to mean was that what
+looked like twenty seven guardrails was twenty one, and that one of the six was
+worse than dormant: `sector_cap` refuses any entry whose industry it was not
+told, so with nothing setting `OrderIntent.sector` it refused every entry every
+momentum book worked out. The clean day scenario reports any rule that refused
+ten or more orders as a stopped machine rather than a guardrail doing its job,
+which is how that turned up.
 
 ### Which scenario is which
 
@@ -444,13 +454,16 @@ checked, not "ok". If a line reads `daily_loss_cap was logged against book A`
 you can go and find that row. A scenario with no evidence line for the thing it
 claims to prove has not proved it.
 
-**A failure is a finding, not a broken test.** Five of the twelve scenarios fail
-against the loop as it stands on 2026-09-06, and every one of them fails on
-something real: the loop has no `cancel_order` call anywhere, it has no
-`alert()` call anywhere, it cannot tell a Gateway that is down from an account
-that is empty, it does not read the market data type off a quote, and books A, B
-and E pick the same names and halt each other. Those are in the failure lines,
-in full sentences, with the reason.
+**A failure is a finding, not a broken test.** All twelve scenarios pass as of
+the evening of 2026-09-06, and the way they got there is the point. Five of them
+were failing that morning, every one on something real: the loop had no
+`cancel_order` call at the flatten, no `alert()` call anywhere, no way to tell a
+Gateway that is down from an account that is empty, no reading of the market data
+type off a quote, and no path from a broker fill back into a book file. Each of
+those was a bug in `agent/loop.py`, found here rather than on a Tuesday, and
+each was fixed rather than worked around in the scenario. A scenario that goes
+red again is a regression, and its failure lines say what changed and where, in
+full sentences.
 
 **The gate marks its own weak spots.** Where a scenario runs on bars written by
 hand rather than recorded, it says so. Where a rule was only reached by pushing a
@@ -606,10 +619,11 @@ edit, and every line of it is a thing to check rather than a thing to assume.
 14. The kill switch has been pulled by hand, for real, against the paper
     account, and the account was empty afterwards. Rehearsing it in a replay is
     not the same as knowing the button works on the day.
-15. Alerts reach a human. As of 2026-09-06 `agent/loop.py` contains no `alert()`
-    call at all, so a halt is written to a log file nobody is watching. Fix that
-    before a book sends a real order, or accept that a halted book will go
-    unnoticed until somebody opens the ledger.
+15. Alerts reach a human. `agent/loop.py` raises them now (a halt, a cap, an
+    orphan, a competing session, delayed data), rate limited so one problem is
+    one message rather than eighty. What is not proved is delivery: the gate
+    captures alerts instead of sending them, so send one to yourself by hand and
+    check it arrives before a book sends a real order.
 
 ## The interface the loop codes against
 
