@@ -90,16 +90,21 @@ but the WAKE UP TIMES are the Mac's local clock. Move to a Mac set to another
 time zone and either set that Mac to Eastern or shift every time in the
 templates. The generated files say so at the top.
 
-THREE FILES IN THAT FOLDER ARE NOT TEMPLATES AT ALL, whatever their names
-suggest. backup_db.plist.tmpl, deadman.plist.tmpl and sheet_sync.plist.tmpl are
-whole finished plists with {ROOT} written through them, made by hand before this
-script existed. There is no [schedule] in English in any of them for this script
-to expand, so nothing here can render one, and each of the three says inside
-itself that it is held back on purpose along with the three steps to convert it.
-They are found and named out loud on every run that writes or checks anything,
-so that the way they went missing in the first place cannot happen twice.
+A FILE IN THAT FOLDER MAY NOT BE A TEMPLATE AT ALL, whatever its name suggests.
+A whole finished plist with {ROOT} written through it, made by hand, holds no
+[schedule] in English for this script to expand, so nothing here can render one.
+Any such file is found and named out loud on every run that writes or checks
+anything, so that a file this script quietly skips can never go unnoticed again.
 --uninstall is the one mode that stays quiet about them, because it is about
 what launchd is running and not about what this folder holds.
+
+There were three of those until 2026-09-07: backup_db.plist.tmpl,
+deadman.plist.tmpl and sheet_sync.plist.tmpl, each one a job that had never run
+and each one saying inside itself that it was held back on purpose. Mo approved
+unattended operation on 2026-09-06 and the hub ruled the next day that all three
+should be armed, so each was rewritten as a proper <job>.template beside the
+other six and the hand made file deleted. The detection stays for the next file
+that arrives in the wrong format; today it finds nothing.
 
 This script never loads a job unless you type --install, and it never places an
 order under any circumstances.
@@ -239,11 +244,12 @@ def expand_schedule(rules: list[str]) -> list[dict[str, int]]:
 
 #: The two endings a template file may have.
 #:
-#: TWO RATHER THAN ONE ON PURPOSE. Six templates are named <job>.template and
-#: three are named <job>.plist.tmpl. Renaming the three to match would be the
-#: tidier fix, and it would also break anybody's local checkout or notes that
-#: refer to them by name, which several do: the journal, the docs and the files
-#: themselves all name them. So both endings are read and either may be used.
+#: TWO RATHER THAN ONE ON PURPOSE. Every template is named <job>.template today,
+#: but three were named <job>.plist.tmpl until 2026-09-07 and this script was
+#: blind to that ending until 2026-09-06, which is how three jobs came to have
+#: no plist at all. Both endings stay readable so that a checkout, a note or a
+#: journal entry from before the rename still works, and so that the next file
+#: dropped in with the other ending is read rather than silently skipped.
 TEMPLATE_ENDINGS = (".template", ".plist.tmpl")
 
 
@@ -254,11 +260,11 @@ def discover_templates(template_dir: Path) -> list[Path]:
     files in the same order and write the same bytes.
 
     This globbed "*.template" alone until 2026-09-06, which is how three jobs
-    went missing: backup_db, deadman and sheet_sync are all named *.plist.tmpl,
-    so the generator never looked at them, no plist was ever written, and
+    went missing: backup_db, deadman and sheet_sync were all named *.plist.tmpl
+    then, so the generator never looked at them, no plist was ever written, and
     nothing ran them. Nothing noticed either, because --check went through the
     list the generator handed it, and a file the generator cannot see is missing
-    from that list too.
+    from that list too. All three are ordinary templates since 2026-09-07.
     """
     found: set[Path] = set()
     for ending in TEMPLATE_ENDINGS:
@@ -287,15 +293,18 @@ def job_name_from_filename(path: Path) -> str:
 def is_pre_rendered_plist(path: Path) -> bool:
     """True for the old hand made kind: a finished plist rather than a template.
 
-    Three files in the templates folder are whole plists with {ROOT} written
-    through them, from before this script existed. They hold no schedule in
-    English to expand, so nothing here can render one, and handing one to
+    Three files in the templates folder were whole plists with {ROOT} written
+    through them, from before this script existed, until all three were
+    rewritten as proper templates on 2026-09-07. Such a file holds no schedule
+    in English to expand, so nothing here can render one, and handing one to
     parse_template only produces "text before the first section" off its XML
     declaration on line 1.
 
-    Telling them apart by their first real line rather than by their name is
-    what lets a new job written in this script's own format be read normally
-    whichever of the two endings its file uses.
+    Nothing in the folder answers yes today. The check stays because the next
+    person to drop a finished plist in there should get a file named out loud
+    rather than a stack trace. Telling them apart by the first real line rather
+    than by the name is what lets a job written in this script's own format be
+    read normally whichever of the two endings its file uses.
     """
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -325,13 +334,15 @@ def report_pre_rendered(root: Path) -> list[Path]:
     print("\nfound but NOT generated, and not by accident:")
     for path in held_back:
         print(f"  {path}   (job {job_name_from_filename(path)})")
-    print("  Each of these is a finished plist with {ROOT} written through it,\n"
-          "  made by hand before this generator existed, so it carries no\n"
-          "  schedule in English for this script to expand. Every one of the\n"
-          "  three says inside itself why it is held back and the three steps\n"
-          "  that convert it. One of them is the dead man's handle, the only\n"
-          "  job in this project that can place an order, so converting them is\n"
-          "  a decision for a person rather than a rename.")
+    print("  Each of these is a finished plist with {ROOT} written through it\n"
+          "  rather than a template in this script's format, so it carries no\n"
+          "  schedule in English for this script to expand and nothing here can\n"
+          "  render it. Rewrite it as config/launchd/templates/<job>.template,\n"
+          "  taking the program, the environment and the comment straight from\n"
+          "  the file and writing the schedule as one English line, then add the\n"
+          "  wake up count to EXPECTED_WAKE_UPS in tests/test_paths.py and\n"
+          "  delete the hand made file. That is what was done on 2026-09-07 to\n"
+          "  the three that used to be listed here.")
     return held_back
 
 
@@ -693,12 +704,12 @@ def main(argv: list[str] | None = None) -> int:
         # still runs it, so a job goes on firing from a definition nobody keeps.
         # Only this run's own label prefix is looked at, so generating under a
         # different prefix does not condemn the real files sitting beside it.
-        # The three held-back files count as templates here even though nothing
-        # renders them. Each one tells you to render it by hand with sed, and
-        # config/launchd/ is where it says to put the result, so a hand made
-        # deadman plist has a template behind it and is not an orphan. Without
-        # this, --check would tell you to delete the dead man's handle three
-        # lines above naming the file that made it.
+        # A held-back file counts as a template here even though nothing renders
+        # it. Each of the three that used to be here told you to render it by
+        # hand with sed into config/launchd/, so a hand made plist had a
+        # definition behind it and was not an orphan. Without this, --check
+        # would have told you to delete the dead man's handle three lines above
+        # naming the file that made it.
         wanted = {plist.name for plist in sources} | {
             f"{args.label_prefix}.{job_name_from_filename(path)}.plist"
             for path in pre_rendered_templates(root)}

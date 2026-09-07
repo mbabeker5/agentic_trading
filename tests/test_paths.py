@@ -99,6 +99,11 @@ EXPECTED_WAKE_UPS = {
     "recorder": 405,    # 81 a day, Monday to Friday
     "learning": 5,      # one a weekday, after the close
     "weekly": 1,        # Friday only
+    # Armed on 2026-09-07. All three were hand written plists in the templates
+    # folder until then, held back because none had ever run.
+    "deadman": 395,     # 79 a day, 09:30 to 16:00 every five minutes, Mon to Fri
+    "sheet_sync": 5,    # 16:35 on a weekday
+    "backup_db": 7,     # 17:00 every day, the weekend included
 }
 
 
@@ -490,23 +495,28 @@ def run_generator(root, *flags):
         capture_output=True, text=True, check=False, cwd=str(REPO))
 
 
-def test_the_generator_reads_both_template_endings():
-    """Six templates end .template and three end .plist.tmpl.
+def test_the_generator_reads_both_template_endings(tmp_path):
+    """Either ending is read, and every job in the folder is found.
 
-    It globbed the first ending alone until 2026-09-06, so the other three were
-    never read and no plist was ever written for any of them. Both endings are
-    accepted rather than the three being renamed, because their names are
-    written down in the journal and inside the files themselves, and a rename
-    would break anybody's notes that point at them.
+    The generator globbed "*.template" alone until 2026-09-06, so three jobs
+    named *.plist.tmpl were never read and no plist was ever written for any of
+    them. All three became ordinary .template files on 2026-09-07 when they were
+    armed, so the folder no longer proves this on its own. A throwaway copy with
+    one file renamed does, and it is the ending that has to keep working rather
+    than any particular file's name.
     """
     generator = load_generator()
     names = [path.name for path in generator.discover_templates(TEMPLATE_DIR)]
-    assert "tick.template" in names
-    assert "backup_db.plist.tmpl" in names
-    assert "deadman.plist.tmpl" in names
-    assert "sheet_sync.plist.tmpl" in names
+    assert sorted(names) == sorted(f"{job}.template" for job in EXPECTED_WAKE_UPS)
     # Sorted with no repeats, so two runs go through the files in one order.
     assert names == sorted(set(names))
+
+    other_ending = tmp_path / "templates"
+    other_ending.mkdir()
+    shutil.copy2(TEMPLATE_DIR / "weekly.template",
+                 other_ending / "weekly.plist.tmpl")
+    found = generator.discover_templates(other_ending)
+    assert [path.name for path in found] == ["weekly.plist.tmpl"]
 
 
 def test_a_plist_tmpl_file_is_not_a_job_called_plist():
@@ -533,9 +543,10 @@ def test_every_template_the_generator_can_read_has_a_plist_on_disk():
 
     IT WOULD NOT HAVE CAUGHT THE ORIGINAL BUG, and saying so matters more than
     the reassurance of pretending otherwise. It skips the pre-rendered files,
-    and all three of the jobs that are actually missing are pre-rendered, so it
-    passes today with backup_db, deadman and sheet_sync still absent. What it
-    guards is the next one: a real template added to that folder and never
+    and all three of the jobs that were actually missing were pre-rendered, so
+    it passed all week with backup_db, deadman and sheet_sync absent. Since
+    2026-09-07 those three are ordinary templates and this does cover them. What
+    it guards is the next one: a real template added to that folder and never
     generated from. The synthetic version of that is
     test_check_fails_when_a_template_has_no_plist below, which invents its own
     template so it can prove the check fires.
@@ -555,22 +566,41 @@ def test_every_template_the_generator_can_read_has_a_plist_on_disk():
         + ", so nothing runs it. Run: python3 scripts/gen_launchd.py")
 
 
-def test_the_hand_made_plists_are_named_out_loud():
-    """The real lesson of the bug is that a silent file is the dangerous one.
+def test_nothing_in_the_templates_folder_is_held_back_any_more():
+    """All nine jobs generate, since backup_db, deadman and sheet_sync were armed.
 
-    backup_db, deadman and sheet_sync are finished plists rather than templates
-    in the generator's format, so nothing is generated from them, and that stays
-    true until somebody converts them on purpose. What must never happen again
-    is that being silent, so the generator names every one of them on every run
-    and this checks that it does.
+    Three of them were finished plists rather than templates in the generator's
+    format, so nothing was generated from them and nothing ran them. They were
+    rewritten as templates on 2026-09-07 and the hand made files deleted, so the
+    folder should now hold nothing the generator cannot render.
     """
     generator = load_generator()
-    held_back = generator.pre_rendered_templates(REPO)
-    result = run_generator(REPO, "--check")
-    for path in held_back:
-        assert path.name in result.stdout, (
-            f"{path.name} sits in the templates folder, nothing generates it, "
-            "and the generator said nothing about it")
+    held_back = [path.name for path in generator.pre_rendered_templates(REPO)]
+    assert held_back == [], (
+        "these are finished plists rather than templates, so nothing generates "
+        "them and nothing runs them: " + ", ".join(held_back))
+
+
+def test_a_hand_made_plist_is_named_out_loud(tmp_path):
+    """The real lesson of the bug is that a silent file is the dangerous one.
+
+    Nothing in the real folder is held back today, so this makes one: a finished
+    plist dropped into a throwaway copy of the templates folder. The generator
+    has to name it rather than skip it in silence, which is the whole of what
+    went wrong before 2026-09-06.
+    """
+    root = temp_project(tmp_path)
+    (root / "config" / "launchd" / "templates" / "by_hand.plist.tmpl").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict><key>Label</key>'
+        "<string>com.example.by_hand</string></dict></plist>\n",
+        encoding="utf-8")
+
+    result = run_generator(root)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "by_hand.plist.tmpl" in result.stdout, (
+        "a file the generator cannot render sat in the folder and it said "
+        "nothing about it")
 
 
 def test_check_fails_when_a_plist_is_deleted(tmp_path):
@@ -619,26 +649,33 @@ def test_check_fails_when_a_plist_has_no_template(tmp_path):
 
 
 def test_a_hand_rendered_plist_is_not_condemned_as_an_orphan(tmp_path):
-    """The dead man's handle, rendered the way its own header tells you to.
+    """A plist rendered by hand from a held-back file the way its header says.
 
-    Each of the three held-back files says to render it with sed into
-    config/launchd/. Nothing generates it, so the orphan check has to count
-    those three as templates anyway, otherwise --check tells you to delete the
-    dead man's handle three lines above naming the file that made it.
+    A held-back file tells you to render it with sed into config/launchd/.
+    Nothing generates it, so the orphan check has to count it as a template
+    anyway, otherwise --check tells you to delete a job three lines above naming
+    the file that made it. Until 2026-09-07 the dead man's handle was the real
+    example; nothing in the folder is held back now, so this makes its own.
     """
     root = temp_project(tmp_path)
     assert run_generator(root).returncode == 0
 
-    source = (root / "config" / "launchd" / "templates" / "deadman.plist.tmpl")
+    source = root / "config" / "launchd" / "templates" / "by_hand.plist.tmpl"
+    source.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict><key>Label</key>'
+        "<string>com.mtalib.agentic-trading.by_hand</string>"
+        "<key>Root</key><string>{ROOT}</string></dict></plist>\n",
+        encoding="utf-8")
     target = (root / "config" / "launchd"
-              / "com.mtalib.agentic-trading.deadman.plist")
+              / "com.mtalib.agentic-trading.by_hand.plist")
     target.write_text(source.read_text(encoding="utf-8").replace("{ROOT}", str(root)),
                       encoding="utf-8")
 
     result = run_generator(root, "--check")
     assert result.returncode == 0, result.stdout
     assert "ORPHAN" not in result.stdout
-    assert "deadman.plist.tmpl" in result.stdout, "it is still named out loud"
+    assert "by_hand.plist.tmpl" in result.stdout, "it is still named out loud"
 
 
 def test_the_plists_on_disk_all_parse_and_carry_a_label():

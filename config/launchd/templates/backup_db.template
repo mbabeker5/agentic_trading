@@ -1,0 +1,51 @@
+# The nightly database copy. Read by scripts/gen_launchd.py, which writes the
+# plist. Do not hand edit the plist, edit this and generate again.
+#
+# This was config/launchd/templates/backup_db.plist.tmpl until 2026-09-07, a
+# whole hand written plist with {ROOT} through it. The hub ruled on 2026-09-07
+# that it should be armed, so the three steps that file listed were carried out
+# and the file itself deleted.
+
+[job]
+name = backup_db
+exit_timeout = 120
+run_at_load = false
+
+[program]
+{ROOT}/scripts/backup_db.sh
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# The market shuts at 16:00 and the sheet rebuild runs at 16:35, so by five
+# o'clock the day is finished and written down. The backup is taken after all of
+# it, every day including the weekend.
+at 17:00 on everyday
+
+[comment]
+The database backup, run by launchd. 7 wake ups a week: 17:00, every day.
+
+WHAT IT DOES. It takes one copy of {ROOT}/data/trading.sqlite into
+{ROOT}/data/backups/trading_YYYY-MM-DD.sqlite and deletes any copy more than
+thirty days old. One line goes into {ROOT}/output/backup_db.log saying what it
+did. A copy from today is overwritten, so running it twice in one day leaves one
+file rather than two.
+
+WHY EVERY DAY AND NOT ONLY WEEKDAYS. A weekend copy holds no new trades, and
+that is fine: the point of running it daily is that the thirty day window is
+thirty real days rather than six working weeks, and that a Mac that dies on a
+Sunday still has Friday's data in a file written by a job that was clearly
+working the day before.
+
+IT CANNOT TRADE, and it cannot damage the live database. It only ever reads the
+database and writes a new file beside it. It uses SQLite's own online backup
+rather than a file copy, which is the point: the database runs in WAL mode, so a
+plain copy taken mid write would quietly miss the newest rows or produce a torn
+file that still looks fine. It checks the copy is readable before it deletes
+anything old.
+
+ARMED ON 2026-09-07 by the hub's ruling. It was run once by hand first and the
+copy it made was checked for a sensible size.

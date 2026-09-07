@@ -1,0 +1,67 @@
+# The dead man's handle. Read by scripts/gen_launchd.py, which writes the plist.
+# Do not hand edit the plist, edit this and generate again.
+#
+# This was config/launchd/templates/deadman.plist.tmpl until 2026-09-07, a whole
+# hand written plist with {ROOT} through it and its 395 wake ups spelled out one
+# at a time. Mo approved the kill switch and unattended operation on 2026-09-06
+# and the hub ruled on 2026-09-07 that it should be armed, so the three steps
+# that file listed were carried out and the file itself deleted.
+
+[job]
+name = deadman
+exit_timeout = 120
+run_at_load = false
+
+[program]
+{VENV_PYTHON}
+{ROOT}/agent/deadman.py
+--really
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# The trading day only. Outside these hours a quarter of an hour of silence is
+# not a fault, it is a Tuesday evening, and the script would refuse to act
+# anyway because its second question is whether the market is open.
+every 5 minutes from 09:30 to 16:00 on weekdays
+
+[comment]
+The dead man's handle, run by launchd. 395 wake ups a week: 79 a day, 09:30 to
+16:00 every five minutes, Monday to Friday.
+
+WHAT IT DOES. It runs {ROOT}/agent/deadman.py in its armed form. That asks three
+questions and stops at the first no: has the trading loop's heartbeat gone stale
+by more than fifteen minutes, is the market actually open, and does any book
+still hold a position or have an order working. If all three are yes it messages
+Mo and pulls the kill switch. If any one is no it does nothing, and in the
+healthy case it does not even speak to IB Gateway.
+
+Every tick writes {ROOT}/output/heartbeat, and this job is the only thing that
+reads it on a schedule. While it was unloaded that heartbeat had no reader, so a
+loop that died holding a position stayed dead and holding it.
+
+IT CAN TRADE. This is the only launchd job in the project that can. It cannot
+open anything: the only orders it can cause are closing orders from
+agent/kill_switch.py, and only on an account whose id starts with DU. A live
+account would need AGENTIC_TRADING_KILL_LIVE set to yes in the environment block
+above, which is deliberately not there and must stay that way.
+
+Take the third argument out of the program block above and it becomes a
+rehearsal: it still decides and still writes to the log, and it sends nothing
+and trades nothing.
+
+It fires once per silence, not once per wake up.
+{ROOT}/output/deadman_state.json remembers which silence it already acted on,
+keyed on the stale heartbeat, so a loop that stays dead all afternoon gets one
+kill switch rather than seventy eight.
+
+ARMED ON 2026-09-07 by the hub's ruling, on Mo's approval of 2026-09-06. It ran
+as a dry run by hand first and reported the loop quiet with the market shut,
+which is the correct answer outside trading hours.
+
+Worth knowing: it does not fire the moment it is loaded, on purpose. A job that
+fired at load would judge a heartbeat from whenever the machine was last used,
+and at nine in the evening that is not a fault.

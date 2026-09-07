@@ -1,0 +1,58 @@
+# The nightly Google Sheet rebuild. Read by scripts/gen_launchd.py, which writes
+# the plist. Do not hand edit the plist, edit this and generate again.
+#
+# This was config/launchd/templates/sheet_sync.plist.tmpl until 2026-09-07, a
+# whole hand written plist with {ROOT} through it. The hub ruled on 2026-09-07
+# that it should be armed, so the three steps that file listed were carried out
+# and the file itself deleted.
+
+[job]
+name = sheet_sync
+exit_timeout = 300
+run_at_load = false
+
+[program]
+{VENV_PYTHON}
+{ROOT}/ledger/sync_sheet.py
+--write
+
+[environment]
+TZ = America/New_York
+PATH = /usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+AGENTIC_TRADING_ROOT = {ROOT}
+
+[schedule]
+# Thirty five minutes after the close, so the day is finished and the positions
+# have settled before the sheet is rebuilt from the database.
+at 16:35 on weekdays
+
+[comment]
+The Google Sheet rebuild, run by launchd. 5 wake ups a week: 16:35, Monday to
+Friday.
+
+WHAT IT DOES. At 16:35 New York it rewrites the Google Sheet ledger from
+{ROOT}/data/trading.sqlite. The database is the record; the sheet is a picture
+of it that Mo can open on a phone. Nothing writes to the sheet during the day
+any more, so a broken wifi connection at half past nine in the morning costs
+nothing.
+
+IT CANNOT TRADE. It reads one file on disk and writes to one Google Sheet. It
+never opens a connection to IB Gateway and has no way to place an order.
+
+IT IS SAFE TO RUN TWICE. Every tab is cleared over the columns the agent owns
+and rewritten from the top, so a second run in the same evening produces the
+same sheet rather than a doubled one. It never appends.
+
+Take the last argument out of the program block above, the write flag, and it
+becomes a rehearsal: it works out every row, reads the live sheet to check the
+column headings still line up, prints what it would send, and writes nothing.
+(The flag cannot be spelled out here, because XML forbids two hyphens in a row
+inside a comment.)
+
+WHAT IT NEEDS. The Google token at {ROOT}/.secrets/token_personal_drive.json and
+the sheet id in {ROOT}/config/ledger.json. If either is missing it says so and
+stops without touching anything.
+
+ARMED ON 2026-09-07 by the hub's ruling. It was run once by hand against the
+live sheet first, and the sheet was read back through the Sheets API afterwards
+to check the tabs it owns had sensible rows in them.

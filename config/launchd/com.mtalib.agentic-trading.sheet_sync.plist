@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  GENERATED FILE. Do not edit it by hand, your edit will be overwritten.
+  Written by /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+  from /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/sheet_sync.template
+
+  launchd works in this Mac's own local time. There is no setting in here
+  that pins a time zone, so the times below are this Mac's clock. The
+  market keeps New York hours whatever the Mac thinks. Keep the Mac on
+  Eastern, or change every time in the template and generate again.
+
+  NOT LOADED by writing this file. Loading is a separate, deliberate step,
+  one command, written out in full in:
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md
+-->
+<!--
+  The Google Sheet rebuild, run by launchd. 5 wake ups a week: 16:35, Monday to
+  Friday.
+
+  WHAT IT DOES. At 16:35 New York it rewrites the Google Sheet ledger from
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/data/trading.sqlite. The database is the record; the sheet is a picture
+  of it that Mo can open on a phone. Nothing writes to the sheet during the day
+  any more, so a broken wifi connection at half past nine in the morning costs
+  nothing.
+
+  IT CANNOT TRADE. It reads one file on disk and writes to one Google Sheet. It
+  never opens a connection to IB Gateway and has no way to place an order.
+
+  IT IS SAFE TO RUN TWICE. Every tab is cleared over the columns the agent owns
+  and rewritten from the top, so a second run in the same evening produces the
+  same sheet rather than a doubled one. It never appends.
+
+  Take the last argument out of the program block above, the write flag, and it
+  becomes a rehearsal: it works out every row, reads the live sheet to check the
+  column headings still line up, prints what it would send, and writes nothing.
+  (The flag cannot be spelled out here, because XML forbids two hyphens in a row
+  inside a comment.)
+
+  WHAT IT NEEDS. The Google token at /Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/token_personal_drive.json and
+  the sheet id in /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/ledger.json. If either is missing it says so and
+  stops without touching anything.
+
+  ARMED ON 2026-09-07 by the hub's ruling. It was run once by hand against the
+  live sheet first, and the sheet was read back through the Sheets API afterwards
+  to check the tabs it owns had sensible rows in them.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mtalib.agentic-trading.sheet_sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python</string>
+      <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading/ledger/sync_sheet.py</string>
+      <string>--write</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_sheet_sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/launchd_sheet_sync.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>AGENTIC_TRADING_ROOT</key><string>/Users/mtalib/workspace_repos/personal_repo/agentic_trading</string>
+      <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+      <key>TZ</key><string>America/New_York</string>
+    </dict>
+
+    <!-- A run that overruns must never have a second one land on top of it. -->
+    <key>AbandonProcessGroup</key>
+    <false/>
+    <key>ExitTimeOut</key>
+    <integer>300</integer>
+
+    <!-- Do not fire the moment the job is loaded, only on the times below. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- 5 wake ups a week. -->
+    <key>StartCalendarInterval</key>
+    <array>
+      <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>4</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+      <dict>
+        <key>Weekday</key><integer>5</integer>
+        <key>Hour</key><integer>16</integer>
+        <key>Minute</key><integer>35</integer>
+      </dict>
+    </array>
+
+</dict>
+</plist>

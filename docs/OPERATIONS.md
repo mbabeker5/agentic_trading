@@ -343,7 +343,8 @@ died before writing today's file has not stopped owning last Thursday's buy.
 The heartbeat is the newest change time among these, all under `output/`:
 
 ```
-heartbeat              wins outright if it exists. Nothing writes it today.
+heartbeat              wins outright if it exists. agent/loop.py touches it at
+                       the end of every tick that got all the way through.
 loop.log               one line per book per tick
 tick_YYYY-MM-DD.log    everything one day's ticks printed
 state_BOOK_*_*.json    one file per book per day
@@ -374,24 +375,39 @@ On an account that does not start with `DU` it alerts and stops there, unless
 deliberately does not set. Flattening a live account because a log file looked
 old is not a decision a scheduled job gets to make on its own.
 
-**It is not loaded, and it is not one of the six generated jobs.** Its job file
-is a template at
-`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/deadman.plist.tmpl`,
-which is a plist with the project folder left as a placeholder rather than one of
-the `.template` files `scripts/gen_launchd.py` reads. That is on purpose: it has
-never run against a real account, so it is kept out of the set of jobs that are
-ready. To load it by hand, from the project folder:
+**IT IS LOADED AND ARMED, as of 2026-09-07.** Mo approved the kill switch and
+unattended operation on 2026-09-06, and the hub ruled the next day that this job
+should go on watch, so it is now one of the nine generated jobs rather than a
+hand written plist held back beside them. It runs with `--really`, which means it
+can pull the kill switch on its own. `AGENTIC_TRADING_KILL_LIVE` is not set
+anywhere in its job file and must stay that way, so it can only ever act on the
+paper account.
+
+Its definition is a normal template now:
 
 ```
-sed "s|{ROOT}|$PWD|g" config/launchd/templates/deadman.plist.tmpl \
-  > ~/Library/LaunchAgents/com.mtalib.agentic-trading.deadman.plist
-launchctl bootstrap gui/$(id -u) \
-  ~/Library/LaunchAgents/com.mtalib.agentic-trading.deadman.plist
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/deadman.template
 ```
 
-Take `--really` out of that file's `ProgramArguments` first and watch it for a
-week. The file itself says how to promote it into a proper generated job when
-you want it armed.
+It was a plist with the project folder left as a placeholder,
+`deadman.plist.tmpl`, from before `scripts/gen_launchd.py` existed. That file is
+gone. Edit the template and run the generator, never the plist.
+
+Before it was loaded it was run once as a dry run by hand. It reported the loop
+quiet with the market shut and stopped at question 2, which is the right answer
+outside trading hours.
+
+To take it off watch again:
+
+```
+launchctl bootout gui/$(id -u)/com.mtalib.agentic-trading.deadman
+```
+
+To keep it loaded but stop it trading, take `--really` out of the `[program]`
+block in the template above and run
+`python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install`
+again. It then still decides and still writes to the log, and it sends nothing
+and trades nothing.
 
 ## Turning it back on
 
@@ -544,13 +560,11 @@ none either. By the rule above that is `new_imd`. It is also not evidence: IBKR
 applies neither rulebook to simulated money, and the live account is U28440091.
 The setting stays at `unknown` until a live account has been read.
 
-## The six scheduled jobs
+## The nine scheduled jobs
 
-The five guards above are what watches the money. These are the six things
-launchd wakes up, which is a different list: two of the guards are on it, and so
-are three jobs that write rather than watch. The dead man's handle would be a
-seventh, and it is deliberately not generated with these six. Its own section
-above says why and how to load it by hand.
+The five guards above are what watches the money. These are the nine things
+launchd wakes up, which is a different list: three of the guards are on it, and
+so are the jobs that write rather than watch.
 
 | Job | When | What it does |
 |---|---|---|
@@ -558,11 +572,25 @@ above says why and how to load it by hand.
 | `watchdog` | every 5 min in market hours, hourly otherwise including weekends | the health check above |
 | `preflight` | 09:00 weekdays | the morning check above |
 | `recorder` | every 5 min 09:25 to 16:05 weekdays | records the day for the replay harness |
+| `deadman` | every 5 min 09:30 to 16:00 weekdays | the dead man's handle above, armed |
 | `learning` | 16:30 weekdays | writes the day's journal entry |
+| `sheet_sync` | 16:35 weekdays | rebuilds the Google Sheet ledger from the database |
 | `weekly` | 16:45 Friday | writes the week's review |
+| `backup_db` | 17:00 every day | copies `data/trading.sqlite` into `data/backups/`, 30 days kept |
 
-The last two run Claude Code with no terminal attached and are told what to do
-by a prompt file, not by the job. Change what they do by editing the prompt:
+Six were loaded on 2026-09-06 and the last three, `deadman`, `sheet_sync` and
+`backup_db`, on 2026-09-07. Those three had been held back because none of them
+had ever run: the dead man's handle is the only job here that can place an
+order, the sheet sync had never touched the real Google Sheet, and the backup
+had never run on a schedule. All three were run once by hand first.
+
+`deadman` is the one to think about, because it is the only job in this project
+that can place an order. Read its own section above before changing anything
+about it.
+
+`learning` and `weekly` run Claude Code with no terminal attached and are told
+what to do by a prompt file, not by the job. Change what they do by editing the
+prompt:
 
 ```
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/prompts/daily_learning_loop.md
@@ -620,14 +648,19 @@ proper MCP request.
 
 ## What is not switched on yet
 
-As of 2026-09-06:
+As of 2026-09-07:
 
-* No launchd job is loaded. There are six of them now and not one is running:
-  the tick, the watchdog, the pre-flight, the market recorder, the daily
-  learning loop and the weekly review. They are definitions sitting in the repo.
-  Loading them is in
-  `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md`,
-  and the watchdog is the one to load first.
+* All nine launchd jobs are loaded, the dead man's handle included. Six went on
+  on 2026-09-06 and the last three on 2026-09-07. `launchctl list | grep agentic`
+  shows them. Every book in `config/books.yaml` is still in dry run, so the tick
+  job works out what it would trade and sends nothing.
+* **This Mac is set to Pacific, not Eastern, and launchd fires on the Mac's own
+  clock.** Checked with `date +%Z` on 2026-09-07 and it answered `PDT`, where
+  `docs/LAUNCHD.md` had recorded `EDT` on 2026-09-02. Nothing in a plist can pin
+  a time zone, so every one of the nine jobs currently wakes three hours late:
+  the 09:30 tick fires at 12:30 New York. Setting the Mac back to Eastern in
+  System Settings fixes all nine at once and needs no regeneration. Until that
+  is done the schedules are wrong, whatever the plists say.
 * iMessage alerts are off until `IMESSAGE_TO` exists in
   `.secrets/alerts.env`. Slack and the screen banner work now.
 * Real time quotes are not arriving. The paper Gateway answered IBKR code

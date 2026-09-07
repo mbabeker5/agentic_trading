@@ -1,7 +1,8 @@
 # The five minute wake up, and how to switch it on
 
-Status: written 2026-09-02. The job described here is **not loaded**. It is a
-definition sitting in the repo waiting for you to decide.
+Status: written 2026-09-02, updated 2026-09-07. The job described here **is
+loaded**, along with all eight others. What was loaded and when is at the bottom
+of this file.
 
 ## What this is
 
@@ -37,13 +38,11 @@ The templates are here, one per job:
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/
 ```
 
-Two file endings are read, `<job>.template` and `<job>.plist.tmpl`, and a new
-job may use either. The generator globbed the first ending alone until
-2026-09-06, which is how three jobs came to have no plist at all: they are named
-`*.plist.tmpl`, so it never looked at them. Both are accepted now rather than
-the three files being renamed, because their names are written down in the
-journal and inside the files themselves, and a rename would break anybody's
-notes that point at them.
+Every one of the nine is named `<job>.template` today. A second ending,
+`<job>.plist.tmpl`, is still read, because three jobs used it until 2026-09-07
+and a note or a checkout from before then should still work. The generator
+globbed the first ending alone until 2026-09-06, which is how those three came
+to have no plist at all: it never looked at them.
 
 The generator is here:
 
@@ -92,9 +91,10 @@ fails the suite.
 `NO PLIST` is the one that matters, because a check that walked the plists
 instead of the templates could not see it, and that is exactly how three jobs
 stayed missing. `ORPHAN` has to be a manual deletion on purpose: a loaded job's
-file is not something this script should remove behind your back. The three
-held-back files below count as templates for the orphan check, so a plist you
-rendered from one of them by hand is not condemned.
+file is not something this script should remove behind your back. A hand written
+plist sitting in the templates folder counts as a template for the orphan check,
+so a plist you rendered from one of them by hand is not condemned. There are
+none of those left since 2026-09-07.
 
 `--install` copies the plists to `~/Library/LaunchAgents` and asks launchd to
 load them. **That starts the jobs running.** It is the only thing in the file
@@ -144,14 +144,19 @@ All of that lives in `config/launchd/templates/tick.template`, in English, and
 the generator does the counting.
 
 launchd works in whatever time zone the Mac is set to, and there is no way to
-pin a time zone inside the file. This Mac is in Eastern. That was checked with
-`date +%Z` on 2026-09-02 and it answered `EDT`, so the times in the file are
-already New York times and need no adjusting.
+pin a time zone inside the file.
 
-If the Mac ever moves to another time zone, every time in that file becomes
-wrong and has to be regenerated, because the market keeps New York hours no
-matter what the Mac thinks. Worth checking with `date +%Z` before you trust a
-tick log after any travel.
+**This Mac is in Pacific, and that is a live problem.** `date +%Z` answered
+`EDT` on 2026-09-02 and `PDT` on 2026-09-07, so the Mac moved in between.
+Nothing in a plist can pin a time zone, so every one of the nine jobs currently
+fires three hours late against New York: the 09:30 wake up lands at 12:30
+Eastern, after the open and after the pick.
+
+The fix is one setting and no regeneration: put the Mac back on Eastern in
+System Settings, General, Date and Time. Changing the times in the templates
+instead would be the wrong fix, because it hides the problem in nine files and
+breaks again the moment the Mac is corrected. Check with `date +%Z` before you
+trust a tick log after any travel.
 
 If the Mac is asleep at one of those times, launchd runs the job once when it
 wakes up, and no setting turns that off. That does no harm, because the loop
@@ -301,15 +306,12 @@ after the close.
 
 ---
 
-# The nine job definitions, and the six that generate
+# The nine job definitions, and all nine generate
 
-`config/launchd/templates/` holds nine job definitions. Six of them are turned
-into plists by the generator and three are not, and the difference is the format
-each file is written in rather than anything about the job. **None of the nine is
-loaded.** They sit there waiting for you to decide, and
-`scripts/gen_launchd.py --install` is the one command that starts the six.
-
-## The six that generate
+`config/launchd/templates/` holds nine job definitions, and since 2026-09-07
+every one of them is a template the generator can render. **All nine are
+loaded.** `scripts/gen_launchd.py --install` is the one command that starts
+them.
 
 | Job | When | What runs | Wake ups a week |
 |---|---|---|---|
@@ -317,71 +319,58 @@ loaded.** They sit there waiting for you to decide, and
 | `watchdog` | every 5 min in market hours, hourly the rest of the time including weekends | `agent/watchdog.py --once` | 533 |
 | `preflight` | 09:00 weekdays | `agent/preflight.py` | 5 |
 | `recorder` | every 5 min 09:25 to 16:05 weekdays | `agent/replay/record_day.py --once` | 405 |
+| `deadman` | every 5 min 09:30 to 16:00 weekdays | `agent/deadman.py --really` | 395 |
 | `learning` | 16:30 weekdays | headless `claude -p` on the daily prompt | 5 |
+| `sheet_sync` | 16:35 weekdays | `ledger/sync_sheet.py --write` | 5 |
 | `weekly` | 16:45 Friday | headless `claude -p` on the weekly prompt | 1 |
+| `backup_db` | 17:00 every day | `scripts/backup_db.sh` | 7 |
 
 Their full labels are `com.mtalib.agentic-trading.` plus the name in the first
 column, which is what every `launchctl` command below wants.
 
-Only the tick job can trade, and only once a book in `config/books.yaml` is
-taken out of dry run by hand. The other five read, write files and send
-messages.
+Two jobs can send an order. The tick job can, and only once a book in
+`config/books.yaml` is taken out of dry run by hand, which none is. The dead
+man's handle can, and it is armed: the only orders it can cause are closing
+orders from `agent/kill_switch.py`, and only on an account whose id starts with
+`DU`. The other seven read, write files and send messages.
 
-## The three that do not generate, and what they are for
+## What the last three do
 
-| Job | When it would run | What it does, in one line |
-|---|---|---|
-| `sheet_sync` | 16:35 weekdays | rewrites the Google Sheet ledger from the database half an hour after the close, so the sheet is a picture of the database rather than a second record of its own |
-| `backup_db` | 17:00 every day | copies `data/trading.sqlite` to `data/backups/trading_YYYY-MM-DD.sqlite` with SQLite's own online backup, and deletes copies over thirty days old |
-| `deadman` | every 5 min 09:30 to 16:00 weekdays | the dead man's handle: if the loop has gone quiet for more than fifteen minutes while the market is open and a book still holds a position or has an order working, it messages you and pulls the kill switch |
+| Job | What it does, in one line |
+|---|---|
+| `deadman` | the dead man's handle: if the loop has gone quiet for more than fifteen minutes while the market is open and a book still holds a position or has an order working, it messages you and pulls the kill switch |
+| `sheet_sync` | rewrites the Google Sheet ledger from the database half an hour after the close, so the sheet is a picture of the database rather than a second record of its own |
+| `backup_db` | copies `data/trading.sqlite` to `data/backups/trading_YYYY-MM-DD.sqlite` with SQLite's own online backup, and deletes copies over thirty days old |
 
-Their files are:
+These three were held back until 2026-09-07 and are worth knowing the history
+of, because it is the sort of gap that hides for a week. They were not templates
+at all: each was a whole finished plist with `{ROOT}` written through it, made by
+hand before the generator existed, with its schedule spelled out entry by entry
+and no line of English to expand. `deadman.plist.tmpl` was 2,079 lines and
+carried its 395 wake ups one at a time. Handing one to the generator produced
+`line 1: text before the first section`, off the XML declaration at the top. And
+before 2026-09-06 the generator did not even look at files with that ending, so
+nothing said anything at all.
 
-```
-/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/sheet_sync.plist.tmpl
-/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/backup_db.plist.tmpl
-/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/templates/deadman.plist.tmpl
-```
-
-**Why they still do not generate.** The generator finds all three now, and names
-all three on every run, but it cannot render any of them. They are not templates
-in its format at all: each one is a whole finished plist with `{ROOT}` written
-through it, made by hand before the generator existed, with its schedule already
-spelled out entry by entry and no line of English for the generator to expand.
-`deadman.plist.tmpl` is 2,079 lines and carries its 395 wake ups one at a time.
-Handing one to the generator produces `line 1: text before the first section`,
-off the XML declaration at the top.
-
-Each of the three also says, inside itself, that it is held back on purpose,
-because none of the three has ever run on a schedule and putting an unwatched
-job in the same list as the ready ones was thought worse than leaving it out.
-
-**What converting one takes.** Each file carries its own three steps at the top,
-and they are the same three every time. Write
-`config/launchd/templates/<job>.template` in the generator's format, taking the
-program, the environment and the comment straight from the existing file and
-writing the schedule as the one English line the file names:
-
-| Job | The schedule line to write | Wake ups to expect |
-|---|---|---|
-| `sheet_sync` | `at 16:35 on weekdays` | 5 |
-| `backup_db` | `at 17:00 on everyday` | 7 |
-| `deadman` | `every 5 minutes from 09:30 to 16:00 on weekdays` | 395 |
-
-Then add that count to `EXPECTED_WAKE_UPS` in
+Each of them also said inside itself that it was held back on purpose, because
+none had ever run and putting an unwatched job in the same list as the ready
+ones was thought worse than leaving it out. Mo approved the kill switch and
+unattended operation on 2026-09-06 and the hub ruled on 2026-09-07 that all
+three should be armed, so each was rewritten as
+`config/launchd/templates/<job>.template`, its wake up count added to
+`EXPECTED_WAKE_UPS` in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/tests/test_paths.py`,
-run the generator, and load it when you mean to.
+and the hand made file deleted.
 
-**`deadman` is the one to think hardest about, and the one that is missing most.**
-Every tick writes `output/heartbeat`, and the dead man's handle is the only thing
-that reads it on a schedule, so while this job does not exist that heartbeat has
-no reader and a loop that dies holding a position stays dead and holding it. It
-is also the only job in this project that can place an order: the orders it can
-cause are closing orders from `agent/kill_switch.py` and only on an account
-whose id starts with `DU`, but that is still the reason converting it is a
-decision rather than a rename. Take `--really` out of its `ProgramArguments` and
-it decides and logs and sends nothing, which is the way to watch it for a week
-first.
+**`deadman` is the one to think hardest about.** Every tick writes
+`output/heartbeat`, and the dead man's handle is the only thing that reads it on
+a schedule, so while this job did not exist that heartbeat had no reader and a
+loop that died holding a position stayed dead and holding it. It is also the
+only job in this project whose whole purpose is to place an order. Take
+`--really` out of the `[program]` block in
+`config/launchd/templates/deadman.template` and generate again, and it decides
+and logs and sends nothing, which is the way to watch it for a week if you ever
+want to.
 
 ## The recorder
 
@@ -461,7 +450,7 @@ A sign in that has expired shows up there.
 
 # The watchdog and the pre-flight
 
-Added 2026-09-06. Like every other job here, **neither of these is loaded.**
+Added 2026-09-06, and loaded the same day along with four others.
 
 ```
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/launchd/com.mtalib.agentic-trading.watchdog.plist
@@ -555,7 +544,7 @@ launchctl bootout gui/$(id -u)/com.mtalib.agentic-trading.preflight
 **Load the watchdog first, before the tick job.** It is the thing that tells you
 the loop has stopped, so it is not much use arriving second.
 
-To load all six at once instead, on a machine where you want the lot:
+To load all nine at once instead, on a machine where you want the lot:
 
 ```
 python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install
@@ -625,26 +614,79 @@ launchctl print gui/$(id -u)/com.mtalib.agentic-trading.tick
 
 `state = waiting` is what you want, plus `last exit code` once it has run.
 
-### The three jobs that were NOT loaded, and why
+### The three jobs that were NOT loaded on 2026-09-06, and why
 
-`backup_db`, `sheet_sync` and `deadman` are not loaded, because they are not
-generated. They are hand written plists from before this generator existed, each
-one carrying `{ROOT}` and a full schedule and each one saying inside itself that
-it is held back on purpose and listing the three steps that arm it.
-`gen_launchd.py --check` now names all three rather than passing over them in
-silence, which is how they went unnoticed until 2026-09-06.
+`backup_db`, `sheet_sync` and `deadman` stayed off that day because they were
+not generated. They were hand written plists from before this generator existed,
+each carrying `{ROOT}` and a full schedule and each saying inside itself that it
+was held back on purpose. `gen_launchd.py --check` had started naming all three
+rather than passing over them in silence, which is how they went unnoticed until
+2026-09-06.
 
-Arming them is a decision for Mo and not a rename, for one reason each:
+Arming them was a decision for Mo and not a rename, for one reason each:
 
-- `deadman` is the ONLY job in this project that can place an order. It runs
-  `agent/deadman.py --really`, which pulls the kill switch and flattens the
-  account when the loop dies holding a position. That is a protective action
+- `deadman` is the ONLY job in this project whose purpose is to place an order.
+  It runs `agent/deadman.py --really`, which pulls the kill switch and flattens
+  the account when the loop dies holding a position. That is a protective action
   and it is still an order.
-- `sheet_sync` has never run against the real Google Sheet, so its first
-  scheduled run would be its first run, against Mo's live sheet.
-- `backup_db` has never run on a schedule.
+- `sheet_sync` had never run against the real Google Sheet, so its first
+  scheduled run would have been its first run, against Mo's live sheet.
+- `backup_db` had never run on a schedule.
 
-**`deadman` is the one that matters for unattended operation.** The loop now
-writes `output/heartbeat` at the end of every tick that finished, and with
-`deadman` unloaded nothing reads it. So the dead man's handle exists, is tested,
-and is not on watch.
+## The last three loaded, 2026-09-07
+
+Mo approved the kill switch and unattended operation on 2026-09-06 and the hub
+ruled the next day that all three should go on. Each was first rewritten as a
+proper template and each was run once by hand before anything was loaded.
+
+The three by-hand runs, all from
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading`:
+
+```
+./venv312/bin/python ledger/sync_sheet.py --dry-run --limit 5
+./venv312/bin/python ledger/sync_sheet.py --write
+./scripts/backup_db.sh
+./venv312/bin/python agent/deadman.py
+```
+
+The sheet sync wrote 4,544 cells to the Rules Log tab and 5 to Config, and the
+sheet was read back afterwards through the Sheets REST API to check the headings
+and the formula columns had survived. The backup wrote
+`data/backups/trading_2026-09-07.sqlite` at 352K. The dead man's handle was run
+as a dry run, with no `--really`, and stopped at question 2 saying the market was
+shut, which is the right answer at that hour. **A dry run is the only way it
+should ever be run by hand.**
+
+Then the generator wrote all nine plists and loaded them:
+
+```
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --check
+python3 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/scripts/gen_launchd.py --install
+launchctl list | grep agentic
+```
+
+`--install` boots each job out before bootstrapping it, so running it with six
+already loaded reloads those six rather than complaining. The last command
+printed all nine:
+
+```
+-	0	com.mtalib.agentic-trading.backup_db
+-	0	com.mtalib.agentic-trading.deadman
+-	0	com.mtalib.agentic-trading.learning
+-	0	com.mtalib.agentic-trading.preflight
+-	0	com.mtalib.agentic-trading.recorder
+-	0	com.mtalib.agentic-trading.sheet_sync
+-	0	com.mtalib.agentic-trading.tick
+-	0	com.mtalib.agentic-trading.watchdog
+-	0	com.mtalib.agentic-trading.weekly
+```
+
+The `-` is the process id column and means the job is not running this second,
+which is right for a job waiting on its schedule. The `0` is the last exit
+status.
+
+**One thing is wrong and is not fixed by any of this.** The Mac is set to
+Pacific, so all nine fire three hours late against New York. See the time zone
+note further up. Fixing the Mac's time zone fixes all nine and needs no
+regeneration.
