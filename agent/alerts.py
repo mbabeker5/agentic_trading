@@ -69,6 +69,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -84,6 +85,16 @@ try:
     import db as _db                        # noqa: E402
 except Exception:                           # noqa: BLE001
     _db = None                              # type: ignore[assignment]
+
+#: Every timestamp in this project is New York, so every alert is stamped in
+#: New York too, whatever zone the Mac or the shell that sent it is set to.
+#:
+#: This Mac is set to Pacific. On 2026-09-07 an alert sent by hand from a
+#: Pacific shell landed in output/alerts.log stamped "07:00:31 PDT", sitting
+#: between lines the loop had stamped in EDT. Read the file in order, or sort it
+#: by time, and that alert is three hours out of place. The database has always
+#: stored New York (agent/db.py as_ts); this is the log catching up.
+NEW_YORK = ZoneInfo("America/New_York")
 
 #: The Slack account the alerts go to. Looked up by email, once, then cached.
 SLACK_EMAIL = "mo@thetaste.ai"
@@ -319,9 +330,20 @@ def alerts_log_path() -> Path:
     return output_dir() / "alerts.log"
 
 
+def log_stamp(when: datetime | None = None) -> str:
+    """The time an alert happened, in New York, however the machine is set.
+
+    Never the local clock. A line stamped in Pacific among lines stamped in
+    Eastern makes the file unreadable in order and unsortable by a script, and
+    that is exactly what happened on 2026-09-07.
+    """
+    moment = when.astimezone(NEW_YORK) if when is not None else datetime.now(NEW_YORK)
+    return moment.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def append_log(level: str, title: str, body: str, delivered: list[str]) -> bool:
     """Write the alert down. This is the channel that must never fail quietly."""
-    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    stamp = log_stamp()
     one_line = " / ".join(part.strip() for part in body.splitlines() if part.strip())
     line = (f"{stamp} | {level} | {title} | {one_line} | "
             f"delivered={','.join(delivered) if delivered else 'none'}\n")

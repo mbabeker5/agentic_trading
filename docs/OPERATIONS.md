@@ -361,6 +361,19 @@ The matching line in `output/alerts.log` looks like this:
 The `delivered=` part says which channels actually got it, which is how you tell
 a quiet phone from a broken alerter.
 
+Every line is stamped in New York, whatever zone the Mac or the shell that sent
+the alert is set to, so the file reads in order and sorts by time. This Mac runs
+on Pacific, and on 2026-09-07 an alert sent by hand landed as `07:00:31 PDT`
+between lines the loop had stamped in `EDT`, three hours out of place. Send an
+alert by hand through `agent/alerts.py` rather than by appending to the file,
+and the stamp takes care of itself:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/alerts.py \
+  --level warn --title "one short line" --body "the detail"
+```
+
 ## What to do when you get one
 
 | Alert says | What is wrong | What to do |

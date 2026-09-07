@@ -11,7 +11,10 @@ whatever else happens.
 from __future__ import annotations
 
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
 if str(AGENT_DIR) not in sys.path:
@@ -154,3 +157,37 @@ def test_a_cached_slack_user_id_is_used_without_asking_slack(monkeypatch, tmp_pa
     monkeypatch.setattr(alerts, "_slack_call", should_not_be_called)
 
     assert alerts.slack_user_id("xoxb-not-a-real-token") == "U0CACHED"
+
+
+# ------------------------------------------------------- the stamp on each line
+
+def test_the_log_line_is_stamped_in_new_york_whatever_the_mac_is_set_to(
+        monkeypatch, tmp_path):
+    """Item 20. This Mac runs on Pacific and the log has to read as New York.
+
+    On 2026-09-07 an alert sent by hand from a Pacific shell landed as
+    "07:00:31 PDT" between lines the loop had stamped in EDT, three hours out of
+    place for anyone reading the file in order or sorting it by time.
+    """
+    folder = isolate(monkeypatch, tmp_path)
+    silence_all(monkeypatch)
+
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        expected = datetime.now(ZoneInfo("America/New_York"))
+        alerts.alert("info", "sent from a Pacific shell", "body")
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()
+
+    stamp = (folder / "alerts.log").read_text(encoding="utf-8").split(" | ")[0]
+    assert stamp.endswith(("EDT", "EST")), f"stamped in the wrong zone: {stamp!r}"
+    assert stamp.startswith(f"{expected:%Y-%m-%d %H:%M}"), (
+        f"{stamp!r} is not the New York clock, which said {expected:%Y-%m-%d %H:%M}")
+
+
+def test_a_moment_from_another_zone_is_converted_rather_than_relabelled():
+    """A datetime handed in keeps its instant and gains the New York clock."""
+    pacific = datetime(2026, 9, 7, 7, 0, 31, tzinfo=ZoneInfo("America/Los_Angeles"))
+    assert alerts.log_stamp(pacific) == "2026-09-07 10:00:31 EDT"
