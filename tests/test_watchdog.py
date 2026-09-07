@@ -1087,7 +1087,15 @@ def test_only_the_not_answering_path_stops_the_old_gateway_first(monkeypatch):
 # would have been the second wrong alert of the morning.
 
 class FakeConnector:
-    """An IB Gateway that refuses the ids in taken and accepts anything else."""
+    """An IB Gateway that refuses the ids in taken and accepts anything else.
+
+    The "code" shape is what really happens, checked live against the paper
+    Gateway on 2026-09-07 by holding client id 250 from another process. IBKR
+    emits error 326 on the error event, and the exception that reaches the
+    caller is a bare TimeoutError carrying no mention of the client id at all.
+    So the error code is the only reliable half of the detection and the
+    message is the fallback, not the other way round.
+    """
 
     def __init__(self, taken=(), how="code"):
         self.taken = set(taken)
@@ -1101,7 +1109,7 @@ class FakeConnector:
             return
         if self.how == "code":
             self.codes.append(wd.CODE_CLIENT_ID_IN_USE)
-            raise ConnectionError("Peer closed connection.")
+            raise TimeoutError()
         raise ConnectionError(f"Peer closed connection. clientId {clientId} "
                               "already in use?")
 
