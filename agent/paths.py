@@ -38,6 +38,22 @@ from pathlib import Path
 #: The environment variable that overrides where the project lives.
 ROOT_ENV_VAR = "AGENTIC_TRADING_ROOT"
 
+#: The environment variable that moves output/ somewhere else, and ONLY output/.
+#:
+#: There is one caller: agent/loop.py, when it is run with --now set to a day
+#: that is not today. Such a run is a rehearsal, and a rehearsal that writes a
+#: state file, a packet or a heartbeat into the real output folder poisons the
+#: real day it is pretending to be. On 2026-09-06 at 13:22 a run with
+#: --now "2026-09-08 09:36" wrote state_BOOK_A_2026-09-08.json through E, each
+#: saying the pick was already made, and on Tuesday morning every book would
+#: have skipped the first real pick of the experiment. See docs/BACKLOG.md item
+#: 18 and journal/2026-09-07.md.
+#:
+#: It moves output/ alone and not the project root, because a rehearsal still
+#: reads the real config/, the real strategies/ and the real git hash. Those are
+#: what is being rehearsed.
+OUTPUT_DIR_ENV_VAR = "AGENTIC_TRADING_OUTPUT_DIR"
+
 #: The environment variable that overrides where IB Gateway is installed.
 GATEWAY_DIR_ENV_VAR = "IB_GATEWAY_DIR"
 
@@ -54,8 +70,15 @@ DEFAULT_GATEWAY_VERSION = "10.45"
 VENV_NAME = "venv312"
 
 
-def _clone_root() -> Path:
-    """The folder two levels above this file, which is the checkout root."""
+def clone_root() -> Path:
+    """The folder two levels above this file, which is the checkout root.
+
+    This is the REAL project on this disk, whatever any environment variable
+    says. Compare project_root() against it to find out whether this process is
+    working in the checkout itself or in a copy somebody made for a test or a
+    replay, which is how agent/loop.py decides whether it has a real output
+    folder to protect.
+    """
     return Path(__file__).resolve().parent.parent
 
 
@@ -71,8 +94,21 @@ def project_root() -> Path:
     """
     raw = (os.environ.get(ROOT_ENV_VAR) or "").strip()
     if not raw:
-        return _clone_root()
+        return clone_root()
     return Path(raw).expanduser()
+
+
+def real_output_dir(create: bool = True) -> Path:
+    """The project's own output/, ignoring any rehearsal redirect.
+
+    The kill switch files live here and nowhere else. A rehearsal must still be
+    stopped by the real output/STOP, and a rehearsal must never be able to write
+    a STOP that the real loop would then obey.
+    """
+    path = project_root() / "output"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def output_dir(create: bool = True) -> Path:
@@ -80,8 +116,14 @@ def output_dir(create: bool = True) -> Path:
 
     Created if it is missing, because every caller writes into it. Pass
     create=False when you only want to look.
+
+    AGENTIC_TRADING_OUTPUT_DIR moves it, and agent/loop.py is the only thing
+    that sets it: a tick pretending to be another day writes to
+    output/rehearsal/<today's real date>/ so it cannot leave a state file behind
+    that a real day would load. See OUTPUT_DIR_ENV_VAR above.
     """
-    path = project_root() / "output"
+    raw = (os.environ.get(OUTPUT_DIR_ENV_VAR) or "").strip()
+    path = Path(raw).expanduser() if raw else project_root() / "output"
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path
@@ -193,18 +235,21 @@ def ibc_dir() -> Path:
 
 
 def stop_file() -> Path:
-    """output/STOP. While it exists the loop closes positions but opens none."""
-    return output_dir() / "STOP"
+    """output/STOP. While it exists the loop closes positions but opens none.
+
+    The real one, never a rehearsal's copy. See real_output_dir().
+    """
+    return real_output_dir() / "STOP"
 
 
 def loop_disabled_file() -> Path:
     """output/LOOP_DISABLED. While it exists run_tick.sh refuses to run at all."""
-    return output_dir() / "LOOP_DISABLED"
+    return real_output_dir() / "LOOP_DISABLED"
 
 
 def no_trade_today_file() -> Path:
     """output/NO_TRADE_TODAY. Written by the pre-flight when a check fails."""
-    return output_dir() / "NO_TRADE_TODAY"
+    return real_output_dir() / "NO_TRADE_TODAY"
 
 
 if __name__ == "__main__":  # pragma: no cover - a hand check, not a code path

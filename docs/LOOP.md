@@ -118,6 +118,33 @@ Everything a book decides is written twice: into its own state file, and to the 
 
 ---
 
+## Pretending it is another day, without poisoning that day
+
+`--now` lets you see a phase after hours:
+
+```
+/Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
+  /Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py --now "2026-09-08 09:36"
+```
+
+A run like that is a rehearsal, and until 2026-09-07 a rehearsal wrote its state files, its decision packets, its heartbeat and its cadence file straight into the real `output/` folder, named after the day it was pretending to be.
+
+That is not a theoretical problem. On Saturday 2026-09-06 at 13:22 somebody ran exactly the command above. It left `state_BOOK_A_2026-09-08.json` through `state_BOOK_E_2026-09-08.json` behind, each one saying the pick had already been made. The loop loads a state file by the date in its name and treats a set `picked_at` as the pick already made, so on Tuesday 2026-09-08, the first trading day of the experiment, all five books would have skipped their first real pick and nothing in any log would have looked wrong.
+
+Two things stop it now, and either one would have been enough.
+
+**A pretend DAY writes somewhere else.** When the date given to `--now` is not today's real date, everything the tick writes goes to `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/rehearsal/<today's real date>/` instead: state files, packets, the heartbeat, `next_tick_seconds`, the tick log, all of it. A real day only ever looks in `output/`, so there is nothing there for it to find. The tick says so in its first three lines, naming the folder. A pretend TIME on today's date is not a rehearsal and is left alone, because today's files really are today's.
+
+Two things deliberately do not move. The three kill switch files are always read from the real `output/`, so a rehearsal is still stopped by a real `STOP` and can never write one that a real tick would obey. And a root that is already a copy, which is what every test and the replay harness use, is left exactly where it is: there is no real output folder to protect, and moving it would only hide where the test wrote.
+
+**A state file written before the day it claims is moved aside.** Every state file now carries `created_at`, stamped from the REAL clock, never from the tick's pretend one. When `load_state` opens a file for a day that has already begun and finds it was written before that day began, it moves it to `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/stale/`, says so on stderr and in an alert, and starts the day fresh, carrying forward whatever the previous day ended holding. Files written before this change have no `created_at`, so the file's own modification time is used instead, which is a real clock too.
+
+Moved, not deleted. A file nobody can explain is evidence.
+
+The two conditions matter. A file written today for tomorrow is early, not wrong, and a replay of a day gone by is not wrong at all. Only when the day a file claims has really arrived does having been written before that day make it impossible.
+
+---
+
 ## Reconciliation, and why a mismatch halts a book
 
 Five books share one account. IBKR reports the account netted together, so it can tell you the account holds 400 shares of AAPL and it cannot tell you which book owns which hundred. Only the book files can, and only because the order that opened each position carried a tag.

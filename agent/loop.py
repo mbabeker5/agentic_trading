@@ -81,7 +81,9 @@ from zoneinfo import ZoneInfo
 # asks. paths.py works it out from where it sits on disk, so a plain git clone
 # anywhere finds itself with nothing configured.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from paths import ROOT_ENV_VAR, project_root  # noqa: E402,F401
+from paths import (OUTPUT_DIR_ENV_VAR, ROOT_ENV_VAR,  # noqa: E402,F401
+                   clone_root, project_root)
+from paths import output_dir as _project_output_dir  # noqa: E402
 
 PROJECT = project_root()
 for _extra in (PROJECT, PROJECT / "agent", PROJECT / "ledger"):
@@ -174,9 +176,15 @@ DAY_TRADE_HARD_LIMIT_BOOKS = ("C", "D")
 # --------------------------------------------------------------- small things
 
 def output_dir() -> Path:
-    path = project_root() / "output"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """Where this tick writes: output/, or a rehearsal folder standing in for it.
+
+    One line of delegation rather than a second copy of the answer. agent/paths.py
+    is the only thing that knows where output/ is, and it is the only thing that
+    knows about the rehearsal redirect below, so a tick pretending to be another
+    day cannot write a state file, a packet, a heartbeat or a cadence file into
+    the real folder. See rehearsal_output_dir().
+    """
+    return _project_output_dir()
 
 
 # ------------------------------------------------------------ the written record
@@ -401,6 +409,55 @@ def parse_now(text: str | None, zone: ZoneInfo) -> datetime:
         except ValueError:
             continue
     raise SystemExit(f'loop: cannot read --now {text!r}. Try --now "2026-09-08 09:36"')
+
+
+# --------------------------------------------------------- pretending it is another day
+
+#: Where a run that is pretending to be another day writes instead of output/.
+REHEARSAL_FOLDER = "rehearsal"
+
+
+def rehearsal_output_dir(now: datetime, real_now: datetime) -> Path | None:
+    """Where this tick must write when it is pretending to be another day.
+
+    None means write to output/ as usual, and that is the answer for every
+    ordinary tick.
+
+    THE BUG THIS CLOSES. On Saturday 2026-09-06 at 13:22 somebody ran this loop
+    with --now "2026-09-08 09:36" against the real output folder. It wrote
+    state_BOOK_A_2026-09-08.json through E, plus five matching packet files,
+    each one saying the pick had already been made. bs.load_state() loads a
+    state file by the date in its name, and phase_for() reads a set picked_at as
+    the pick already made, so on Tuesday morning, the first trading day of the
+    experiment, every book would have loaded Saturday's rehearsal and skipped
+    its first real pick. Nothing would have looked wrong in any log.
+
+    So a run whose pretend DATE is not today's real date writes everything into
+    output/rehearsal/<today's real date>/ instead: state files, packets, the
+    heartbeat, next_tick_seconds, the tick log, all of it. Nothing it writes can
+    be picked up by a real day, because a real day only ever looks in output/.
+
+    Redirecting rather than refusing, because a rehearsal is a useful thing and
+    the docstring at the top of this file recommends one. A flag to allow it
+    would be one more thing to remember at 13:22 on a Saturday, and the whole
+    problem is that nobody remembered.
+
+    Two things deliberately do NOT move. The three kill switch files are read
+    from the real output folder, so a rehearsal is still stopped by a real STOP
+    and can never write one a real tick would obey. And a root that is already
+    somewhere else, which is what every test and the replay harness use, is left
+    alone: there is no real output folder to protect, and moving it under those
+    would only hide where the test wrote.
+    """
+    if now.date() == real_now.date():
+        return None
+    try:
+        if project_root().resolve() != clone_root().resolve():
+            return None
+    except OSError:                          # a root that is not on this disk
+        return None
+    return (project_root() / "output" / REHEARSAL_FOLDER
+            / f"{real_now.date():%Y-%m-%d}")
 
 
 # ------------------------------------------------------------- the guard files
@@ -5060,6 +5117,55 @@ def alert_on_reconciliation(outcome: ReconcileOutcome, now: datetime,
         now=now)
 
 
+def report_stale_state(now: datetime, rules: str, write_ledger: bool) -> int:
+    """Say which book files were moved aside for describing a day they cannot.
+
+    Returns how many. Zero on every ordinary morning, and that is the point:
+    this is the alarm for the failure that produced no alarm at all. On Saturday
+    2026-09-06 a rehearsal wrote five state files for Tuesday into the real
+    output folder, each saying the pick was already made, and the only reason it
+    was ever noticed was a person reading the folder by hand two days later.
+
+    agent/book_state.py does the moving, because it is the only thing that opens
+    these files and a check that can be bypassed is not a check. This function
+    only tells Mo about it, which is knowledge book_state has no business
+    having.
+    """
+    moved = list(bs.STALE_ARCHIVED)
+    if not moved:
+        return 0
+    for row in moved:
+        line = (f"{row['order_ref']}: the state file for {row['date']} was written "
+                f"on {row['written_at']}, before that day began, so it cannot be "
+                f"describing it. Moved to {row['moved_to']}")
+        print(f"  STALE STATE {line}")
+        ledger_writer.log_rule(
+            now, "stale_state_file", f"{line} [rules {rules}]",
+            "this book started the day fresh, from what the day before it ended with",
+            book_id=None, dry_run=not write_ledger)
+        db_call("record_decision", ts=now, shape="reconcile", rules_commit=rules,
+                action="stale state file moved aside", rationale=line,
+                rejected=True, reject_reason="stale_state_file")
+    names = ", ".join(row["order_ref"] for row in moved)
+    raise_alert(
+        "error", f"A state file from before today was found and moved: {names}",
+        f"{len(moved)} book state file(s) said they described "
+        f"{moved[0]['date']} but were written before that day began. A file like "
+        "that is a rehearsal that leaked into the real output folder, and the "
+        "loop reads a pick recorded in one as a pick already made, so following "
+        "it would mean skipping the day's first real pick.\n\n"
+        + "\n".join(f"- {row['order_ref']}: written {row['written_at']}, moved to "
+                    f"{row['moved_to']}" for row in moved)
+        + "\n\nEach of those books has started the day fresh, carrying forward "
+        "what the previous day ended holding. Nothing has been lost and nothing "
+        "was deleted. This happened for real on 2026-09-06: see "
+        "docs/BACKLOG.md item 18.\n"
+        f"Rules {rules}, {now:%Y-%m-%d %H:%M} New York.",
+        key="stale_state:" + names, now=now,
+        quiet_minutes=ALERT_ONCE_A_DAY_MINUTES)
+    return len(moved)
+
+
 def report_orphans(outcome: ReconcileOutcome, now: datetime, rules: str,
                    write_ledger: bool) -> int:
     """Say who is holding what nobody claims. Returns how many were said.
@@ -5325,6 +5431,27 @@ def broker_unavailable_tick(facts: BrokerFacts, books, now: datetime, rules: str
 
 
 def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None) -> int:
+    """One tick, and the rehearsal redirect put back exactly as it was found.
+
+    run_one_tick() below may point output/ somewhere else for the length of a
+    tick that is pretending to be another day, and it does it through the
+    environment so that the scanner and the sweeps, which run as their own
+    processes, are moved with it. An environment variable left set outlives the
+    thing that set it, so it is restored here rather than there: one tick's
+    rehearsal must not follow the next tick around.
+    """
+    saved = os.environ.get(OUTPUT_DIR_ENV_VAR)
+    try:
+        return run_one_tick(argv, broker)
+    finally:
+        if saved is None:
+            os.environ.pop(OUTPUT_DIR_ENV_VAR, None)
+        else:
+            os.environ[OUTPUT_DIR_ENV_VAR] = saved
+
+
+def run_one_tick(argv: list[str] | None = None,
+                 broker: broker_mod.Broker | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="One tick of the trading loop, across all five books. Dry run "
                     "only today: the mode comes from config/books.yaml and every "
@@ -5343,6 +5470,7 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
                         help="accepted and ignored. Every book is already dry_run, "
                              "because that is what its mode in books.yaml says.")
     args = parser.parse_args(argv)
+    bs.STALE_ARCHIVED.clear()
 
     guards = read_guards()
     if guards.loop_disabled_present:
@@ -5358,6 +5486,12 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
 
     zone = ZoneInfo(registry.shared.timezone)
     now = parse_now(args.now, zone)
+    real_now = datetime.now(zone)
+    rehearsal = rehearsal_output_dir(now, real_now)
+    if rehearsal is not None:
+        # Before the first thing is written, and before any book file is read.
+        os.environ[OUTPUT_DIR_ENV_VAR] = str(rehearsal)
+        rehearsal.mkdir(parents=True, exist_ok=True)
     rules = rules_commit()
     account_wanted = registry.shared.account_id
 
@@ -5375,6 +5509,12 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
     print("=" * 78)
     print(f"Tick at {now:%Y-%m-%d %H:%M:%S} {now.tzname()}"
           + ("  (pretend time from --now)" if args.now else ""))
+    if rehearsal is not None:
+        print(f"REHEARSAL: it is really {real_now:%Y-%m-%d %H:%M} {real_now.tzname()}, "
+              f"so this is a rehearsal of another day.")
+        print(f"  Everything is written to {rehearsal}, not to the real output "
+              "folder, so it cannot be loaded as real on the day it pretends to be.")
+        print("  The kill switch files are still read from the real output folder.")
     print(f"Rules {rules} | register {args.books_file} | "
           f"{len(books)} enabled book(s): {', '.join(b.book_id for b in books)}")
     print("=" * 78)
@@ -5451,6 +5591,8 @@ def main(argv: list[str] | None = None, broker: broker_mod.Broker | None = None)
             "positions": {symbol: int(round(p.qty))
                           for symbol, p in state.all_positions().items()},
             "working_orders": dict(state.working_orders)}
+
+    report_stale_state(now, rules, args.write_ledger)
 
     # Read once for the whole tick, because it opens all five book files and
     # five books each opening all five would be twenty five reads a tick.

@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date as date_type, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -58,6 +59,24 @@ if str(_HERE) not in sys.path:
 # names are re-exported here because callers of this module have always asked it
 # where the state files go.
 from paths import ROOT_ENV_VAR, output_dir, project_root  # noqa: E402,F401
+
+#: Every clock in this project is New York, and created_at below is the one
+#: field that must be the REAL clock rather than the tick's, so it gets its own
+#: timezone here rather than borrowing the caller's.
+NEW_YORK = ZoneInfo("America/New_York")
+
+#: Where a state file that cannot be describing the day it claims is put.
+STALE_FOLDER = "stale"
+
+#: Every file moved there by this process, newest last. The loop reads it after
+#: it has loaded its books and sends one alert naming all of them.
+#:
+#: A list here rather than a callback passed in, because load_state is called
+#: from a dozen places across the loop, the dead man's handle and the tests, and
+#: none of them should have to remember to pass an alerter for a thing that
+#: happens once a year. There is no long running process in this project, so it
+#: lives exactly as long as one tick.
+STALE_ARCHIVED: list[dict] = []
 
 
 # ---------------------------------------------------------------- the shapes
@@ -136,6 +155,15 @@ class BookState:
     book_id: str
     order_ref: str
     date: str
+    #: When this file was first written, on the REAL clock, in New York.
+    #:
+    #: Never the tick's own time. A tick can be told to pretend it is another
+    #: day with --now, and its pretend time goes into last_tick and into every
+    #: decision, which is right: those describe the day being rehearsed. This
+    #: one field describes the FILE, and it is what tells a file written on
+    #: Saturday for Tuesday apart from one written on Tuesday for Tuesday. See
+    #: is_stale() below and docs/BACKLOG.md item 18.
+    created_at: str = ""
     capital: float = 0.0
     cash: float = 0.0
     day_start_equity: float = 0.0
@@ -277,6 +305,98 @@ def _known(cls, stored: dict) -> dict:
     return {k: v for k, v in stored.items() if k in fields}
 
 
+def written_at(path: Path, stored: dict) -> datetime | None:
+    """When this state file was really written, or None when nobody can tell.
+
+    created_at is the answer when the file has one. When it does not, which is
+    every file written before 2026-09-07, the file's own modification time is
+    the next best thing and it is a real clock too: a rehearsal on Saturday
+    leaves a Saturday mtime whatever date it wrote into the name.
+    """
+    raw = str(stored.get("created_at") or "").strip()
+    if raw:
+        try:
+            moment = datetime.fromisoformat(raw)
+        except ValueError:
+            moment = None
+        if moment is not None:
+            return moment if moment.tzinfo else moment.replace(tzinfo=NEW_YORK)
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=NEW_YORK)
+    except OSError:
+        return None
+
+
+def is_stale(path: Path, day: date_type, stored: dict,
+             real_today: date_type | None = None) -> bool:
+    """Was this file written before the day it claims to describe had begun?
+
+    THE BUG THIS CLOSES. On Saturday 2026-09-06 at 13:22 a rehearsal wrote
+    state_BOOK_A_2026-09-08.json through E into the real output folder, each one
+    saying the pick had already been made. load_state loads a file by the date
+    in its name, and the loop reads a set picked_at as the pick already made, so
+    on Tuesday 2026-09-08, the first trading day of the experiment, all five
+    books would have loaded Saturday's rehearsal and skipped their first real
+    pick. Nothing in any log would have looked wrong.
+
+    Two conditions, and both are needed:
+
+        the file was written before the day it names, AND
+        that day has actually arrived
+
+    The second is what keeps a rehearsal honest while it is still a rehearsal. A
+    file written today for tomorrow is not wrong yet, it is just early, and a
+    replay of a day in the past is not wrong at all. Only when the day it claims
+    has really started does a file written before that day become a file that
+    cannot possibly be describing it.
+    """
+    today = real_today or datetime.now(NEW_YORK).date()
+    if day > today:
+        return False                         # the day it names has not arrived
+    moment = written_at(path, stored)
+    return moment is not None and moment.date() < day
+
+
+def archive_stale_state(path: Path, day: date_type, stored: dict,
+                        real_today: date_type | None = None) -> Path | None:
+    """Move a file that cannot be describing today into output/stale/. Where it went.
+
+    None when the file is fine, which is every ordinary morning.
+
+    Moved rather than deleted, because the thing to do with a file nobody can
+    explain is keep it and look at it. The day starts fresh from what came
+    before, exactly as it would have if the file had never been there. What was
+    moved is written into STALE_ARCHIVED so the loop can tell Mo.
+    """
+    if not is_stale(path, day, stored, real_today):
+        return None
+    folder = path.parent / STALE_FOLDER
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(NEW_YORK).strftime("%Y%m%dT%H%M%S")
+    target = folder / f"{path.stem}.moved-{stamp}{path.suffix}"
+    moment = written_at(path, stored)
+    try:
+        path.replace(target)
+    except OSError as exc:
+        print(f"book_state: {path} was written on "
+              f"{moment:%Y-%m-%d} for {day:%Y-%m-%d} and cannot be right, but it "
+              f"could not be moved out of the way ({exc}). This book is NOT "
+              "starting the day fresh.", file=sys.stderr)
+        return None
+    print(f"book_state: {path.name} says it is {day:%Y-%m-%d} but it was written on "
+          f"{moment:%Y-%m-%d}, before that day began, so it cannot be describing "
+          f"it. Moved to {target} and this book starts the day fresh.",
+          file=sys.stderr)
+    STALE_ARCHIVED.append({
+        "order_ref": path.stem.replace("state_", "").rsplit("_", 1)[0],
+        "date": f"{day:%Y-%m-%d}",
+        "written_at": (f"{moment:%Y-%m-%d %H:%M}" if moment else "unknown"),
+        "was": str(path),
+        "moved_to": str(target),
+    })
+    return target
+
+
 def load_state(book_id: str, order_ref: str, day: date_type, capital: float = 0.0,
                root: Path | None = None) -> BookState:
     """Today's file for this book, or a fresh day built from yesterday's close.
@@ -286,17 +406,25 @@ def load_state(book_id: str, order_ref: str, day: date_type, capital: float = 0.
     forward. The insider and Congress books hold for weeks, so carrying the
     positions over is not a nicety: without it, every morning the loop would
     think those books were flat and their stops would vanish.
+
+    A file for today that was written before today began is not used at all. It
+    is moved to output/stale/ and the day starts fresh, because a file like that
+    is a rehearsal that leaked into the real folder and following it would mean
+    skipping the day's first real pick. See archive_stale_state().
     """
     path = state_path(order_ref, day, root)
     if path.exists():
+        stored: dict | None = None
         try:
             stored = json.loads(path.read_text())
-            return BookState(**_known(BookState, stored))
         except Exception as exc:                 # noqa: BLE001
             print(f"book_state: {path} is unreadable ({exc!r}), starting this book's "
                   "day from what came before it", file=sys.stderr)
+        if isinstance(stored, dict) and archive_stale_state(path, day, stored) is None:
+            return BookState(**_known(BookState, stored))
 
     fresh = BookState(book_id=book_id, order_ref=order_ref, date=f"{day:%Y-%m-%d}",
+                      created_at=datetime.now(NEW_YORK).isoformat(),
                       capital=float(capital), cash=float(capital),
                       day_start_equity=float(capital))
     previous = load_previous_state(order_ref, day, root)
@@ -335,7 +463,13 @@ def save_state(state: BookState, root: Path | None = None) -> Path:
 
     Written to a temporary name and moved into place, so a tick killed halfway
     through leaves the last good file rather than half a new one.
+
+    A state built by hand rather than by load_state gets its created_at here, on
+    the real clock, so that every file on disk carries one and nothing has to
+    fall back to reading the file's modification time.
     """
+    if not str(state.created_at or "").strip():
+        state.created_at = datetime.now(NEW_YORK).isoformat()
     day = datetime.strptime(state.date, "%Y-%m-%d").date()
     path = state_path(state.order_ref, day, root)
     temporary = path.with_suffix(".json.tmp")
