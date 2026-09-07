@@ -323,6 +323,7 @@ def test_an_orphan_somebody_has_already_looked_at_is_not_alerted(sent, monkeypat
     assert loop.report_orphans(outcome, at(9, 40), "testhash", False) == 1
     assert sent == [], (
         "output/expected_orphans.json is somebody saying they have looked at it")
+    assert outcome.books_agree is True, "and it halts nobody either"
 
 
 def test_the_alert_says_how_to_stop_it_being_said_again(sent, monkeypatch):
@@ -334,6 +335,7 @@ def test_the_alert_says_how_to_stop_it_being_said_again(sent, monkeypatch):
     assert "expected_orphans.json" in body
     assert '["SPY"]' in body
     assert "Nothing is managing it" in body
+    assert "Rules testhash" in body, "the rules hash goes on every alert"
 
 
 def test_an_order_nobody_tagged_is_the_same_situation(sent, monkeypatch):

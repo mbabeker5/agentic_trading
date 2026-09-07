@@ -15,6 +15,9 @@ Run them with:
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from agent.reconcile import (
@@ -268,6 +271,57 @@ def test_with_no_expected_orphans_at_all_the_leftover_spy_is_a_problem():
     assert report.ok is False
     assert report.orphans[0].expected is False
     assert report.summary == "1 problem, with no book to blame"
+
+
+def test_an_orphan_and_a_real_mismatch_are_both_reported_and_neither_hides_the_other():
+    """Book A is 20 shares out on AAPL, and 100 GHOST belong to nobody at all.
+
+    Two different problems, and both have to survive into the report. The halt
+    belongs to book A alone, because book A's own numbers are the thing that is
+    wrong. The GHOST is reported and halts nobody, and that must not swallow the
+    sentence saying what is wrong with book A's AAPL.
+    """
+    report = reconcile(
+        broker_positions=[held("AAPL", 120), held("GHOST", 100, avg_cost=120.0)],
+        broker_open_orders=[],
+        books_state={"A": book({"AAPL": 100}), "B": book()},
+    )
+    assert report.ok is False
+    assert report.books_to_halt == ("A",), "only the book being blamed stops"
+
+    # The per book mismatch is there, and blames only book A.
+    assert [m.kind for m in report.mismatches] == [KIND_POSITION_QTY]
+    assert (report.mismatches[0].book_id, report.mismatches[0].symbol) == ("A", "AAPL")
+    assert report.mismatches_for("B") == ()
+
+    # And so is the orphan. Two sentences in the log, one for each problem.
+    assert [o.symbol for o in report.unexpected_orphans] == ["GHOST"]
+    assert len(report.lines) == 2
+    assert report.mismatches[0].line in report.lines
+    assert report.orphans[0].line in report.lines
+    assert report.summary == "2 problems across book A"
+
+
+def test_reconcile_imports_nothing_that_could_talk_to_the_outside_world():
+    """Pure arithmetic, and that has to stay true.
+
+    agent/reconcile.py can be tested in under a second with no account open, no
+    Slack token and no network, and that is only true while it imports nothing
+    that could reach any of them. Telling somebody about an orphan is the
+    caller's job: report_orphans in agent/loop.py reads report.orphans and puts
+    the alert through agent/alerts.py. Importing agent/alerts.py in here to send
+    it directly would throw the whole property away.
+    """
+    import agent.reconcile as reconcile_module
+
+    source = Path(reconcile_module.__file__).read_text(encoding="utf-8")
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add((node.module or "").split(".")[0])
+    assert imported == {"__future__", "dataclasses", "decimal", "math"}, imported
 
 
 # ---------------------------------------------------------------------------
