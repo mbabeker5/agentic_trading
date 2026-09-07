@@ -2,6 +2,46 @@
 
 This file records every change to this strategy's numbers: what changed, on what date, and the git commit that carried it. The reason it exists is the ledger. A decision written down in the ledger in October has to be readable against the exact rules it was made under, not against whatever the rules became by December. Without a dated commit beside each set of numbers, a good month and a changed stop loss are impossible to tell apart. The strategy file beside this one is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/strategies/momentum_hybrid/strategy.yaml` and the spec it implements is `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/STRATEGY.md`.
 
+## The flatten stops trusting a feed it cannot read, 2026-09-06 (night)
+
+Not a change to this strategy's numbers. Every number in `strategy.yaml` is
+still exactly as Mo approved it in Momentum v2, and nothing in this entry moved
+one.
+
+Commit: b04298a (moved from f840f0f)
+
+One change in the batch moves a limit, and it is the reason the stamp moves.
+`snapshot_by_symbol()` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/loop.py`
+returned the prices and threw away everything the feed said about itself, so the
+15:45 flatten handled a market data line taken by another session (IBKR code
+10197) and a subscription lapsed to delayed data exactly like a quote that did
+not arrive: no log line, no alert, no halt. It now passes the tick and the book
+in, so the feed's verdict reaches the one place that writes a data problem down,
+tells Mo and halts the book. **A rule that said yes from 15:45 onwards can now
+say no**, which is what this stamp exists to record. The halt stops the book
+opening anything and leaves the closing path alone, because a stale price is
+fine to get out on and is not fine to get in on.
+
+The four other commits in the batch leave every limit answering as it did:
+
+- `6fc3fd3` widens the launchd generator's template glob, names the three
+  hand-made plists it cannot render instead of passing over them in silence, and
+  rewrites `--check` to fail three ways. Not one byte of any generated plist
+  changes, verified by generating from both versions and diffing.
+- `9254702` adds a thirteenth replay scenario, `nothing_left_working`, and
+  strengthens `day_trade_counter` to read each book's own counter file. Test
+  code and a scenario.
+- `c5c92a2` reverts an uncommitted change that would have made an unclaimed
+  position halt every book, so the committed answer stands: tell somebody once a
+  day, halt nobody. Net zero behaviour change, plus documentation and tests.
+  Whether that answer is right is now backlog item 0b, for Mo.
+- `5b57b6f` is the backlog and the journal.
+
+Nothing has traded. All five books are still on `dry_run` and `promoted_on` is
+still empty on every one of them, so this is still housekeeping rather than a
+version.
+
 ## Loop and guardrail fixes from the replay gate, 2026-09-06
 
 Not a change to this strategy's numbers. Every number in `strategy.yaml` is
