@@ -1,73 +1,43 @@
 # Hub status
 
-Written 2026-09-07 about 14:10 New York by the Tuesday worker. Overwritten each
+Written 2026-09-07 at 16:55 New York by the Tuesday worker. Overwritten each
 time, so this file is always now and never a history.
 
-## THE ONE THING MO MUST DO BEFORE TUESDAY
+## For Mo before 07:00 New York Tuesday
 
-**The trading machine is a MacBook Pro on battery, and it slept through this
-morning's rehearsal.** `pmset -g log` shows it asleep from about 07:50 to 09:43
-New York with a dark wake every fifteen minutes; `pmset -g batt` says 82 percent,
-discharging. A `caffeinate -dimsu` keep-awake job is already loaded
-(`com.codex.keepawake`), so this was a lid-closed or hand-triggered sleep that
-no software can override. While it slept IB Gateway lost its upstream link to
-IBKR (warning 2110, every read times out), a tick that started at 07:37 hung
-until 09:25 and blocked every pre-open wake-up, and the 09:00 pre-flight hung
-for 44 minutes without a verdict. Slack and screen alert sent at 09:50.
-
-Before 07:00 New York on Tuesday: plug it in, lid open or on an external
-display. The Mac Mini is not reachable on Tailscale right now, so moving there is
-not an option tonight.
+1. **Keep the MacBook plugged in and awake, lid open.** It is charging now (36
+   percent at 16:43). It slept on battery from 07:50 to 13:49 New York today and
+   that single fact caused every failure in the rehearsal. The Mac Mini is not
+   reachable on Tailscale, so the laptop is the trading machine tomorrow.
+2. **Check the market data subscription in Client Portal.** IBKR said all day
+   that the API is not subscribed to real time data (codes 10168 and 10089).
+   If that is still true at 09:36, no book opens anything, by design. The 09:38
+   check will report it either way.
 
 ## The five rulings
 
-1. **Orphan halt: DONE.** `38912d9` (behaviour, tests, `phantom_position`
-   scenario), `dd2800c` (docs, backlog 0b decided), `167b95b` (stamp on A, B, E
-   moved 51da883 to 38912d9). Verified directly: an unclaimed SPY share with no
-   forgiveness file halts A to E; `{"SPY": 1}` halts nobody; `{"SPY": 2}` halts
-   all again. Live file `output/expected_orphans.json` is `{"SPY": 1}`, and a
-   live read after the Gateway restart confirmed exactly 1 SPY at 766.15 with
-   order 4 (SELL 1) working. Note: `167b95b` also carries the time zone
-   generator work under the wrong message; my `git commit` swept in another
-   agent's staged files. Content is right, message is not.
-2. **Deadman, sheet_sync, backup_db: ARMED.** `7449442`. Nine jobs loaded.
-   sheet_sync ran once by hand against the live Sheet
-   (https://docs.google.com/spreadsheets/d/18_lzOTkoiJn1tc_WCHE5MheigyfhNc2dQcaZJjUBiP8/edit):
-   568 Rules Log rows and 5 Config values written, formulas intact, read back
-   through the REST API. Two findings for Mo: the sync wiped two hand-typed
-   sheet rows by design (the database is the truth; text is in the launchd
-   agent's report in journal/2026-09-07.md), and the 568 rows are alert-test
-   noise from 2026-09-06 in `data/trading.sqlite`. Backup wrote a 352K copy.
-   Deadman dry run stopped correctly at "market shut".
-   **Time zone:** the Mac flipped to Pacific at 22:29 on 2026-09-06 (automatic
-   time zone is on), so every job would have fired three hours late. Fixed in
-   `scripts/gen_launchd.py`: templates stay in New York time, plists are
-   converted to the Mac's zone and stamped, `--check`, the watchdog and the
-   pre-flight all fail on a zone change (`8916bba`, `46ce775`). Reinstalled at
-   06:55 New York; launchd shows hour 6 for the 09:xx New York wake-ups.
-3. **Gateway slow reads: DIAGNOSED AND FIXED TWICE, ROOT CAUSE IS SLEEP.** The
-   Gateway had lost upstream connectivity (2110); local login still worked so
-   the watchdog said ok. Restarted 04:12 and 09:48 New York; reads go from
-   20 minute hangs to under 3 seconds. Write-up:
-   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/journal/gateway_reads_2026-09-07.md`.
-   Follow-ups LANDED: (a) a wall-clock deadline on every MCP read (`2a90b2b`),
-   a 240 second cap on one tick in run_tick.sh (`8e2a509`), a 10 minute budget
-   on the pre-flight that writes NO_TRADE_TODAY if the broker cannot be read in
-   time (`b9c6a62`), bounded recorder reads (`86fb6c3`); (b) a watchdog
-   `ib_answers` check that does a real 20 second positions read after logging
-   in, restarts the Gateway once per outage when it fails, falls back to a spare
-   client id on a 326 collision, and bounds the whole run at 90 seconds
-   (`122254d` to `ba1a769`), verified read-only against the live Gateway.
-4. **Monday rehearsal: RUNNING, and it has already paid for itself.** Found:
-   the Mac sleep above; reads with no deadline hang jobs for hours; the loop
-   treats a holiday as a trading day (book D ran its sweep, momentum books
-   waited for a 09:30 open) because only deadman and pdt read
-   `schedule.holidays` (FIXED `f8e719a`, backlog item 9 shipped; live ticks now show phase=closed for the holiday); the pre-flight was
-   killed by its 10 minute launchd ExitTimeOut on an earlier run; watchdog
-   client id 250 collided with its own hung earlier copy. The deadman ran at
-   09:40 and correctly said the market is shut. Next checkpoints 16:43 New York
-   today, 09:21 and 09:38 Tuesday.
-5. **Tuesday 09:38 checks: scheduled**, not started.
+1. **Orphan halt: DONE.** `38912d9`, `dd2800c`, stamp `167b95b`. Live file
+   `output/expected_orphans.json` is `{"SPY": 1}`, confirmed against a live
+   read (1 SPY at 766.15, order 4 SELL 1 working).
+2. **Three jobs armed: DONE.** `7449442`. Nine jobs loaded, converted to the
+   Mac's Pacific clock and stamped (`8916bba`, `46ce775`). Sheet sync verified
+   against the live Sheet
+   (https://docs.google.com/spreadsheets/d/18_lzOTkoiJn1tc_WCHE5MheigyfhNc2dQcaZJjUBiP8/edit).
+   Two things for Mo from that: the sync wiped two hand-typed rows by design,
+   and the Rules Log carries 568 alert-test rows from Saturday's test database.
+3. **Gateway slow reads: DONE.** Cause was upstream loss while the Mac slept;
+   restarted twice by hand, then the new watchdog `ib_answers` check restarted
+   it by itself at 15:52 and proved the restart in 65 seconds. Every read now
+   has a wall-clock deadline, a tick is capped at 240 s, the pre-flight at 10
+   minutes. Write-up: `journal/gateway_reads_2026-09-07.md`.
+4. **Monday rehearsal: DONE.** Journal `journal/2026-09-07.md` written by the
+   16:30 learning job (`80844bf`) with my addendum. Fixed today from what it
+   found: holiday handling in the loop (`f8e719a`), the deadlines above, the
+   watchdog real read, the time zone conversion, and ten stale Tuesday state
+   files quarantined out of `output/`. In flight: backlog 18 (rehearsal runs
+   cannot write real state), 19 (reconciliation says "not checked" when the
+   broker is unreadable), alert stamps in New York time.
+5. **Tuesday 09:38 checks: scheduled** (09:21 and 09:38 New York), not started.
 
 ## Stays as ruled
-All five books dry_run. Shorting off. Suite 1689 passing at `ba1a769`. Tree clean, everything pushed.
+All five books dry_run. Shorting off. Suite 1689 passing at `ba1a769`.
