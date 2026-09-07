@@ -17,11 +17,18 @@ Nothing here touches a broker or a network. The fake below is twenty lines and
 its order methods raise, so a test that ever tried to send something fails
 loudly rather than passing quietly.
 
+The flatten tests at the bottom are the exception, and they have to be: watching
+an order actually get cancelled needs the live path open. They use a second fake
+that writes every cancel and every order into one list instead of sending it, so
+the order the two happen in can be read back, and they all catch their alerts
+rather than letting agent/alerts.py text a real phone.
+
     /Users/mtalib/workspace_repos/personal_repo/agentic_trading/venv312/bin/python \
       -m pytest tests/test_loop_wiring.py -q
 """
 from __future__ import annotations
 
+import dataclasses
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -111,6 +118,27 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setenv(loop.ROOT_ENV_VAR, str(tmp_path))
     monkeypatch.delenv("AGENTIC_TRADING_LIVE_ORDERS", raising=False)
     return tmp_path
+
+
+@pytest.fixture
+def sent(monkeypatch):
+    """Every alert this test raises, caught instead of sent.
+
+    agent/alerts.py really does text a phone, message Slack and put a banner on
+    this screen, so a test that alerts without this fixture alerts Mo. Tests
+    that expect no alert take it too and assert the list is empty, which is the
+    only way an accidental one gets caught rather than delivered.
+    """
+    caught: list[tuple[str, str, str]] = []
+
+    class Caught:
+        @staticmethod
+        def alert(level, title, body):
+            caught.append((level, title, body))
+            return ["captured"]
+
+    monkeypatch.setattr(loop, "alerts_mod", Caught)
+    return caught
 
 
 def guard_for(book_id: str = "A") -> gr.Guardrails:
@@ -795,3 +823,427 @@ def test_the_working_orders_for_a_flattened_name_go_too(sandbox):
 
     assert "501" not in state.working_orders
     assert "502" in state.working_orders, "another name's stop is nothing to do with it"
+
+
+# ---------------------------------------------------------------------------
+# The flatten: nothing this book has resting survives it, and the quotes it
+# closes on have to say what they are
+# ---------------------------------------------------------------------------
+#
+# Two findings, both from the replay gate rather than from reading the code.
+#
+# An entry goes out as a bracket, a limit parent and a resting stop-limit child,
+# and until 2026-09-06 nothing cancelled either at the close. cancel_order was
+# reachable from exactly two places, moving a stop and the sixty second stop
+# backstop, and neither of them runs at 15:45. Live that is a stop resting for a
+# position that no longer exists, plus an unfilled entry that can fill on the
+# next open into a book that believes it is flat.
+#
+# And the flatten read its quotes through snapshot_by_symbol(), which returned
+# the prices and dropped everything the feed said about itself into a list the
+# caller threw away. So from 15:45 a competing session (IBKR code 10197) and a
+# subscription that had lapsed to delayed data were both handled exactly like a
+# quote that did not arrive: no log line, no alert, no halt.
+
+#: The paper account. The live order path refuses any id not starting with DU.
+PAPER_ACCOUNT = "DUT077572"
+
+#: A live quote with both sides of the spread on it, so a limit flatten has a
+#: bid to sit on. marketDataType 1 is the "this price is current" answer
+#: read_quotes asks for, and a fake that leaves it out looks exactly like a
+#: subscription that has lapsed.
+LIVE_QUOTE = {"symbol": "AAPL", "last": 100.0, "close": 100.0, "bid": 99.90,
+              "ask": 100.10, "marketDataType": loop.MARKET_DATA_LIVE}
+
+
+class FlattenBroker(QuoteBroker):
+    """Takes cancels and closing orders, sends none of them, remembers the order.
+
+    One list for both kinds of call, because the order they happen in is the
+    point rather than a detail: a stop still live while a closing order fills
+    sells stock the book has already sold.
+    """
+
+    def __init__(self, quotes: list[dict] | None = None, cancels: bool = True):
+        super().__init__([LIVE_QUOTE] if quotes is None else quotes)
+        self.did: list[str] = []
+        self.cancels = cancels
+        self._next_id = 900
+
+    def cancel_order(self, order_id):
+        self.did.append(f"cancel {order_id}")
+        return {"order_id": order_id, "cancelled": self.cancels,
+                "error": None if self.cancels else "it filled a moment ago"}
+
+    def place_order(self, contract, order, order_ref=""):
+        self._next_id += 1
+        self.did.append(f"place {order.get('action')} {contract.get('symbol')} "
+                        f"{order.get('orderType')}")
+        return {"sent": True, "order_id": self._next_id, "working": True,
+                "filled_qty": 0.0, "avg_fill_price": None, "error": None,
+                "confirmed_by": "open_orders"}
+
+
+class RefusingBroker(FlattenBroker):
+    """A broker that raises on a cancel instead of answering it."""
+
+    def cancel_order(self, order_id):
+        self.did.append(f"cancel {order_id}")
+        raise RuntimeError("the gateway went away mid cancel")
+
+
+class DelayedBroker(FlattenBroker):
+    """Quotes that came back fifteen minutes old when live was asked for."""
+
+    def snapshot(self, contracts, market_data_type=3):
+        self.snapshot_calls.append(contracts)
+        return {"snapshots": [dict(LIVE_QUOTE,
+                                   marketDataType=loop.MARKET_DATA_DELAYED)],
+                "market_data_type": loop.MARKET_DATA_DELAYED}
+
+
+class MuteBroker(FlattenBroker):
+    """A snapshot that failed with no IBKR code and no data type on it at all."""
+
+    def snapshot(self, contracts, market_data_type=3):
+        raise RuntimeError("the quote request timed out")
+
+
+class TakenDataLine(RuntimeError):
+    """What a broker raises when another session holds the market data line.
+
+    The number is on the exception and not in the words, exactly as
+    agent/replay/fake_broker.py raises it, so a passing test proves the code was
+    read off the object rather than scraped out of a sentence.
+    """
+
+    def __init__(self):
+        super().__init__("market data is not available because another session "
+                         "is using this account")
+        self.code = loop.COMPETING_SESSION_CODE
+
+
+class CompetingBroker(FlattenBroker):
+    """Another session has taken the market data line, so no quote arrives."""
+
+    def snapshot(self, contracts, market_data_type=3):
+        raise TakenDataLine()
+
+
+def flatten_parts(sandbox: Path, now: datetime, holding: tuple = (),
+                  book_id: str = "A"):
+    """Everything do_flatten needs, on a book in full mode.
+
+    Full mode opens one of the four live locks and each test opens the others,
+    which is the only way to watch a cancel actually happen. Nothing can reach a
+    broker from here: every fake in this file either records the call or raises.
+
+    holding is what the book has open, as (symbol, shares, price) triples, and
+    it goes in BEFORE the account state is worked out. That order matters: the
+    guardrails read what is held off the account snapshot, so a position added
+    afterwards is a position they cannot see, and the closing order then reads
+    as a naked short sale and is refused by the no_shorts rule.
+    """
+    book = dataclasses.replace(gr.load_books(BOOKS_YAML).get(book_id), mode="full")
+    guard = guard_for(book_id)
+    state = bs.load_state(book_id, f"BOOK_{book_id}", TUESDAY, capital=100000,
+                          root=sandbox)
+    for symbol, qty, price in holding:
+        state.put_position(bs.Position(
+            symbol=symbol, qty=qty, avg_cost=price, entry=price, side="long",
+            opened_on=f"{TUESDAY:%Y-%m-%d}", stop=round(price * 0.985, 2),
+            market_value=qty * price))
+    tick = loop.BookTick(book, now, "testhash", write_ledger=False, quiet=True)
+    account_state = bs.account_state_for(state, gr, now, PAPER_ACCOUNT, False)
+    return (tick, state, loop.plan_for(book, guard), guard, account_state,
+            loop.read_guards(sandbox))
+
+
+#: One long position in AAPL, a hundred shares bought at a hundred dollars.
+HELD_AAPL = (("AAPL", 100, 100.0),)
+
+
+def cancels(broker: FlattenBroker) -> list[str]:
+    return [call for call in broker.did if call.startswith("cancel")]
+
+
+def test_the_flatten_pulls_the_resting_stop_and_the_unfilled_entry(
+        sandbox, sent, monkeypatch):
+    """Both legs of the bracket, and the position closed after them.
+
+    The entry in REST never filled and the stop in AAPL is the bracket's child.
+    Neither has anything to do with the closing order, and both used to sit
+    there through the close.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+    state.working_orders = {
+        "501": {"symbol": "REST", "purpose": "entry", "remaining": 100,
+                "limit_price": 99.5},
+        "502": {"symbol": "AAPL", "purpose": "stop", "price": 98.5,
+                "is_child": True}}
+
+    broker = FlattenBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert sorted(cancels(broker)) == ["cancel 501", "cancel 502"]
+    assert "501" not in state.working_orders
+    assert "502" not in state.working_orders
+    assert [o.get("purpose") for o in state.working_orders.values()] == ["flatten"], (
+        "the only order left resting after the flatten is the flatten itself")
+    assert sent == []
+
+
+def test_the_cancel_goes_out_before_the_closing_order(sandbox, sent, monkeypatch):
+    """The order of the two is the whole point.
+
+    Closing first would leave a live stop able to fill against a position that
+    is already gone, and the book would end up short a name it never sold.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+    state.working_orders = {"502": {"symbol": "AAPL", "purpose": "stop",
+                                    "price": 98.5, "is_child": True}}
+
+    broker = FlattenBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert broker.did == ["cancel 502", "place SELL AAPL LMT"]
+    written = [row["decision"] for row in state.decisions]
+    assert written.index("cancelled order 502") < next(
+        i for i, decision in enumerate(written) if decision.startswith("placed ")), (
+        "the book file has to say the same thing in the same order")
+
+
+def test_a_flatten_with_nothing_resting_pulls_nothing_and_raises_nothing(
+        sandbox, sent, monkeypatch):
+    """The ordinary case. A book flat at 15:45 with no orders out."""
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(sandbox, at(15, 46))
+
+    broker = FlattenBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert broker.did == []
+    assert tick.notes == []
+    assert state.working_orders == {}
+    assert sent == []
+
+
+def test_an_order_the_broker_will_not_cancel_is_left_and_said_to_be_still_live(
+        sandbox, sent, monkeypatch):
+    """It stays in the book file, so the next tick tries it again."""
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry",
+                                    "remaining": 100, "limit_price": 99.5}}
+
+    broker = FlattenBroker(cancels=False)
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert "501" in state.working_orders
+    assert any("still resting at the broker" in note for note in tick.notes)
+    assert "place SELL AAPL LMT" in broker.did, (
+        "one order that would not come off does not stop the book getting out")
+
+
+def test_a_cancel_that_raises_does_not_stop_the_flatten(sandbox, sent, monkeypatch):
+    """A broker that goes away mid cancel is a note, never an exception.
+
+    The flatten is the last thing this book does all day. Something raising out
+    of it would leave the position open overnight, which is the one outcome the
+    whole 15:45 rule exists to prevent.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry",
+                                    "remaining": 100, "limit_price": 99.5}}
+
+    broker = RefusingBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert any("would not cancel" in note for note in tick.notes)
+    assert "501" in state.working_orders
+    assert "place SELL AAPL LMT" in broker.did
+
+
+def test_cancelling_twice_in_one_day_pulls_each_order_once(sandbox, sent, monkeypatch):
+    """15:45 and the 15:55 backstop both come through here, so it runs twice."""
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, _plan, _guard, account, guards = flatten_parts(sandbox, at(15, 46))
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry",
+                                    "remaining": 100}}
+
+    broker = FlattenBroker()
+    first = loop.cancel_working_orders(tick, state, broker, guards, account,
+                                       "this book is flattening")
+    second = loop.cancel_working_orders(tick, state, broker, guards, account,
+                                        "this book is flattening")
+
+    assert (first, second) == (1, 0)
+    assert broker.did == ["cancel 501"]
+
+
+def test_the_market_backstop_pulls_the_limit_flatten_the_last_tick_left(
+        sandbox, sent, monkeypatch):
+    """15:55. The 15:45 limit did not fill, so it comes off and a market order goes.
+
+    This is the second cancel the day asks for, and it is why the helper has to
+    be safe to call again: the thing it pulls at 15:55 is what it placed at
+    15:45.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 56), holding=HELD_AAPL)
+    state.working_orders = {"901": {"symbol": "AAPL", "purpose": "flatten",
+                                    "side": "SELL", "qty": 100, "remaining": 100,
+                                    "limit_price": 99.90}}
+
+    broker = FlattenBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert broker.did == ["cancel 901", "place SELL AAPL MKT"]
+
+
+def test_a_dry_run_cancels_nothing_and_says_what_it_would_have_done(
+        sandbox, sent, capsys):
+    """Every book is in dry run today, so this is the path that actually runs."""
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000, root=sandbox)
+    state.working_orders = {"501": {"symbol": "REST", "purpose": "entry",
+                                    "remaining": 100}}
+    tick = loop.BookTick(gr.load_book(BOOKS_YAML, "A"), at(15, 46), "testhash",
+                         write_ledger=False)
+    account = bs.account_state_for(state, gr, at(15, 46), PAPER_ACCOUNT, False)
+
+    broker = FlattenBroker()
+    pulled = loop.cancel_working_orders(tick, state, broker, loop.read_guards(sandbox),
+                                        account, "this book is flattening at 15:45")
+
+    assert pulled == 0
+    assert broker.did == []
+    assert "501" in state.working_orders
+    printed = capsys.readouterr().out
+    assert "would cancel order 501" in printed
+    assert "because this book is flattening at 15:45" in printed
+
+
+# ---------------------------------------------------------------------------
+# A snapshot failure at the flatten is not a note nobody reads
+# ---------------------------------------------------------------------------
+
+
+def test_a_taken_data_line_at_the_flatten_halts_the_book_and_tells_mo(
+        sandbox, sent, monkeypatch):
+    """IBKR code 10197, which used to vanish into a list do_flatten threw away.
+
+    Prices nobody can trust are worse than no prices, so the book is halted. A
+    halt stops it OPENING anything and leaves the closing path alone, and the
+    position still goes out, at market, because no bid or ask arrived to sit a
+    limit order on.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+
+    broker = CompetingBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert state.halted is True
+    assert bs.HALT_MARKET_DATA in state.halt_causes()
+    assert str(loop.COMPETING_SESSION_CODE) in tick.data_block
+    assert [title for _level, title, _body in sent] == [
+        "Another session has taken the market data line"]
+    assert "place SELL AAPL MKT" in broker.did, (
+        "an exit is never blocked by the state of the feed")
+
+
+def test_a_delayed_feed_at_the_flatten_stops_an_entry_and_lets_the_exit_out(
+        sandbox, sent, monkeypatch):
+    """Market data type 3 during the session means the live subscription lapsed.
+
+    A price about fifteen minutes old is fine for deciding whether to get out of
+    something and is not fine for deciding what to pay for it, which is exactly
+    the split this asserts.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+
+    broker = DelayedBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    blocked = loop.entries_blocked_reason(guards, state, tick)
+    assert blocked and "delayed" in blocked
+    assert state.halted is True
+    assert [level for level, _title, _body in sent] == ["warn"]
+    assert "place SELL AAPL LMT" in broker.did, (
+        "the price that did arrive is good enough to get out on")
+
+
+def test_one_name_whose_quote_did_not_arrive_is_only_a_note(sandbox, sent,
+                                                            monkeypatch):
+    """Two positions, one quote. An unreadable name is not a reason to stop.
+
+    The fake answers about AAPL and says nothing at all about MSFT, which is
+    what a single name nobody could price looks like. MSFT goes out at market
+    and the book is not halted.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=(("AAPL", 100, 100.0), ("MSFT", 50, 200.0)))
+
+    broker = FlattenBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert state.halted is False
+    assert sent == []
+    assert any("MSFT" in note and "no bid or ask" in note for note in tick.notes)
+    assert "place SELL AAPL LMT" in broker.did
+    assert "place SELL MSFT MKT" in broker.did
+
+
+def test_a_snapshot_that_simply_failed_is_a_note_and_not_a_halt(sandbox, sent,
+                                                                monkeypatch):
+    """No IBKR code and no market data type: nothing here says the feed is bad.
+
+    A Gateway that has gone away is somebody else's job, in read_broker_facts
+    and broker_unavailable_tick. Halting the book on a timed out quote request
+    would stop the day over the one failure that is most often a single slow
+    reply.
+    """
+    monkeypatch.setenv(loop.LIVE_ENV_VAR, "yes")
+    tick, state, plan, guard, account, guards = flatten_parts(
+        sandbox, at(15, 46), holding=HELD_AAPL)
+
+    broker = MuteBroker()
+    loop.do_flatten(tick, state, plan, guard, broker, account, guards)
+
+    assert state.halted is False
+    assert sent == []
+    assert any("no quotes came back" in note for note in tick.notes)
+    assert "place SELL AAPL MKT" in broker.did
+
+
+def test_a_caller_with_no_book_to_halt_still_gets_the_reason_in_writing(sandbox):
+    """snapshot_by_symbol used to return the prices and drop all of this.
+
+    Without a tick there is no book to halt and nobody to tell, so the verdict
+    goes into notes. That is the difference between a caller that can act on it
+    and the silence there used to be.
+    """
+    taken: list[str] = []
+    loop.snapshot_by_symbol(CompetingBroker(), [{"symbol": "AAPL"}], taken)
+    assert any(str(loop.COMPETING_SESSION_CODE) in note for note in taken)
+
+    delayed: list[str] = []
+    loop.snapshot_by_symbol(DelayedBroker(), [{"symbol": "AAPL"}], delayed)
+    assert any("delayed" in note for note in delayed)
+
+    live: list[str] = []
+    quotes = loop.snapshot_by_symbol(FlattenBroker(), [{"symbol": "AAPL"}], live)
+    assert live == [], "a live feed has nothing to say about itself"
+    assert quotes["AAPL"]["bid"] == 99.90

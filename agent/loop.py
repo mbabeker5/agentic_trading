@@ -1312,14 +1312,41 @@ def _served_type(answer: dict, quotes: dict[str, dict]) -> int | None:
 
 
 def snapshot_by_symbol(broker: broker_mod.Broker, rows: list[dict],
-                       notes: list[str]) -> dict[str, dict]:
+                       notes: list[str], tick: "BookTick | None" = None,
+                       state: "bs.BookState | None" = None) -> dict[str, dict]:
     """One quote each for a list of names, keyed by symbol. Prices only.
 
     For the callers that want nothing but the numbers. Anything that decides
     whether to OPEN a position uses read_quotes above instead, because the
     decision needs to know how old the price is.
+
+    Hand it the tick and the book as well and it stops being prices only: the
+    feed's own verdict goes to note_the_feed(), which is the single place that
+    writes a data problem down, tells Mo once and halts the book. That is not a
+    refinement, it is the bug this wrapper was. read_quotes() has always worked
+    out whether another session had taken the market data line (IBKR code
+    10197) or whether the quotes came back delayed when live was asked for, and
+    this function returned .quotes and dropped all of it, so every caller
+    reading it that way handled a taken data line exactly like a quote that did
+    not arrive. The flatten was the last one, which is why from 15:45 a
+    competing session reached no log, no alert and no halt. That is the shape
+    the replay gate's competing_session_delayed_data scenario found.
+
+    Without a tick there is no book to halt and nobody to tell, so the verdict
+    is written into notes in plain words instead. That caller is still better
+    off than it was, because the reason is on the record rather than gone.
+
+    A single name whose own quote did not arrive is not judged here at all. It
+    stays what it always was, a note from the caller who wanted it, because one
+    unreadable name is not a reason to stop a book's day.
     """
-    return read_quotes(broker, rows, notes).quotes
+    feed = read_quotes(broker, rows, notes)
+    if tick is not None and state is not None:
+        note_the_feed(tick, state, feed)
+    elif feed.competing_session or (feed.market_data_type is not None
+                                    and not feed.good_enough_to_enter):
+        notes.append(feed.why_not)
+    return feed.quotes
 
 
 #: IBKR's halted tick is tick type 49. It comes back as a number: 0 means not
@@ -4002,7 +4029,14 @@ def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
                  "open positions with limit orders at the bid or the ask. Anything "
                  f"still open at {plan.flatten_market_at:%H:%M} goes out at market.")
 
-    quotes = snapshot_by_symbol(broker, [{"symbol": s} for s in positions], [])
+    # The tick and the book go in, so what the feed said about itself reaches
+    # them instead of a throwaway list nobody reads. A taken data line (IBKR
+    # code 10197) or a delayed feed at 15:45 halts this book, and a halt stops
+    # it OPENING anything and leaves this closing path alone, which is the right
+    # way round: a stale price is fine to get out on and is not fine to get in
+    # on. The prices that did arrive are still used to close on.
+    quotes = snapshot_by_symbol(broker, [{"symbol": s} for s in positions],
+                                tick.notes, tick, state)
     counter = make_day_trade_counter(guard)
     today = tick.now.date()
     for symbol, position in positions.items():
