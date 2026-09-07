@@ -734,7 +734,8 @@ def test_the_shared_settings_still_load_on_their_own_with_no_book():
     assert shared.money.gross_exposure_pct_max == 100
     assert shared.money.tiny_capital_usd == 2000
     assert shared.schedule.entries_per_day_max is None
-    assert shared.schedule.holidays == (), "no holiday calendar in month one"
+    assert loaded.schedule.holidays == (date(2026, 9, 7), date(2026, 11, 26), date(2026, 12, 25)), \
+        "the 2026 NYSE closures left after Labor Day; without them a closed Monday looks like a trading day"
     assert shared.universe.min_avg_dollar_volume == 20_000_000
     assert shared.universe.dollar_volume_sessions == 30
     assert shared.pdt.hard_limit is False
