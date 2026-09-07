@@ -946,11 +946,18 @@ def _positions_answer(ib, timeout: int = ANSWER_TIMEOUT_SECONDS,
     connection to IBKR was gone, so the handshake proved nothing: every
     reqPositions, account update and reqExecutions simply never came back.
 
+    Asking again after connecting is not the waste it looks. ib_async asks for
+    the positions itself while connecting, but it logs a timeout there and
+    carries on, because raiseSyncErrors is off by default. That swallowed
+    timeout is precisely why ib_connect reported ok all night. The answer has to
+    be asked for by something that treats not getting one as a failure.
+
     Two ways to fail, and they are the same illness:
 
-    * the request does not answer inside the bound. ib_async raises
-      asyncio.TimeoutError once ib.RequestTimeout is set, and that setting also
-      caps everything else asked on this connection.
+    * the request does not answer inside the bound. ib_async raises through
+      asyncio.wait_for once ib.RequestTimeout is set on the connection, which
+      on Python 3.11 and later is the builtin TimeoutError; both names are
+      caught below because they are the same class.
     * IBKR says warning 2110, "Connectivity between Trader Workstation and
       server is broken", which is Gateway admitting it up front. That one
       arrives with the handshake rather than with the read, which is why every
@@ -1031,9 +1038,6 @@ def check_ib(port_ok: bool, market_hours: bool = True,
 
     codes: list[int] = []
     ib = IB()
-    # One bound for everything asked on this connection, which is what stops a
-    # hung Gateway holding the whole run open. ib_async reads it on the instance.
-    ib.RequestTimeout = ANSWER_TIMEOUT_SECONDS
     ib.errorEvent += lambda reqId, code, msg, *rest: codes.append(code)
     try:
         used, note, failures = _connect_read_only(ib, codes, client_id)
@@ -1042,6 +1046,13 @@ def check_ib(port_ok: bool, market_hours: bool = True,
                           detail="Could not connect to IB Gateway: "
                                  + "; ".join(failures)),
                     skipped_answers, skipped_data)
+
+        # Set only once the connection is up, so it bounds the reads below and
+        # nothing else. ib_async runs connect through the same timeout, and the
+        # connect already carries its own fifteen second bound, so setting this
+        # first would wrap a fifteen second thing in a twenty second thing and
+        # turn a slow login into an ib_connect failure.
+        ib.RequestTimeout = ANSWER_TIMEOUT_SECONDS
 
         accounts = list(ib.managedAccounts() or [])
         if PAPER_ACCOUNT not in accounts:
