@@ -37,7 +37,7 @@ import json
 import logging
 import os
 import random
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import date as date_type, datetime, time as clock_time, timedelta
 from pathlib import Path
 from typing import Any, Iterator
@@ -378,8 +378,19 @@ async def connect_ib(ib, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     Returns True when it connected and False when it gave up, rather than
     raising, because both callers want to carry on and write down that they
     could not connect rather than die.
+
+    THE TIMEOUT IS ALSO GIVEN TO THE LIBRARY, not just to the connect. ib_async
+    waits forever on a request by default: IB.RequestTimeout is 0, which means
+    no timeout at all. A Gateway that is up and logged in but has lost its own
+    upstream connection to IBKR answers nothing, and on the morning of
+    2026-09-07 that is exactly what happened: the day recorder sat on those
+    reads for eighteen minutes for a single --once tick. Handing the library the
+    same bound the connect gets means a read either answers or raises, and the
+    caller writes down a missed slot instead of hanging.
     """
     wait = float(first_wait)
+    with suppress(Exception):
+        ib.RequestTimeout = float(timeout)
     for attempt in range(1, int(attempts) + 1):
         if ib.isConnected():
             return True

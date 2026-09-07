@@ -147,6 +147,22 @@ DEFAULT_MAX_SYMBOLS = 25
 SNAPSHOT_TIMEOUT_SECONDS = 30.0
 HISTORY_TIMEOUT_SECONDS = 60.0
 
+#: Looking a symbol up is a Gateway round trip like any other, and
+#: qualifyContractsAsync has no timeout of its own either. Twenty seconds, the
+#: same bound the connection itself gets in agent/replay/common.py.
+QUALIFY_TIMEOUT_SECONDS = 20.0
+
+#: THE WHOLE OF ONE TICK. Under launchd every tick of the real day is its own
+#: --once process on a five minute timetable, so a tick still going after four
+#: minutes has already lost its slot and is now only in the way of the next one.
+#: Past this it is written down as missed and the process exits, which is worth
+#: far more than a tick that eventually succeeds an hour late.
+#:
+#: Why the number is needed at all: on 2026-09-07 IB Gateway was up and logged
+#: in but had lost its own connection to IBKR (warning 2110), every read timed
+#: out after a long wait, and one --once tick sat there for eighteen minutes.
+TICK_TIMEOUT_SECONDS = 240.0
+
 #: Snapshots go out in batches rather than all at once, so that one symbol
 #: Gateway refuses to answer about only costs its batch and not the whole tick.
 SNAPSHOT_BATCH_SIZE = 10
@@ -465,7 +481,14 @@ class DayRecorder:
         if missing:
             wanted = [Stock(symbol, "SMART", "USD") for symbol in missing]
             try:
-                await self.ib.qualifyContractsAsync(*wanted)
+                # Bounded, because ib_async does not bound this one. A Gateway
+                # that has lost IBKR answers a contract lookup with silence.
+                await asyncio.wait_for(self.ib.qualifyContractsAsync(*wanted),
+                                       timeout=QUALIFY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                self.note(f"looking up contracts for {', '.join(missing)} took "
+                          f"more than {QUALIFY_TIMEOUT_SECONDS:.0f} seconds, so "
+                          f"this tick carried on without them")
             except Exception as exc:                        # noqa: BLE001
                 self.note(f"could not look up contracts for "
                           f"{', '.join(missing)}: {exc!r}")
@@ -841,7 +864,16 @@ class DayRecorder:
         and the recording would be wrong anyway, because the quotes would all
         carry the wrong timestamp.
         """
-        self.write_tick({
+        self.write_tick(self.missed_record(moment, why))
+
+    def missed_record(self, moment: datetime, why: str) -> dict:
+        """The shape of a slot that did not happen, without writing it down yet.
+
+        Split out from record_missed above so that a tick killed by the cap can
+        be handed back to the caller exactly like a real one, and written by the
+        same line of code.
+        """
+        return {
             "tick": moment.isoformat(),
             "slot": slot_label(moment),
             "ran_at": None,
@@ -861,7 +893,7 @@ class DayRecorder:
             "history_requests_used": self.pacer.granted,
             "duration_seconds": 0.0,
             "errors": [why],
-        })
+        }
 
     # -- the manifest -------------------------------------------------------
 
@@ -968,6 +1000,29 @@ def is_scanner_slot(moment: datetime) -> bool:
     return slot_label(moment) in SCANNER_SLOTS
 
 
+async def capped_tick(recorder: DayRecorder, moment: datetime,
+                      run_scanner: bool) -> dict:
+    """One tick, with a cap on the whole of it. Comes back with a record either way.
+
+    one_tick already bounds each kind of read it does. This is the cap over all
+    of them together, for the case they queue up behind one another on a Gateway
+    that has stopped answering: on 2026-09-07 a single --once tick ran for
+    eighteen minutes that way. A tick that overruns is written down as a missed
+    slot, which is what the manifest already knows how to describe, and the
+    recorder carries on to the next one.
+    """
+    try:
+        return await asyncio.wait_for(
+            recorder.one_tick(moment, run_scanner=run_scanner),
+            timeout=TICK_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        why = (f"the tick was still waiting on IB Gateway after "
+               f"{TICK_TIMEOUT_SECONDS:.0f} seconds, so it was written off as "
+               f"missed rather than left running into the next slot")
+        log.error("%s %s", slot_label(moment), why)
+        return recorder.missed_record(moment, why)
+
+
 async def run_once(recorder: DayRecorder) -> None:
     """A single tick, right now, for testing outside market hours.
 
@@ -991,7 +1046,8 @@ async def run_once(recorder: DayRecorder) -> None:
     log.info("one tick only, standing in for the %s slot%s", slot_label(moment),
              f", slot {slot_label(moment)} of the {len(full_grid)} slot day"
              if on_the_grid else ", outside the recording window, so a test tick")
-    record = await recorder.one_tick(moment, run_scanner=bool(recorder.args.run_scanner))
+    record = await capped_tick(recorder, moment,
+                               run_scanner=bool(recorder.args.run_scanner))
     recorder.write_tick(record)
     recorder.ending = "finished, single tick"
     recorder.write_manifest()
@@ -1028,7 +1084,8 @@ async def run_day(recorder: DayRecorder, stop: asyncio.Event) -> None:
             if await sleep_until(moment, stop):
                 break
 
-        record = await recorder.one_tick(moment, run_scanner=is_scanner_slot(moment))
+        record = await capped_tick(recorder, moment,
+                                   run_scanner=is_scanner_slot(moment))
         recorder.write_tick(record)
         recorder.write_manifest()
 
