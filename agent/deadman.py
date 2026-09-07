@@ -134,15 +134,6 @@ STALE_FLOOR = timedelta(minutes=15)
 #: Mo hears the watchdog shouting before this thing flattens anything.
 MISSED_TICKS = 3
 
-#: The default when nobody has read config/guardrails.yaml: three missed ticks at
-#: the five minute cadence, which is the floor anyway. The real number comes from
-#: Schedule.stale_after below, so a cadence change in the settings moves this
-#: without anybody remembering to edit it here. That is the whole point: it used
-#: to be fifteen minutes written out as a constant, and a book moved to a thirty
-#: minute clock would have been called dead twenty five minutes into a normal
-#: gap between its ticks.
-STALE_AFTER = STALE_FLOOR
-
 #: The one file that wins outright when it exists.
 HEARTBEAT_NAME = "heartbeat"
 
@@ -225,6 +216,12 @@ class Schedule:
         agent/watchdog.py works out its own limit the same way at two missed
         ticks rather than three, so Mo hears it shouting before this thing
         flattens anything.
+
+        Until a0e504a this was fifteen minutes written out as a constant, and a
+        book moved to a thirty minute clock would have been called dead twenty
+        five minutes into a normal gap between its ticks. The insider and
+        Congress books are on thirty minutes in their own strategy.yaml today,
+        so that was not hypothetical.
         """
         interval = max(1, int(self.loop_minutes or 5))
         return max(STALE_FLOOR, timedelta(minutes=MISSED_TICKS * interval))

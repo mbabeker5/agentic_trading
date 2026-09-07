@@ -217,9 +217,9 @@ a quiet phone from a broken alerter.
 | `Kill switch fired on LIVE account ...` | The panic button was pulled on an account that is not the paper one | This needs the flag and the environment variable together, so somebody meant it. Check the account. |
 | `Kill switch refused: ... is not a paper account` | The panic button was pulled on a live account without both permissions | Nothing was traded, but the loop IS stopped. Decide whether you really want that account flattened, and read the panic button section below. |
 | `Kill switch could not read the account` | The panic button was pulled and IB Gateway did not answer | The loop is stopped anyway. Fix Gateway, then run it again. |
-| `Loop is dead, pulling the kill switch` | The dead man's handle fired. The loop stopped for more than 15 minutes while a book was holding something | Nothing to do right now, it is already closing out. A second message follows with the result. Then find out why the loop stopped. |
+| `Loop is dead, pulling the kill switch` | The dead man's handle fired. The loop went quiet for three whole ticks while a book was holding something, which is fifteen minutes at the ordinary five minute cadence and never less than fifteen whatever the cadence | Nothing to do right now, it is already closing out. A second message follows with the result. Then find out why the loop stopped. |
 | `Loop is dead and ... is a LIVE account` | The same, on an account that is not the paper one | It has NOT traded and will not. Close the positions yourself, or read the panic button section. |
-| `The trading loop has stopped` | The loop stopped for more than 15 minutes in market hours, and no book was holding anything | Nothing was traded and nothing needed to be. Find out why the loop stopped. |
+| `The trading loop has stopped` | The loop went quiet for three whole ticks in market hours, and no book was holding anything | Nothing was traded and nothing needed to be. Find out why the loop stopped. |
 | `Recovered: ...` | Nothing. It is over | Nothing. |
 
 ## The panic button
@@ -310,7 +310,12 @@ open, and the books are still holding things.
 Every five minutes from 09:30 to 16:00 on a weekday it asks three questions and
 stops at the first no:
 
-1. Has the loop written nothing for more than fifteen minutes?
+1. Has the loop written nothing for three whole ticks? That is
+   `schedule.loop_minutes` times three out of
+   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml`,
+   with a fifteen minute floor under it, so the ordinary five minute cadence
+   means fifteen minutes and the thirty minute cadence the insider and Congress
+   books run on means ninety.
 2. Is the market actually open?
 3. Does the broker hold a position, or a working order, that carries a `BOOK_`
    tag?
