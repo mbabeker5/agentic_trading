@@ -1,6 +1,6 @@
 # Hub status
 
-Written 2026-09-07 at 16:55 New York by the Tuesday worker. Overwritten each
+Written 2026-09-07 at 17:20 New York by the Tuesday worker. Overwritten each
 time, so this file is always now and never a history.
 
 ## For Mo before 07:00 New York Tuesday
@@ -34,10 +34,10 @@ time, so this file is always now and never a history.
    16:30 learning job (`80844bf`) with my addendum. Fixed today from what it
    found: holiday handling in the loop (`f8e719a`), the deadlines above, the
    watchdog real read, the time zone conversion, and ten stale Tuesday state
-   files quarantined out of `output/`. In flight: backlog 18 (rehearsal runs
+   files quarantined out of `output/`. DONE too: backlog 18 (rehearsal runs
    cannot write real state), 19 (reconciliation says "not checked" when the
-   broker is unreadable), alert stamps in New York time.
+   broker is unreadable) and 20 (alert stamps in New York time): `53c69d9`, `7801267`, `5a65b42`, `74f1601`.
 5. **Tuesday 09:38 checks: scheduled** (09:21 and 09:38 New York), not started.
 
 ## Stays as ruled
-All five books dry_run. Shorting off. Suite 1689 passing at `ba1a769`.
+All five books dry_run. Shorting off. Suite 1718 passing at `74f1601`. Tree clean, everything pushed.
