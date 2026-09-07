@@ -70,6 +70,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date as date_type, datetime, time as clock_time, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -884,6 +885,12 @@ class DayTradeVerdict:
     reason: str
     used: int | None = None
     would_have_blocked: bool = False
+    #: Which rulebook the answer was worked out under, old_pdt or new_imd or
+    #: unknown. On the record because the two regimes count completely
+    #: differently, and a month of these read back without it cannot be
+    #: interpreted at all. FINRA retired the old rule on 2026-06-04 and this
+    #: account's regime is not known until Tuesday's pre-flight asks.
+    regime: str = ""
 
 
 def make_day_trade_counter(guard: gr.Guardrails):
@@ -929,7 +936,8 @@ def day_trade_check(guard: gr.Guardrails, intent: gr.OrderIntent, today: date_ty
             blocked=not allowed,
             reason="; ".join(reasons) or "not a day trade",
             used=getattr(decision, "day_trades_used", None),
-            would_have_blocked=flagged)
+            would_have_blocked=flagged,
+            regime=str(getattr(decision, "regime", "") or ""))
 
     # No counter. The book file still knows whether this position was opened
     # today, which is the day trade test; what it cannot know is how many day
@@ -949,6 +957,28 @@ def day_trade_check(guard: gr.Guardrails, intent: gr.OrderIntent, today: date_ty
            else ", which day trades on purpose")
         + f", and agent/pdt.py is not loaded ({PDT_ERROR}), so the five day count is "
           "not known. Letting it through and writing it down.")
+
+
+def record_day_trade_row(tick: "BookTick", verdict: DayTradeVerdict) -> None:
+    """Where this book stands against the day trade limit, into the database.
+
+    Written from the check itself rather than once at the close, because
+    db.record_day_trade_counter ADDS ONE to would_have_blocked every time it is
+    told the rule bit. That running total is the only figure that says what the
+    pattern day trader limit is actually costing this experiment, and a single
+    write at the end of the day could not produce it. The row itself is one per
+    book per day, updated in place, so the repeated calls cost one row.
+
+    A verdict with no count behind it and no day trade in it writes nothing. A
+    book that never bought and sold the same name on the same day has nothing to
+    count, and a row of zeroes would read as though the counter had looked.
+    """
+    if verdict.used is None and not verdict.is_day_trade:
+        return
+    db_call("record_day_trade_counter", tick.book.book_id,
+            count_5d=verdict.used, regime=(verdict.regime or None),
+            blocked=bool(verdict.blocked or verdict.would_have_blocked),
+            date=tick.now.date(), ts=tick.now)
 
 
 # ------------------------------------------------------- shortlists and packets
@@ -3648,6 +3678,7 @@ def do_manage(tick: BookTick, state: bs.BookState, plan: BookPlan, guard: gr.Gua
             purpose="exit", book_id=tick.book.book_id)
 
         verdict = day_trade_check(guard, intent, today, counter, position.opened_on)
+        record_day_trade_row(tick, verdict)
         if verdict.blocked:
             tick.say(f"  NOT closing {symbol}: {verdict.reason}")
             tick.rule("pdt_limit", f"{symbol}: {verdict.reason}",
@@ -3988,6 +4019,7 @@ def do_flatten(tick: BookTick, state: bs.BookState, plan: BookPlan,
             qty=int(round(abs(position.qty))), limit_price=limit, purpose="flatten",
             book_id=tick.book.book_id)
         verdict = day_trade_check(guard, intent, today, counter, position.opened_on)
+        record_day_trade_row(tick, verdict)
         if verdict.blocked:
             tick.say(f"  NOT closing {symbol}: {verdict.reason}")
             tick.rule("pdt_limit", f"{symbol}: {verdict.reason}",
@@ -4021,6 +4053,30 @@ def write_daily(tick: BookTick, state: bs.BookState) -> None:
                f"realised {facts['realized_pnl_today']:,.2f}, "
                f"model spend {state.model_cost_today:.4f} dollars")
     tick.say(summary)
+
+    # The scoreboard row, into the database first. This is the only table where
+    # each book gets its own equity curve: the Sheet's Daily tab follows the one
+    # paper account all five books share, so it cannot.
+    #
+    # Four columns are deliberately left alone rather than filled with a guess.
+    # spy_close and max_drawdown_pct are not measured anywhere yet.
+    # rule_triggers is not tick.refused, which counts only this one tick at the
+    # close; the day's real count is a COUNT over the decisions table, where
+    # every guardrail firing already sits with its rule id on it, and it belongs
+    # to whatever reads the month back rather than here. missed_ticks needs an
+    # expected number of ticks to subtract from, and nothing works that out yet.
+    # Leaving a column NULL says "not measured". Writing a zero would say
+    # "measured, and it was none", which is a different and untrue thing.
+    fills = [row for row in (db_call("trades_for_date", tick.now.date()) or [])
+             if str(row.get("book_id") or "") == str(tick.book.book_id)]
+    commissions = round(sum(_number(row.get("commission")) for row in fills), 2)
+    db_call("upsert_daily_summary", tick.now.date(), tick.book.book_id,
+            start_equity=facts["day_start_equity"], end_equity=facts["equity"],
+            pnl_pct=facts.get("day_pnl_pct"),
+            trades=len(fills), commissions=(commissions or None),
+            model_cost_usd=state.model_cost_today or None,
+            notes=summary)
+
     tick.record(state, "", "daily summary", summary,
                 cost=state.model_cost_today or None)
     tick.rule("daily_summary", f"book {tick.book.book_id}: {summary}",
@@ -4216,6 +4272,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     when nobody could ask. It is what lifts a halt that was caused by a
     disagreement which no longer exists.
     """
+    started = monotonic()
     tick = BookTick(book, now, rules, write_ledger, quiet=quiet)
     tick.broker_orders = list(broker_orders or [])
     plan = plan_for(book, guard)
@@ -4327,6 +4384,7 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
     # tick can be counted from.
     db_call("record_tick", ts=now, book_id=book.book_id, phase=phase,
             mode=str(book.mode), rules_commit=rules,
+            duration_ms=int((monotonic() - started) * 1000),
             outcome=("halted" if state.halted else "ok"),
             notes="; ".join(tick.notes[:5]) or None)
 

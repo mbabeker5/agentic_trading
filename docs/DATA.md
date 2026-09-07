@@ -178,6 +178,21 @@ give each book its own equity curve, its own drawdown, or a count of the ticks
 it missed. Those three are exactly the columns that sit blank on the Books tab
 today. Here they are just columns.
 
+`write_daily()` in `agent/loop.py` fills the row at the close: both equity
+figures, the profit worked out from them inside `upsert_daily_summary`, the
+number of fills and the commissions on them read back out of the `fills` table,
+the model spend and the sentence a person reads. **Four columns are deliberately
+left NULL rather than zeroed**, and this is the distinction to hold on to: NULL
+means nothing measured this, a zero means something measured it and the answer
+was none. `spy_close` and `max_drawdown_pct` have nothing working them out
+anywhere yet. `rule_triggers` is a `COUNT` over the `decisions` table, where
+every guardrail firing already sits with its rule id on it, and it belongs to
+whatever reads the month back rather than to a book's own tick. `missed_ticks`
+needs an expected number of ticks to subtract the attended ones from, and
+nothing works that number out yet. Anything that reads this table has to treat a
+blank as unknown, because putting a made up zero in front of Mo is worse than
+putting nothing.
+
 **schema_version.** Which migration files have already been applied. That is the
 whole of how running the migration again does nothing.
 
@@ -196,8 +211,10 @@ What each of them writes:
 | `agent/loop.py` | `ticks` | one row per book per tick, whether or not anything happened |
 | `agent/loop.py` | `decisions` | every judgement, and every guardrail firing as a row marked `rejected` with the rule's own id in `reject_reason` |
 | `agent/loop.py` | `orders` | every order sent, and every order a dry run only worked out |
-| `agent/loop.py` | `fills` | every execution read back off the broker, deduplicated on IBKR's own execution id |
-| `agent/loop.py` | `position_snapshots` | what each book held at each tick, with the stop and the target on it |
+| `agent/loop.py` | `fills` | every execution read back off the broker, deduplicated on IBKR's own execution id. Nothing on `dry_run`: there is no execution to read, so this table is empty until a book is promoted |
+| `agent/loop.py` | `position_snapshots` | what each book held at each tick, with the stop and the target on it. A book holding nothing writes no row, so the snapshot for a flat book is the absence of one |
+| `agent/loop.py` | `day_trade_counters` | one row per book per day, written from the check itself rather than at the close, because `would_have_blocked` is added to each time the rule bit and that running total is what says what the limit costs |
+| `agent/loop.py` | `daily_book_summaries` | one row per book at the close. Four of its columns stay blank on purpose, see the table notes above |
 | `agent/alerts.py` | `alerts` | every alert and which channels actually delivered it |
 | `agent/preflight.py` | `preflight_results` | one row per morning check per day, updated if the checks run again |
 | `agent/watchdog.py` | `watchdog_checks` | one row per check per run, piling up all day |
@@ -207,6 +224,20 @@ once and the run carries on. `db_call()` in `agent/loop.py` is that wrapper, and
 `tests/test_db_wiring.py` is where it is proved: a database that will not answer
 costs a row, never a tick. The loop is what holds the risk limits, so recording
 what it did must never be the thing that stops it doing it.
+
+`db_call()` covers the loop only. `agent/alerts.py`, `agent/preflight.py` and
+`agent/watchdog.py` each guard their own writes with a `try`/`except` at the
+call site instead, which does the same job with the same outcome. Worth knowing
+before hunting for a wrapper that is not there.
+
+Three of the file's writers still have no caller in `agent/`: `record_scan`,
+`record_decision_result` and `record_regime`. The scanner and the sweeps have
+their own JSON output and have not been pointed here yet; judgements reach the
+database one at a time through `BookTick.record()` rather than a whole
+`DecisionResult`; and the regime reading is written into the settings by the
+9 AM pre-flight rather than into `regime_flags`. None of the three is wired, and
+a table with no writer is worth saying out loud rather than leaving to be
+discovered.
 
 This is what the change looks like at one call site.
 
@@ -263,13 +294,17 @@ on Google. The full list is at the top of
 `record_alert`, `record_preflight`, `record_watchdog`,
 `record_day_trade_counter`, `record_regime` and `upsert_daily_summary`.
 
-One of those is worth calling out. `record_decision_result` takes a whole
-`DecisionResult` from `agent/decide.py` and writes one row per name in it: a row
-for each pick, each skip, each exit and each rejection. The cost, the token
-counts and the latency go on the first row only and the rest carry nothing. That
-is deliberate. One model call has one price, and writing it on every row would
-multiply the month's spend by however many names the model happened to mention,
-which would make the whole cost comparison meaningless.
+One of those is worth calling out, and it is not in service yet.
+`record_decision_result` takes a whole `DecisionResult` from `agent/decide.py`
+and writes one row per name in it: a row for each pick, each skip, each exit and
+each rejection. The cost, the token counts and the latency go on the first row
+only and the rest carry nothing. That is deliberate. One model call has one
+price, and writing it on every row would multiply the month's spend by however
+many names the model happened to mention, which would make the whole cost
+comparison meaningless. Nothing calls it today; `agent/loop.py` writes
+judgements one at a time through `BookTick.record()`, which carries the cost on
+the row the model was actually called for and so lands in the same place by a
+different route.
 
 ## Two writers at the same time
 

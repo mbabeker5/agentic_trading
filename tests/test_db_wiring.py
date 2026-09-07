@@ -189,6 +189,141 @@ def test_a_flat_book_writes_no_snapshot_rows(database):
 
 
 # ---------------------------------------------------------------------------
+# The day trade counter and the daily scoreboard
+# ---------------------------------------------------------------------------
+
+
+def test_where_a_book_stands_against_the_day_trade_limit_is_written_down(database):
+    """One row per book per day, with the rulebook it was worked out under on it."""
+    tick = tick_for("C", at(14, 30))
+    loop.record_day_trade_row(tick, loop.DayTradeVerdict(
+        is_day_trade=True, blocked=True, reason="already made 3 in five days",
+        used=3, regime="old_pdt"))
+
+    row = rows(database, "SELECT * FROM day_trade_counters")[0]
+    assert row["book_id"] == "C"
+    assert row["date"] == "2026-09-08"
+    assert row["count_5d"] == 3
+    assert row["regime"] == "old_pdt", (
+        "FINRA retired the old rule on 2026-06-04, so a count read back without "
+        "the rulebook beside it cannot be interpreted at all")
+    assert row["would_have_blocked"] == 1
+
+
+def test_the_cost_of_the_rule_adds_up_across_the_day(database):
+    """would_have_blocked counts refusals, so it has to be added to, not replaced.
+
+    Book A day trades on purpose, so the limit only flags it. The number of
+    times it was flagged is the whole measurement: it is what says what the rule
+    would have cost had this been a live account held to it.
+    """
+    tick = tick_for("A", at(11, 0))
+    for _ in range(3):
+        loop.record_day_trade_row(tick, loop.DayTradeVerdict(
+            is_day_trade=True, blocked=False, reason="flagged only", used=4,
+            would_have_blocked=True, regime="old_pdt"))
+
+    counted = rows(database, "SELECT * FROM day_trade_counters")
+    assert len(counted) == 1, "one book on one day is one row, updated in place"
+    assert counted[0]["would_have_blocked"] == 3
+
+
+def test_a_book_that_never_day_traded_gets_no_counter_row(database):
+    """A row of zeroes reads as though the counter looked and found none."""
+    tick = tick_for("A", at(11, 0))
+    loop.record_day_trade_row(tick, loop.DayTradeVerdict(
+        is_day_trade=False, blocked=False,
+        reason="not a day trade, this position was not opened today"))
+    assert rows(database, "SELECT * FROM day_trade_counters") == []
+
+
+def test_the_end_of_day_scoreboard_lands_in_the_summaries_table(database):
+    """The one table where each book gets its own equity curve.
+
+    The Sheet's Daily tab follows the one paper account all five books share, so
+    this is the only place book A's day can be told apart from book E's.
+    """
+    tick = tick_for("A", at(16, 5))
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    state.realized_pnl_today = 1500.0      # a book is worth what it started the
+    state.model_cost_today = 0.0412        # day with plus what it has made since
+    loop.write_daily(tick, state)
+
+    row = rows(database, "SELECT * FROM daily_book_summaries")[0]
+    assert row["book_id"] == "A"
+    assert row["date"] == "2026-09-08"
+    assert row["start_equity"] == pytest.approx(100000.0)
+    assert row["end_equity"] == pytest.approx(101500.0)
+    assert row["pnl_usd"] == pytest.approx(1500.0), (
+        "worked out inside db.upsert_daily_summary from the two equity figures, "
+        "so the loop cannot disagree with the database about the same number")
+    assert row["model_cost_usd"] == pytest.approx(0.0412)
+    assert "end of day" in row["notes"]
+    assert state.daily_written is True
+
+
+def test_a_column_nothing_measures_is_left_empty_rather_than_zeroed(database):
+    """NULL says not measured. A zero says measured, and it was none.
+
+    spy_close, max_drawdown_pct, rule_triggers and missed_ticks have nothing
+    working them out yet. Writing zeroes into them would put four made up
+    numbers straight into the Sheet's Books tab.
+    """
+    tick = tick_for("A", at(16, 5))
+    state = bs.load_state("A", "BOOK_A", TUESDAY, capital=100000)
+    loop.write_daily(tick, state)
+
+    row = rows(database, "SELECT * FROM daily_book_summaries")[0]
+    for column in ("spy_close", "max_drawdown_pct", "rule_triggers",
+                   "missed_ticks"):
+        assert row[column] is None, f"{column} is not measured, so it must be blank"
+    assert row["trades"] == 0, "no fills is a measured zero, not a blank"
+
+
+def test_a_whole_tick_writes_down_how_long_it_took(database, tmp_path, monkeypatch):
+    """A tick with no duration on it cannot be told from a tick that never ran.
+
+    The attendance register is the only place a missed tick can ever be counted
+    from, so the row has to say the tick happened AND how long it took.
+    """
+    for name in ("config", "strategies", "agent", "venv312"):
+        (tmp_path / name).symlink_to(REPO / name)
+    (tmp_path / "output").mkdir(exist_ok=True)
+    monkeypatch.setenv(loop.ROOT_ENV_VAR, str(tmp_path))
+    monkeypatch.delenv(loop.LIVE_ENV_VAR, raising=False)
+
+    class Quiet:
+        def account_summary(self, account=None):
+            return {"items": []}
+
+        def portfolio(self, account=None, include_pnl=True):
+            return {"positions": []}
+
+        def open_orders(self, account=None, include_all=True):
+            return {"orders": []}
+
+        def executions(self, account=None, **kwargs):
+            return {"executions": []}
+
+        def snapshot(self, contracts, market_data_type=3):
+            return {"snapshots": []}
+
+        def historical_bars(self, contract, duration, bar_size, **kwargs):
+            return {"bars": []}
+
+    book = gr.load_book(BOOKS_YAML, "A")
+    guard = gr.load_book_guardrails(BOOKS_YAML, "A")
+    loop.run_book(book, guard, at(9, 40), loop.read_guards(), Quiet(),
+                  "DUT077572", {}, "testhash", write_ledger=False, quiet=True)
+
+    row = rows(database, "SELECT * FROM ticks")[0]
+    assert row["book_id"] == "A"
+    assert row["rules_commit"] == "testhash"
+    assert row["duration_ms"] is not None
+    assert 0 <= row["duration_ms"] < 60000
+
+
+# ---------------------------------------------------------------------------
 # A database that will not answer costs a row, never a tick
 # ---------------------------------------------------------------------------
 
