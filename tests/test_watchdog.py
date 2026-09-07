@@ -747,8 +747,9 @@ def test_the_time_zone_check_is_asked_even_when_the_market_is_shut(monkeypatch):
                         lambda: wd.Check(wd.CHECK_GATEWAY_PROCESS, ok=True))
     monkeypatch.setattr(wd, "check_gateway_port",
                         lambda *a, **k: wd.Check(wd.CHECK_GATEWAY_PORT, ok=True))
-    monkeypatch.setattr(wd, "check_ib_and_market_data",
+    monkeypatch.setattr(wd, "check_ib",
                         lambda **k: (wd.Check(wd.CHECK_IB_CONNECT, ok=True),
+                                     wd.Check(wd.CHECK_IB_ANSWERS, ok=True),
                                      wd.Check(wd.CHECK_MARKET_DATA, ok=True)))
     monkeypatch.setattr(wd, "check_disk",
                         lambda *a, **k: wd.Check(wd.CHECK_DISK, ok=True))

@@ -1,6 +1,6 @@
 """The thing that watches the trading plumbing and tells Mo when it breaks.
 
-One run of this script is one health check. It looks at six things, decides
+One run of this script is one health check. It looks at eight things, decides
 what to do about what it found, and exits. launchd wakes it every five minutes
 during market hours and once an hour the rest of the time. See
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md
@@ -17,18 +17,26 @@ What it checks
 3. ib_connect       A read only connection gets through and the account it
                     reports is DUT077572, the paper account. Read only, so this
                     connection cannot place an order even by accident.
-4. market_data      SPY quotes are real time rather than delayed. IBKR error
+4. ib_answers       That same connection asks a real question, for the list of
+                    positions, and gets an answer inside twenty seconds. A
+                    Gateway that has lost its upstream connection to IBKR still
+                    accepts logins and still hands over the account id, so the
+                    first three checks all pass while nothing works. This is the
+                    one that catches it. Added 2026-09-07 after two outages in
+                    one day, both of them invisible to checks 1 to 3.
+5. market_data      SPY quotes are real time rather than delayed. IBKR error
                     354 means the subscription is missing and we are on delayed
                     prices. Error 10197 means a competing live session: Mo has a
                     quote screen or the mobile app open on the live login and it
                     has taken the data feed. That one is never Gateway's fault,
                     so it never causes a restart.
-5. loop_tick        The trading loop wrote a tick recently. Checked only during
+6. loop_tick        The trading loop wrote a tick recently. Checked only during
                     market hours, and only when the loop's launchd job is
                     loaded, because a loop that was never switched on has no
                     heartbeat to miss.
-6. disk_free        More than one gigabyte free. IB Gateway writes a lot of logs
+7. disk_free        More than one gigabyte free. IB Gateway writes a lot of logs
                     and a full disk fails everything at once.
+8. time_zone        The launchd jobs still fire at the right New York minute.
 
 What it does about it
 ---------------------
@@ -39,17 +47,19 @@ actions. It reads no files and sends nothing, which is why it can be tested
 properly. The rules are:
 
 * The first time a check misses, alert once.
-* If that miss is IB Gateway being down, also schedule exactly one restart
-  attempt through agent/start_gateway.sh. One attempt per outage, not one per
-  wake up, and never a second Gateway on top of a running one.
+* If that miss is IB Gateway being down, or Gateway being up and not answering,
+  also schedule exactly one restart attempt through agent/start_gateway.sh. One
+  attempt per outage, not one per wake up, and never a second Gateway on top of
+  a running one: when a Gateway is sitting there useless, agent/stop_gateway.sh
+  runs first and the start only follows once it is gone.
 * A restart only counts once it has been proved. The start script exiting 0
   proves nothing, because that script becomes Gateway when it works. So the
   watchdog looks at Gateway before it starts anything, then watches for two
-  minutes and wants all three of: a different process id, a "Login has
-  completed" line in the IBC log newer than the one it saw before, and port
-  4002 accepting a connection. Anything less is a "restart did not take"
-  message that says which of the three did and did not happen, and the attempt
-  is not written down as an attempt.
+  minutes and wants all four of: a different process id, a "Login has
+  completed" line in the IBC log newer than the one it saw before, port 4002
+  accepting a connection, and a read that actually comes back. Anything less is
+  a "restart did not take" message that says which of the four did and did not
+  happen, and the attempt is not written down as an attempt.
 * A check that keeps missing re-alerts at most every thirty minutes, so an
   outage over lunch is two or three messages rather than fifty.
 * A check that comes back alerts once, at level info, so Mo knows it is over.
@@ -60,6 +70,25 @@ What it can never do
 
 Place an order, change an order, or cancel one. The only broker connection it
 opens is read only, and the only thing it can start is IB Gateway itself.
+
+How long a run can take
+-----------------------
+
+launchd wakes this every five minutes, so a run that hangs would be found still
+going by the next one. Two bounds stop that. The checks share a ninety second
+wall clock deadline: when it runs out, whatever has not been asked yet is
+reported as skipped rather than asked, so the run always finishes and always
+writes its line. A restart attempt sits outside that deadline on purpose, since
+proving a restart takes two minutes by design, but it is bounded too: at most
+sixty seconds stopping the old Gateway and a hundred and twenty proving the new
+one. Ninety plus sixty plus a hundred and twenty is two hundred and seventy
+seconds, still inside the five minute gap.
+
+If an earlier copy is somehow still running, its API client id is still taken,
+and connecting on a taken id gives IBKR error 326. That is not a broken Gateway
+and must not be reported as one, so the watchdog moves to a spare id and says
+in its own log that the previous copy has not finished. This is not
+hypothetical: it happened at 09:40 on 2026-09-07.
 
 Flags
 -----
@@ -86,6 +115,7 @@ A one line summary of every run is appended to
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -127,6 +157,33 @@ PAPER_ACCOUNT = "DUT077572"
 #: pre-flight. This is 250.
 CLIENT_ID = 250
 
+#: Where to go when 250 is taken. IBKR answers a connection on an id another
+#: session already holds with error 326, and the only copy that ever holds 250
+#: is an earlier watchdog run that has not finished. That is a watchdog problem,
+#: not a Gateway problem, so it must not be reported as one.
+#:
+#: The range is 2500 to 2502 on purpose: three is enough for the overlap of two
+#: or three stuck runs, and four digits starting with 25 keeps them clearly the
+#: watchdog's own while staying far away from every id in use today (99, 100,
+#: 201, 250, 251, 252, 260, 261, 282). Nothing else in this project may take an
+#: id in this range.
+SPARE_CLIENT_IDS = (2500, 2501, 2502)
+
+#: How long a read is given before the Gateway counts as not answering. Twenty
+#: seconds. A healthy Gateway answers a positions request in well under a
+#: tenth of a second, so this is not a tight bound, it is the difference
+#: between slow and dead.
+ANSWER_TIMEOUT_SECONDS = 20
+
+#: The whole run of checks gets this long. See "How long a run can take" above.
+RUN_DEADLINE_SECONDS = 90
+
+#: Stopping a stuck Gateway before starting a new one. agent/stop_gateway.sh
+#: waits thirty seconds on the IBC command port and fifteen more after a TERM,
+#: so sixty is enough for the slow path and short enough to stay inside the
+#: five minute gap between wake ups.
+STOP_TIMEOUT_SECONDS = 60
+
 #: The launchd job that runs the trading loop. Used only to tell "the loop is
 #: late" apart from "the loop was never switched on".
 TICK_JOB_LABEL = "com.mtalib.agentic-trading.tick"
@@ -157,6 +214,12 @@ CODE_NO_SUBSCRIPTION = 354        # not subscribed, delayed prices only
 CODE_NO_API_SUBSCRIPTION = 10089  # needs an extra subscription for the API
 CODE_NOT_SUBSCRIBED = 10168       # not subscribed and delayed is not enabled either
 CODE_COMPETING_SESSION = 10197    # a live login is holding the market data feed
+CODE_CLIENT_ID_IN_USE = 326       # another session already has this client id
+CODE_UPSTREAM_BROKEN = 2110       # "Connectivity between Trader Workstation and
+                                  # server is broken." Gateway is logged in and
+                                  # cut off from IBKR at the same time, which is
+                                  # the exact state that fooled every check on
+                                  # the night of 2026-09-06 into 2026-09-07.
 
 #: The three codes that all mean the same thing: no real time quotes for us.
 #: IBKR picks between them depending on what it was last asked for, so all three
@@ -172,6 +235,7 @@ IBC_NIGHTLY_RESTART = (clock_time(1, 45), clock_time(2, 30))
 CHECK_GATEWAY_PROCESS = "gateway_process"
 CHECK_GATEWAY_PORT = "gateway_port"
 CHECK_IB_CONNECT = "ib_connect"
+CHECK_IB_ANSWERS = "ib_answers"
 CHECK_MARKET_DATA = "market_data"
 CHECK_LOOP_TICK = "loop_tick"
 CHECK_DISK = "disk_free"
@@ -183,6 +247,7 @@ CHECK_ORDER = (
     CHECK_GATEWAY_PROCESS,
     CHECK_GATEWAY_PORT,
     CHECK_IB_CONNECT,
+    CHECK_IB_ANSWERS,
     CHECK_MARKET_DATA,
     CHECK_LOOP_TICK,
     CHECK_DISK,
@@ -190,7 +255,7 @@ CHECK_ORDER = (
 )
 
 #: Only a miss on one of these can lead to starting IB Gateway.
-RESTART_CHECKS = (CHECK_GATEWAY_PROCESS, CHECK_GATEWAY_PORT)
+RESTART_CHECKS = (CHECK_GATEWAY_PROCESS, CHECK_GATEWAY_PORT, CHECK_IB_ANSWERS)
 
 ACTION_ALERT = "alert"
 ACTION_RESTART = "restart_gateway"
@@ -206,6 +271,11 @@ WHAT_TO_DO = {
     CHECK_IB_CONNECT: (
         "Gateway is up but will not hand over the account. Check it is logged "
         "into the paper account and that the API is enabled on port 4002."),
+    CHECK_IB_ANSWERS: (
+        "Gateway is logged in and cut off from IBKR at the same time, so every "
+        "read hangs. Nothing you do inside the Gateway window fixes this. Stop "
+        "it with agent/stop_gateway.sh and start it with agent/start_gateway.sh; "
+        "the watchdog is already trying that once itself."),
     CHECK_MARKET_DATA: (
         "The agent is pricing from stale or delayed quotes. Close any IBKR quote "
         "screen, Client Portal watchlist or mobile app on the live login, or "
@@ -273,11 +343,14 @@ class GatewayProbe:
 class RestartOutcome:
     """Whether a restart really happened, and the evidence either way.
 
-    took            all three proofs came back. Only this counts as a restart.
+    took            every proof came back. Only this counts as a restart.
     new_pid         the process id changed.
     fresh_login     the IBC log has a newer login than before the restart.
     port_open       port 4002 is accepting connections again.
-    detail          the three lines a person reads to see what did not happen.
+    answers         a read came back from the new Gateway. None means the
+                    question was never reached, because one of the first three
+                    had already failed and there was nothing worth asking.
+    detail          the lines a person reads to see what did not happen.
     waited_seconds  how long we watched before giving up or being satisfied.
     """
     took: bool
@@ -286,19 +359,66 @@ class RestartOutcome:
     port_open: bool
     detail: str
     waited_seconds: int = 0
+    answers: bool | None = None
 
 
 @dataclass
 class Schedule:
-    """When the market is open, and how often the loop is meant to wake up."""
+    """When the market is open, and how often the loop is meant to wake up.
+
+    holidays is the days the US market is shut that are not weekends, held as
+    plain "YYYY-MM-DD" strings exactly as config/guardrails.yaml writes them,
+    the same way agent/deadman.py holds them.
+    """
     open_at: clock_time = clock_time(9, 30)
     close_at: clock_time = clock_time(16, 0)
+    holidays: tuple = ()
     loop_minutes: int = 5
 
     @property
     def stale_after(self) -> timedelta:
         """Two loop intervals. Past this, the loop's heartbeat counts as missed."""
         return timedelta(minutes=2 * self.loop_minutes)
+
+
+class Deadline:
+    """A wall clock budget for one run of the checks.
+
+    launchd wakes the watchdog every five minutes, so a check that hangs would
+    leave the last run still going when the next one arrives, and by 09:40 on
+    2026-09-07 that had already happened: a stuck copy still held client id 250
+    and the fresh copy could not connect at all.
+
+    Every check is bounded on its own, but bounded things add up, so the run
+    carries this as well. Before each remaining check the run asks whether there
+    is time left; when there is not, the rest are reported as skipped rather
+    than asked. Skipped is the honest answer: nobody looked. It raises no alert
+    and clears nothing that was known, so a run that ran out of time is quiet
+    rather than wrong.
+
+    clock is swappable so tests can make time pass without waiting for it.
+    """
+
+    def __init__(self, seconds: float = RUN_DEADLINE_SECONDS, clock=time.monotonic):
+        self.seconds = seconds
+        self.clock = clock
+        self.started = clock()
+
+    def elapsed(self) -> float:
+        return self.clock() - self.started
+
+    def remaining(self) -> float:
+        return max(0.0, self.seconds - self.elapsed())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+    def out_of_time(self, name: str) -> Check:
+        """The skipped Check to report for something there was no time to ask."""
+        return Check(name, ok=True, skipped=True,
+                     detail=(f"not checked, the run ran out of time after "
+                             f"{self.elapsed():.0f} seconds of its "
+                             f"{self.seconds:.0f} second budget"))
 
 
 # ------------------------------------------------------------------- settings
@@ -327,13 +447,33 @@ def load_schedule() -> Schedule:
     return Schedule(
         open_at=_parse_clock(block.get("scan_start"), default.open_at),
         close_at=_parse_clock(block.get("market_close"), default.close_at),
+        holidays=tuple(str(day) for day in (block.get("holidays") or [])),
         loop_minutes=int(block.get("loop_minutes") or default.loop_minutes),
     )
 
 
-def in_market_hours(now: datetime, schedule: Schedule) -> bool:
-    """True on a weekday between the open and the close. Holidays are not known here."""
+def is_trading_day(now: datetime, schedule: Schedule) -> bool:
+    """True when the US market trades on the day this moment falls on.
+
+    A weekday that is not one of the days named in schedule.holidays. Read
+    straight off the schedule rather than by importing agent/guardrails.py, for
+    the same reason load_schedule() reads the YAML itself: a watchdog run must
+    not be breakable by work in progress on the guardrails. agent/guardrails.py
+    answers the same question with is_trading_date() for everything that does
+    hold a Guardrails object.
+
+    Why it exists: on 2026-09-07, Labor Day, the market_data check reported a
+    miss every five minutes all day because the market was shut and the quotes
+    were delayed. A closed Monday has to be as quiet as a Saturday.
+    """
     if now.weekday() >= 5:
+        return False
+    return f"{now.date():%Y-%m-%d}" not in (schedule.holidays or ())
+
+
+def in_market_hours(now: datetime, schedule: Schedule) -> bool:
+    """True on a trading day between the open and the close."""
+    if not is_trading_day(now, schedule):
         return False
     return schedule.open_at <= now.time() < schedule.close_at
 
@@ -383,20 +523,30 @@ def _as_check(name: str, value) -> Check:
 def _may_restart(check: Check, checks: dict[str, Check]) -> bool:
     """Whether this miss is the kind that starting IB Gateway would fix.
 
-    Three conditions, all of them on purpose:
+    Two ways in, and they are not the same shape.
 
-    * the failing check is one of the two that say Gateway is down;
-    * the message code is not 10197, which means Mo's own quote screen has the
-      data feed and Gateway is perfectly healthy;
-    * no Gateway process is running. Starting a second Gateway on top of a
-      running one gives two logins fighting over the same session, which is
-      worse than the hang it was meant to fix. A hung Gateway needs stopping
-      first, and that is a decision for a person.
+    ib_answers is the straightforward one. A Gateway that is logged in and not
+    answering is dead machinery whatever its process list says, and the only
+    thing that has ever fixed it is a stop and a start. So it is allowed on its
+    own. restart_gateway() stops the old copy first in that case, which is why
+    this can say yes to a Gateway that is running.
+
+    gateway_process and gateway_port are the older way in, and they still want
+    no Gateway process running at all. Starting a second Gateway on top of a
+    running one gives two logins fighting over the same session, which is worse
+    than the hang it was meant to fix, and a port that is shut on a process that
+    is up tells us nothing about whether that process is mid-start or wedged.
+    That one stays a decision for a person.
+
+    Either way, message code 10197 is never a reason. It means Mo's own quote
+    screen has the data feed and Gateway is perfectly healthy.
     """
     if check.name not in RESTART_CHECKS:
         return False
     if check.code == CODE_COMPETING_SESSION:
         return False
+    if check.name == CHECK_IB_ANSWERS:
+        return True
     process = checks.get(CHECK_GATEWAY_PROCESS)
     return process is not None and not process.ok and not process.skipped
 
@@ -413,10 +563,11 @@ def _stamp(moment: datetime | None) -> str:
 
 def judge_restart(before: GatewayProbe, after: GatewayProbe,
                   launch_exit: int | None = None,
-                  waited_seconds: int = 0) -> RestartOutcome:
-    """Did the restart actually take? Pure: it only reads its two arguments.
+                  waited_seconds: int = 0,
+                  answers: bool | None = None) -> RestartOutcome:
+    """Did the restart actually take? Pure: it only reads its arguments.
 
-    Three proofs, and all three have to be there, because each one on its own
+    Four proofs, and all of them have to be there, because each one on its own
     can lie:
 
     * a different process id. The same process id back again does not mean
@@ -427,8 +578,17 @@ def judge_restart(before: GatewayProbe, after: GatewayProbe,
       new process id on its own is not a Gateway anyone can trade through.
     * port 4002 accepting a connection. Logged in but not listening is exactly
       the hang this watchdog exists to catch.
+    * a read that comes back. Added 2026-09-07, because the outage that day had
+      all of the first three and still could not answer a single request: the
+      process was new, the login was fresh, the port was open, and IBKR was not
+      there. The first three are all local; this is the only one that proves
+      anything about the other end.
 
-    The start script's exit code short circuits all three. agent/start_gateway.sh
+    answers is None when nobody asked, which is what happens when one of the
+    first three had already failed and there was no point. That is not counted
+    against the restart, it just is not counted for it either.
+
+    The start script's exit code short circuits the lot. agent/start_gateway.sh
     becomes Gateway when it works and never returns, so any exit code at all
     means it gave up first, usually a missing credentials file or a Gateway
     version that is not installed.
@@ -446,16 +606,24 @@ def judge_restart(before: GatewayProbe, after: GatewayProbe,
     port_open = bool(after.port_open)
 
     yes_no = {True: "yes", False: "no"}
-    detail = "\n".join([
+    lines = [
         f"  a different process id: {yes_no[new_pid]} "
         f"(was {before.pid or 'nothing running'}, now {after.pid or 'nothing running'})",
         f"  a newer login in the IBC log: {yes_no[fresh_login]} "
         f"(was {_stamp(before.login_at)}, now {_stamp(after.login_at)})",
         f"  port {GATEWAY_PORT} accepting connections: {yes_no[port_open]}",
-    ])
-    return RestartOutcome(took=new_pid and fresh_login and port_open,
+    ]
+    if answers is None:
+        lines.append("  IBKR answering a read: not asked, "
+                     "one of the first three had already failed")
+    else:
+        lines.append(f"  IBKR answering a read: {yes_no[bool(answers)]}")
+
+    return RestartOutcome(took=new_pid and fresh_login and port_open
+                          and answers is not False,
                           new_pid=new_pid, fresh_login=fresh_login,
-                          port_open=port_open, detail=detail,
+                          port_open=port_open, answers=answers,
+                          detail="\n".join(lines),
                           waited_seconds=waited_seconds)
 
 
@@ -468,8 +636,8 @@ def restart_did_not_take_alert(check: str, outcome: RestartOutcome) -> Action:
               f"what was and was not seen in the {outcome.waited_seconds} seconds "
               "after it was started:\n\n"
               f"{outcome.detail}\n\n"
-              "All three have to be true before this counts as a restart, so it is "
-              "not being written down as one.\n\n"
+              "All of them have to be true before this counts as a restart, so it "
+              "is not being written down as one.\n\n"
               "What to do: run agent/start_gateway.sh yourself and watch the Gateway "
               "window. IBKR Mobile may be waiting for you to approve the login. "
               "output/gateway_launch.log and output/ibc_logs hold what happened."))
@@ -723,22 +891,114 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not math.isnan(float(value))
 
 
-def check_ib_and_market_data(port_ok: bool, market_hours: bool = True,
-                            client_id: int = CLIENT_ID) -> tuple[Check, Check]:
-    """One read only connection, two answers: the login and the quote feed.
+def _connect_read_only(ib, codes: list[int], client_id: int = CLIENT_ID,
+                       spares=SPARE_CLIENT_IDS):
+    """Get a read only session, moving off our own client id if it is taken.
+
+    Returns (client_id used, note, failures). A client_id of None means no id
+    worked and failures says what each one said. The note is empty on the
+    ordinary path and says which spare was used, and why, when it was not.
+
+    IBKR answers a connection on an id that another session already holds with
+    error 326, and ib_async may show it either as that code on the error event
+    or as a closed socket whose message mentions the id. Both are checked,
+    because at 09:40 on 2026-09-07 this run saw the code and the message.
+
+    The only thing that ever holds client id 250 is an earlier watchdog that has
+    not finished, so this is never news about IB Gateway and must never be
+    reported as ib_connect failing. Moving to a spare gets the run its answers
+    and leaves a line saying the other copy is still there.
+    """
+    failures: list[str] = []
+    for index, candidate in enumerate((client_id, *spares)):
+        before = len(codes)
+        try:
+            ib.connect(GATEWAY_HOST, GATEWAY_PORT, clientId=candidate,
+                       timeout=15, readonly=True)
+        except Exception as exc:                                  # noqa: BLE001
+            failures.append(f"client id {candidate}: {exc}")
+            taken = (CODE_CLIENT_ID_IN_USE in codes[before:]
+                     or "already in use" in str(exc).lower())
+            if not taken:
+                return None, "", failures
+            continue
+        if index == 0:
+            return candidate, "", failures
+        return candidate, (
+            f" Client id {client_id} was already in use, so an earlier watchdog "
+            f"copy is still running and this one moved to the spare id "
+            f"{candidate}."), failures
+    return None, "", failures
+
+
+def _positions_answer(ib, timeout: int = ANSWER_TIMEOUT_SECONDS,
+                      codes: list[int] | None = None) -> Check:
+    """Ask the open connection a real question and hold it to twenty seconds.
+
+    This is the check that the outages of 2026-09-07 needed and did not have.
+    Gateway kept its port open and its login all night while its own upstream
+    connection to IBKR was gone, so the handshake proved nothing: every
+    reqPositions, account update and reqExecutions simply never came back.
+
+    Two ways to fail, and they are the same illness:
+
+    * the request does not answer inside the bound. ib_async raises
+      asyncio.TimeoutError once ib.RequestTimeout is set, and that setting also
+      caps everything else asked on this connection.
+    * IBKR says warning 2110, "Connectivity between Trader Workstation and
+      server is broken", which is Gateway admitting it up front.
+    """
+    seen = codes if codes is not None else []
+    before = len(seen)
+    started = time.monotonic()
+    try:
+        positions = ib.reqPositions()
+    except Exception as exc:                                      # noqa: BLE001
+        took = time.monotonic() - started
+        reason = (f"positions request timed out after {timeout} s"
+                  if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                  else f"the positions request failed after {took:.0f} s: {exc}")
+        return Check(CHECK_IB_ANSWERS, ok=False,
+                     detail=(f"Gateway is logged in but IBKR is not answering "
+                             f"({reason}); it has lost its upstream connection."))
+    took = time.monotonic() - started
+
+    if CODE_UPSTREAM_BROKEN in seen[before:]:
+        return Check(CHECK_IB_ANSWERS, ok=False, code=CODE_UPSTREAM_BROKEN,
+                     detail=("Gateway is logged in but IBKR is not answering "
+                             f"(IBKR warning {CODE_UPSTREAM_BROKEN}, connectivity "
+                             "between Trader Workstation and server is broken); "
+                             "it has lost its upstream connection."))
+
+    held = len(list(positions or []))
+    return Check(CHECK_IB_ANSWERS, ok=True,
+                 detail=(f"Gateway answered a positions request in {took:.2f} s, "
+                         f"{held} position{'' if held == 1 else 's'}."))
+
+
+def check_ib(port_ok: bool, market_hours: bool = True,
+             client_id: int = CLIENT_ID,
+             ask_answers: bool = True) -> tuple[Check, Check, Check]:
+    """One read only connection, three answers: the login, a read, the quotes.
 
     readonly=True on purpose. A read only API session cannot place, change or
     cancel an order, so the watchdog cannot touch the account even if something
     in it went badly wrong.
 
-    The quote half is only asked while the market is open. Nothing is trading at
-    nine in the evening, so "no bid came back" would mean nothing then, and the
-    watchdog would spend every night saying so.
+    The read is only asked once the login came back with the right account,
+    because there is nothing to ask on otherwise, and the quote half is only
+    asked while the market is open. Nothing is trading at nine in the evening,
+    so "no bid came back" would mean nothing then, and the watchdog would spend
+    every night saying so.
     """
     skipped_data = Check(CHECK_MARKET_DATA, ok=True, skipped=True,
                          detail="not checked, there was no connection to ask on")
+    skipped_answers = Check(CHECK_IB_ANSWERS, ok=True, skipped=True,
+                            detail="not checked, there was no connection to ask on")
     if not port_ok:
         return (Check(CHECK_IB_CONNECT, ok=True, skipped=True,
+                      detail="not checked, the port is shut"),
+                Check(CHECK_IB_ANSWERS, ok=True, skipped=True,
                       detail="not checked, the port is shut"),
                 skipped_data)
 
@@ -746,32 +1006,41 @@ def check_ib_and_market_data(port_ok: bool, market_hours: bool = True,
         from ib_async import IB, Stock
     except Exception as exc:                                      # noqa: BLE001
         return (Check(CHECK_IB_CONNECT, ok=False,
-                      detail=f"ib_async will not import: {exc}"), skipped_data)
+                      detail=f"ib_async will not import: {exc}"),
+                skipped_answers, skipped_data)
 
     codes: list[int] = []
     ib = IB()
+    # One bound for everything asked on this connection, which is what stops a
+    # hung Gateway holding the whole run open. ib_async reads it on the instance.
+    ib.RequestTimeout = ANSWER_TIMEOUT_SECONDS
     ib.errorEvent += lambda reqId, code, msg, *rest: codes.append(code)
     try:
-        try:
-            ib.connect(GATEWAY_HOST, GATEWAY_PORT, clientId=client_id,
-                       timeout=15, readonly=True)
-        except Exception as exc:                                  # noqa: BLE001
+        used, note, failures = _connect_read_only(ib, codes, client_id)
+        if used is None:
             return (Check(CHECK_IB_CONNECT, ok=False,
-                          detail=f"Could not connect to IB Gateway: {exc}"),
-                    skipped_data)
+                          detail="Could not connect to IB Gateway: "
+                                 + "; ".join(failures)),
+                    skipped_answers, skipped_data)
 
         accounts = list(ib.managedAccounts() or [])
         if PAPER_ACCOUNT not in accounts:
             return (Check(CHECK_IB_CONNECT, ok=False,
                           detail=(f"Gateway answered with accounts {accounts or 'none'}, "
                                   f"not the paper account {PAPER_ACCOUNT}.")),
-                    skipped_data)
+                    skipped_answers, skipped_data)
         connect = Check(CHECK_IB_CONNECT, ok=True,
-                        detail=f"Connected read only, account {PAPER_ACCOUNT}.")
+                        detail=f"Connected read only, account {PAPER_ACCOUNT}.{note}")
+
+        answers = (_positions_answer(ib, ANSWER_TIMEOUT_SECONDS, codes)
+                   if ask_answers else
+                   Check(CHECK_IB_ANSWERS, ok=True, skipped=True,
+                         detail="not asked for on this connection"))
 
         if not market_hours:
-            return connect, Check(CHECK_MARKET_DATA, ok=True, skipped=True,
-                                  detail="not checked, the market is shut")
+            return connect, answers, Check(
+                CHECK_MARKET_DATA, ok=True, skipped=True,
+                detail="not checked, the market is shut")
 
         spy = Stock("SPY", "SMART", "USD")
         try:
@@ -782,24 +1051,26 @@ def check_ib_and_market_data(port_ok: bool, market_hours: bool = True,
             bid, ask = ticker.bid, ticker.ask
             ib.cancelMktData(spy)
         except Exception as exc:                                  # noqa: BLE001
-            return connect, Check(CHECK_MARKET_DATA, ok=False,
-                                  detail=f"Asking for a SPY quote failed: {exc}")
+            return connect, answers, Check(
+                CHECK_MARKET_DATA, ok=False,
+                detail=f"Asking for a SPY quote failed: {exc}")
 
         if CODE_COMPETING_SESSION in codes:
-            return connect, Check(
+            return connect, answers, Check(
                 CHECK_MARKET_DATA, ok=False, code=CODE_COMPETING_SESSION, level="warn",
                 detail=("Competing live session: Mo has a live quote screen or the IBKR "
                         "app open and it is holding the market data feed. Close it."))
         subscription_problem = next((c for c in codes if c in NOT_SUBSCRIBED_CODES), None)
         if subscription_problem is not None:
-            return connect, Check(
+            return connect, answers, Check(
                 CHECK_MARKET_DATA, ok=False, code=subscription_problem, level="warn",
                 detail=(f"IBKR message {subscription_problem}: not subscribed to real "
                         "time data for the API, so SPY is on delayed prices only."))
         if _is_number(bid) and _is_number(ask):
-            return connect, Check(CHECK_MARKET_DATA, ok=True,
-                                  detail=f"SPY real time quote, bid {bid} ask {ask}.")
-        return connect, Check(
+            return connect, answers, Check(
+                CHECK_MARKET_DATA, ok=True,
+                detail=f"SPY real time quote, bid {bid} ask {ask}.")
+        return connect, answers, Check(
             CHECK_MARKET_DATA, ok=False, level="warn",
             detail=("Asked for a real time SPY quote and no bid or ask came back "
                     f"within five seconds. Gateway messages: {sorted(set(codes)) or 'none'}."))
@@ -809,6 +1080,34 @@ def check_ib_and_market_data(port_ok: bool, market_hours: bool = True,
                 ib.disconnect()
         except Exception:                                         # noqa: BLE001
             pass
+
+
+def check_ib_and_market_data(port_ok: bool, market_hours: bool = True,
+                             client_id: int = CLIENT_ID) -> tuple[Check, Check]:
+    """The login and the quote feed, without the read in between.
+
+    Kept because agent/preflight.py asks for exactly these two and nothing else.
+    The pre-flight runs at 09:00 with its own timings to keep, so it is not made
+    to sit through a twenty second read it never asked for.
+    """
+    connect, _answers, data = check_ib(port_ok, market_hours=market_hours,
+                                       client_id=client_id, ask_answers=False)
+    return connect, data
+
+
+def ask_ib_answers(client_id: int = CLIENT_ID) -> Check:
+    """Open a read only connection of our own and ask the one bounded question.
+
+    Used as the fourth proof that a restart took: a Gateway that came back with
+    a new process id, a fresh login and an open port, and still cannot answer a
+    read, has not come back at all.
+    """
+    connect, answers, _data = check_ib(port_ok=True, market_hours=False,
+                                       client_id=client_id)
+    if connect.skipped or not connect.ok:
+        return Check(CHECK_IB_ANSWERS, ok=False,
+                     detail=f"could not ask: {connect.detail}")
+    return answers
 
 
 def tick_job_loaded(label: str = TICK_JOB_LABEL) -> bool:
@@ -932,21 +1231,43 @@ def check_disk(floor: int = DISK_FLOOR_BYTES) -> Check:
     return Check(CHECK_DISK, ok=True, detail=f"{free_gb:.1f} GB free.")
 
 
-def run_checks(now: datetime, schedule: Schedule) -> dict[str, Check]:
-    """Do all seven checks and hand back the results, in the usual order."""
+def run_checks(now: datetime, schedule: Schedule,
+               deadline: Deadline | None = None) -> dict[str, Check]:
+    """Do all eight checks and hand back the results, in the usual order.
+
+    The whole set shares one ninety second budget. Before each remaining check
+    the budget is asked whether there is time left, and once there is not, the
+    rest come back skipped rather than asked. So a check that hangs costs the
+    run the checks after it, not the run itself: the line still gets written and
+    launchd's next wake up never finds this one still going.
+
+    The IB connection is the only expensive one here and it carries three of the
+    eight, so it is asked as one block.
+    """
+    deadline = deadline or Deadline()
     market_hours = in_market_hours(now, schedule)
-    process = check_gateway_process()
-    port = check_gateway_port()
-    connect, data = check_ib_and_market_data(port_ok=port.ok, market_hours=market_hours)
-    return {
-        CHECK_GATEWAY_PROCESS: process,
-        CHECK_GATEWAY_PORT: port,
-        CHECK_IB_CONNECT: connect,
-        CHECK_MARKET_DATA: data,
-        CHECK_LOOP_TICK: check_loop_tick(now, schedule, market_hours),
-        CHECK_DISK: check_disk(),
-        CHECK_TIME_ZONE: check_time_zone(now),
-    }
+    results: dict[str, Check] = {}
+
+    def ask(name: str, work):
+        results[name] = deadline.out_of_time(name) if deadline.expired() else work()
+
+    ask(CHECK_GATEWAY_PROCESS, check_gateway_process)
+    ask(CHECK_GATEWAY_PORT, check_gateway_port)
+
+    port = results[CHECK_GATEWAY_PORT]
+    if deadline.expired():
+        for name in (CHECK_IB_CONNECT, CHECK_IB_ANSWERS, CHECK_MARKET_DATA):
+            results[name] = deadline.out_of_time(name)
+    else:
+        (results[CHECK_IB_CONNECT],
+         results[CHECK_IB_ANSWERS],
+         results[CHECK_MARKET_DATA]) = check_ib(
+            port_ok=port.ok and not port.skipped, market_hours=market_hours)
+
+    ask(CHECK_LOOP_TICK, lambda: check_loop_tick(now, schedule, market_hours))
+    ask(CHECK_DISK, check_disk)
+    ask(CHECK_TIME_ZONE, lambda: check_time_zone(now))
+    return results
 
 
 # ------------------------------------------------------------ carrying it out
@@ -979,15 +1300,47 @@ def launch_gateway():
     return started, f"IB Gateway starting, output going to {log}"
 
 
+def stop_gateway(timeout: int = STOP_TIMEOUT_SECONDS) -> tuple[bool, str]:
+    """Run agent/stop_gateway.sh and wait for it. Returns (worked, message).
+
+    Only used on the ib_answers path, where a Gateway is sitting there logged in
+    and cut off from IBKR. Starting a second one on top of that gives two logins
+    fighting over one session, and the "different process id" proof could never
+    come true while the old process is still there, so the old one has to go
+    first. That script exits 0 only when no Gateway process remains.
+    """
+    script = agent_dir() / "stop_gateway.sh"
+    if not script.exists():
+        return False, f"cannot stop the old Gateway, {script} is missing"
+    try:
+        finished = subprocess.run(["/bin/bash", str(script)], capture_output=True,
+                                  text=True, timeout=timeout, cwd=str(project_root()))
+    except Exception as exc:                                      # noqa: BLE001
+        return False, f"stopping the old Gateway failed: {exc}"
+    if finished.returncode != 0:
+        return False, (f"stop_gateway.sh exited {finished.returncode}, the old "
+                       "Gateway is still there")
+    return True, "the old Gateway was stopped"
+
+
 def restart_gateway(wait_seconds: int = RESTART_VERIFY_SECONDS,
                     poll_seconds: int = RESTART_POLL_SECONDS,
-                    probe=None, launcher=None, sleep=time.sleep) -> RestartOutcome:
+                    probe=None, launcher=None, sleep=time.sleep,
+                    stop_first: bool = False, stopper=None,
+                    answering=None) -> RestartOutcome:
     """Start IB Gateway, then prove it really came back.
 
-    Look at Gateway first, start it, then keep looking until either all three
-    proofs in judge_restart() are there or the two minutes are up. The looking
-    is done by probe(), the deciding by judge_restart(), which is why the whole
-    rule can be tested with made up probes and no Gateway anywhere near it.
+    Look at Gateway first, stop the old one when there is one worth stopping,
+    start it, then keep looking until either the three local proofs in
+    judge_restart() are there or the two minutes are up. Once they are, ask the
+    fourth: does the new Gateway answer a read. The looking is done by probe(),
+    the asking by answering(), the deciding by judge_restart(), which is why the
+    whole rule can be tested with made up answers and no Gateway anywhere near
+    it.
+
+    stop_first is set when the reason for the restart is a Gateway that is
+    running and not answering, since that process has to be gone before a new
+    one means anything.
 
     Stops early on a start script that exited with an error, because nothing is
     going to change in the remaining two minutes if the script has already
@@ -995,8 +1348,18 @@ def restart_gateway(wait_seconds: int = RESTART_VERIFY_SECONDS,
     """
     probe = probe or probe_gateway
     launcher = launcher or launch_gateway
+    stopper = stopper or stop_gateway
+    answering = answering or (lambda: ask_ib_answers().ok)
 
     before = probe()
+    stop_note = ""
+    if stop_first and before.pid:
+        worked, stop_note = stopper()
+        if not worked:
+            return RestartOutcome(took=False, new_pid=False, fresh_login=False,
+                                  port_open=False, waited_seconds=0,
+                                  detail=f"  {stop_note}, so nothing was started")
+
     handle, message = launcher()
     if handle is None:
         return RestartOutcome(took=False, new_pid=False, fresh_login=False,
@@ -1006,8 +1369,14 @@ def restart_gateway(wait_seconds: int = RESTART_VERIFY_SECONDS,
     waited = 0
     while True:
         exit_code = handle.poll()
-        outcome = judge_restart(before, probe(), exit_code, waited_seconds=waited)
-        if outcome.took or exit_code not in (None, 0) or waited >= wait_seconds:
+        after = probe()
+        outcome = judge_restart(before, after, exit_code, waited_seconds=waited)
+        if outcome.took:
+            # The three local proofs are in. The one that matters is whether
+            # IBKR is on the other end, and that is worth asking only now.
+            return judge_restart(before, after, exit_code, waited_seconds=waited,
+                                 answers=bool(answering()))
+        if exit_code not in (None, 0) or waited >= wait_seconds:
             return outcome
         sleep(poll_seconds)
         waited += poll_seconds
@@ -1034,7 +1403,10 @@ def perform(actions: list[Action], allow_restart: bool) -> tuple[list[str], list
             if not allow_restart:
                 done.append("restart skipped, --no-restart was given")
                 continue
-            outcome = restart_gateway()
+            # A Gateway that is up and not answering has to be stopped before a
+            # new one is worth anything. A Gateway that is not running at all
+            # has nothing to stop.
+            outcome = restart_gateway(stop_first=(action.check == CHECK_IB_ANSWERS))
             done.append(f"restart: {'verified' if outcome.took else 'NOT verified'} "
                         f"after {outcome.waited_seconds}s")
             done.extend(outcome.detail.splitlines())
@@ -1123,7 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{now:%Y-%m-%d %H:%M:%S %Z}: outside market hours, nothing to do.")
         return 0
 
-    checks = run_checks(now, schedule)
+    checks = run_checks(now, schedule, Deadline())
     state = load_state()
     actions = decide_actions(checks, now, state)
 
