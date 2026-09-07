@@ -23,7 +23,7 @@ to do about it.
 | Guard | When it runs | What it can do |
 |---|---|---|
 | `agent/alerts.py` | whenever something calls it | send you a message four ways |
-| `agent/watchdog.py` | every 5 minutes in market hours, hourly otherwise | check seven things, message you, start IB Gateway once |
+| `agent/watchdog.py` | every 5 minutes in market hours, hourly otherwise | check eight things, message you, start IB Gateway once |
 | `agent/preflight.py` | 09:00 on weekdays | check five things, stop the day's trading, message you |
 | `agent/kill_switch.sh` | when you run it | stop the loop, cancel every order, close every position |
 | `agent/deadman.py` | every 5 minutes 09:30 to 16:00 on weekdays | notice the loop has died while a book is exposed, message you, and pull the kill switch itself |
@@ -71,22 +71,34 @@ Test the whole chain any time. It is harmless:
 ```
 
 Every five minutes during the trading day, and once an hour through the night
-and the weekend, it checks seven things:
+and the weekend, it checks eight things:
 
 1. `gateway_process`, IB Gateway is running.
 2. `gateway_port`, port 4002 is accepting connections. A running Gateway with
    a shut port is a hung Gateway.
 3. `ib_connect`, a read only login gets through and comes back with account
    DUT077572.
-4. `market_data`, SPY quotes are real time rather than delayed. Only checked
+4. `ib_answers`, that same connection asks for the list of positions and gets
+   an answer inside twenty seconds. See the subsection below. Only asked when
+   checks 2 and 3 passed, because there is nothing to ask on otherwise.
+5. `market_data`, SPY quotes are real time rather than delayed. Only checked
    while the market is open, because there is nothing to quote at nine at night.
-5. `loop_tick`, the trading loop has ticked within the last ten minutes. Only
+6. `loop_tick`, the trading loop has ticked within the last ten minutes. Only
    checked during market hours, and only when the loop's launchd job is loaded.
-6. `disk_free`, more than a gigabyte free.
-7. `time_zone`, the launchd jobs still fire at the right New York minute. See
+7. `disk_free`, more than a gigabyte free.
+8. `time_zone`, the launchd jobs still fire at the right New York minute. See
    the time zone section below. Checked at every run, market hours or not,
    because the answer has nothing to do with the market being open and the
    useful time to hear it is the evening before rather than 09:35 on the day.
+
+"While the market is open" means a weekday that is not a market holiday, read
+from `schedule.holidays` in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/guardrails.yaml`.
+Labor Day 2026 is the reason that sentence is here: on 2026-09-07 the market was
+shut all day, the quotes were delayed because there were no live quotes to have,
+and `market_data` reported a miss every five minutes from the open to the close.
+A closed Monday is now as quiet as a Saturday. The Gateway checks still run on a
+holiday, because a Gateway that dies on a day off is still dead on Tuesday.
 
 The hourly overnight runs are the whole point. On 2026-09-03 Gateway went down
 at 01:44 in the morning and nobody found out until Saturday lunchtime. With the
@@ -95,6 +107,91 @@ to restart itself.
 
 It will not nag. Once when something breaks, once every thirty minutes while it
 stays broken, once when it comes back. That is the whole budget.
+
+#### A login is not an answer
+
+`ib_connect` proves that IB Gateway is on this Mac, accepting connections, and
+willing to say which account it holds. It proves nothing at all about IBKR.
+
+On 2026-09-07 that gap cost a whole night and most of a morning. Twice, at 22:35
+Pacific and again at 07:50 New York, both times just after the MacBook went to
+sleep, Gateway lost its upstream connection to IBKR and never got it back. It
+kept running. Port 4002 stayed open. The login handshake kept working and kept
+handing over DUT077572. So `gateway_process`, `gateway_port` and `ib_connect`
+all said ok every five minutes all night, while every `reqPositions`, every
+account update and every `reqExecutions` timed out. Nothing restarted it. A
+person did, at 04:12 and again at 09:48, and each restart fixed it instantly:
+reads went from timing out to under a tenth of a second. The measurements are in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/journal/gateway_reads_2026-09-07.md`.
+
+So the watchdog now asks a real question on that same read only connection. It
+requests the list of positions with a hard twenty second bound, and either the
+answer comes back or the Gateway is dead as far as anyone trading is concerned.
+Two things fail it:
+
+* the request does not answer inside twenty seconds. A healthy Gateway answers
+  in well under a tenth of a second, so this is not a tight bound, it is the
+  difference between slow and dead;
+* IBKR says warning 2110, "Connectivity between Trader Workstation and server is
+  broken", which is Gateway admitting it up front. That warning is read together
+  with its opposite, 1102, "connectivity has been restored". Whichever of the
+  two IBKR said last is the state now, so a blip that mends itself in three
+  minutes, which the IBC log for 2026-09-06 has an example of, says nothing.
+
+The alert reads:
+
+```
+[ERROR] Watchdog: ib_answers failed
+
+Gateway is logged in but IBKR is not answering (positions request timed out
+after 20 s); it has lost its upstream connection.
+
+What to do: Gateway is logged in and cut off from IBKR at the same time, so
+every read hangs. Nothing you do inside the Gateway window fixes this. Stop it
+with agent/stop_gateway.sh and start it with agent/start_gateway.sh; the
+watchdog is already trying that once itself.
+```
+
+and the line in
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/watchdog.log`
+reads:
+
+```
+2026-09-07 22:35:00 EDT | gateway_process=ok gateway_port=ok ib_connect=ok ib_answers=FAIL market_data=skip loop_tick=skip disk_free=ok time_zone=ok | actions=2 | failed=ib_answers
+```
+
+Read left to right, that line is the whole story of the outage: everything local
+is fine and the one check that asks the other end is not.
+
+A failed `ib_answers` counts as a dead Gateway, so it gets the same single
+restart per outage that `gateway_process` failing gets, and the same alert
+budget. The one difference is that this Gateway is still running, so
+`agent/stop_gateway.sh` runs first and the start only follows once the old
+process is gone. Two logins fighting over one session would be worse than the
+hang, and the "different process id" proof below could never come true while the
+old process is still sitting there.
+
+#### When the watchdog trips over itself
+
+At 09:40 on 2026-09-07, in the middle of all this, a watchdog run could not
+connect at all: "Error 326 client id 250 already in use". An earlier copy of
+itself was still hung on the Gateway that had stopped answering, and it still
+held the API client id.
+
+That is a watchdog problem wearing a Gateway problem's clothes, and it must not
+be reported as `ib_connect` failing. So a connection refused for that reason now
+moves to a spare client id, 2500, 2501 or 2502, and the run says in its own
+output that an earlier copy is still running. Nothing else in this project may
+use an id in that range.
+
+The reason a copy gets stuck in the first place is now bounded as well. The
+checks share a ninety second wall clock budget: when it runs out, whatever has
+not been asked yet is reported as skipped rather than asked, and skipped raises
+no alert. A restart attempt sits outside that budget, because proving a restart
+takes two minutes by design, but it is bounded too, at sixty seconds to stop the
+old Gateway and a hundred and twenty to prove the new one. Ninety plus sixty
+plus a hundred and twenty is two hundred and seventy seconds, and launchd wakes
+this every three hundred.
 
 #### A restart only counts once it is proved
 
@@ -110,7 +207,7 @@ which process id Gateway is running under, and the time of the newest
 `Login has completed` line in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/ibc_logs/`.
 Then it starts Gateway and keeps looking, every five seconds for up to two
-minutes. Three things all have to be true before it will call that a restart:
+minutes. Four things all have to be true before it will call that a restart:
 
 1. **A different process id.** The old one coming back means nothing started,
    it means we are looking at the Gateway that was already sitting there.
@@ -120,8 +217,14 @@ minutes. Three things all have to be true before it will call that a restart:
 3. **Port 4002 accepting a connection.** Logged in but not listening is exactly
    the hang the watchdog exists to catch. Nothing is sent down that socket, it
    is opened and closed again, so this can never touch the account.
+4. **A read that comes back.** Added 2026-09-07, and it is the only one of the
+   four that proves anything about IBKR rather than about this Mac. The outage
+   that day had the first three and still could not answer a single request, so
+   a Gateway with a new process id, a fresh login and an open port that cannot
+   hand over the positions has not come back at all. This one is asked only once
+   the other three are in, since there is nothing worth asking otherwise.
 
-If any of the three is missing you get a message that names which ones did and
+If any of the four is missing you get a message that names which ones did and
 did not happen:
 
 ```
@@ -132,9 +235,10 @@ and was not seen in the 120 seconds after it was started:
 
   a different process id: yes (was 123, now 456)
   a newer login in the IBC log: yes (was 2026-09-06 06:30:00, now 2026-09-06 10:16:00)
-  port 4002 accepting connections: no
+  port 4002 accepting connections: yes
+  IBKR answering a read: no
 
-All three have to be true before this counts as a restart, so it is not being
+All of them have to be true before this counts as a restart, so it is not being
 written down as one.
 ```
 
@@ -264,6 +368,7 @@ a quiet phone from a broken alerter.
 | `gateway_process failed` | IB Gateway is not running | The watchdog has already tried once. If a second message follows, run `agent/start_gateway.sh` yourself and watch your phone for the IBKR approval prompt. |
 | `gateway_port failed` while the process is up | Gateway has hung | `agent/stop_gateway.sh`, then `agent/start_gateway.sh`. The watchdog will not do this for you, because starting a second Gateway on top of a hung one gives two logins fighting over the same session. |
 | `ib_connect failed` | Gateway is up but will not hand over the account | Look at the Gateway window. It is usually sitting on a login prompt or a two factor prompt. IBKR ends the session on Sundays at 1 AM Eastern, so one login a week is normal. |
+| `ib_answers failed` | Gateway is logged in and cut off from IBKR at the same time, so every read hangs | Nothing inside the Gateway window fixes it. The watchdog is already trying one stop and start itself; if a second message follows, run `agent/stop_gateway.sh` then `agent/start_gateway.sh` yourself. It has happened twice on a MacBook waking from sleep. |
 | `market_data failed`, code 10197 | A competing live session. Your own quote screen, Client Portal watchlist or IBKR mobile app has taken the market data feed | Close it. IBKR allows one market data session per user and the paper account shares yours. |
 | `market_data failed`, code 354, 10089 or 10168 | The real time subscription is not reaching the paper account | Client Portal, Settings, User Settings, Market Data Subscriptions. Check the US Securities Snapshot and Futures Value Bundle is on and that sharing with the paper account is ticked. See `docs/SETUP_IBKR_ACCOUNT.md`. |
 | `loop_tick failed` | The loop has stopped waking up | Check `output/tick_YYYY-MM-DD.log` for the last thing it said, then `launchctl print gui/$(id -u)/com.mtalib.agentic-trading.tick` to see whether the job is still loaded. |
