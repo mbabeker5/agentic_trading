@@ -123,13 +123,17 @@ If `agent/reconcile.py` cannot be imported at all, every book is halted for that
 
 ### Positions nobody claims
 
-The paper account holds one share of SPY from the manual test on 2026-09-02, and there is a working order id 4 with no tag on it from the same session. Neither belongs to a book.
+The paper account holds one share of SPY from the manual test on 2026-09-02, and there is a working order id 4 with no tag on it from the same session. Neither belongs to a book, and the two are treated differently on purpose.
 
-**Neither halts one, and that is a decision rather than a gap.** Halting on an orphan would mean halting all five books on every tick of every day for the rest of the month over a share nobody is managing and nobody is at risk from, and a safety rule that fires every five minutes forever is not a safety rule. What the loop does instead is write a line into the record every tick, so a reader can see it was noticed rather than missed, and tell Mo once per name per day. An orphan named in `output/expected_orphans.json` gets the line and no alert, because somebody has already looked at that one and said so.
+**A POSITION no book claims halts every book.** Hub ruling, 2026-09-07, recorded in `journal/2026-09-07.md` and item 0b of `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/BACKLOG.md`. A holding nobody can account for means either a book has lost its own record or somebody traded the account by hand, and in both of those cases all five books are sizing their next order against a picture of the account that is not true. That is the same reason a quantity mismatch halts the book it belongs to. Nobody can be blamed for an orphan, so nobody can be singled out either, and that leaves stopping all of them. Each halted book opens nothing more that day and may still close what it holds, exactly as under any other reconciliation halt, and the halt lifts on its own on the next tick after the orphan has gone or been forgiven.
 
-This is also why the loop reads `books_agree` rather than reconciliation's own `ok`. The unclaimed SPY share makes `ok` false on every tick of every day and will keep doing so. Reading that as "the books are wrong" would mean no reconciliation halt could ever be lifted, because the condition for lifting one would never be true again.
+One alert goes out for the finding, not one per halted book, and it is rate limited to once per name per day, because reconciliation runs every five minutes and it is the same fact at 11:40 as at 15:40. It names the symbol, the quantity and the exact line to write to forgive it. The line into the record is still written every tick, so a reader can see the orphan was noticed rather than missed.
 
-To stop the alert once someone has looked at them, write `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/expected_orphans.json` as either
+**An ORDER nobody tagged halts nobody**, and that is not an inconsistency. An order that is only working has changed nothing about what any book holds, so nobody is sizing anything against a wrong picture because of it. It is written down and Mo is told once a day, keyed by its order id.
+
+That difference is also why the loop reads `books_agree` rather than reconciliation's own `ok`. The untagged order id 4 makes `ok` false on every tick of every day and will keep doing so. Reading that as "the books are wrong" would mean no reconciliation halt could ever be lifted, because the condition for lifting one would never be true again. An unexpected orphan position, by contrast, now makes `books_agree` false too, which is what halts the books and what keeps them halted until it is dealt with.
+
+To stop the halt and the alert once someone has looked at the position, write `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/expected_orphans.json` as either
 
 ```json
 ["SPY"]
@@ -141,9 +145,9 @@ which forgives any quantity of that symbol, or
 {"SPY": 1}
 ```
 
-which forgives exactly one share and complains again if the number changes. That second shape is the better one and it is what ships.
+which forgives exactly one share and halts every book again if the number changes. That second shape is the better one and it is what ships.
 
-**What the code does today (commit c5c92a2):** an unclaimed position is written down, Mo is told once per symbol per day, and no book is halted. The forgiveness file `output/expected_orphans.json` is optional: a symbol and share count listed there gets the log line and no alert, and the file is gitignored, so a fresh clone or the Mac Mini starts without one. Whether an unexpected orphan should instead halt every book is Mo's decision, recorded as backlog item 0b with both arguments; the code follows the committed answer until that changes. See `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/README_expected_orphans.md`.
+**What the code does today (commit `38912d9`):** an unclaimed position is written down every tick, every book is halted for the tick, and one alert goes out for the finding naming the symbol, the quantity and how to forgive it. The forgiveness file `output/expected_orphans.json` is **no longer optional**: a symbol and share count listed there at exactly the right quantity gets the log line, no halt and no alert, and anything else halts. A missing or unreadable file forgives nothing, which is the safe way round. The file is gitignored, so a fresh clone or the Mac Mini starts without one and will halt on the first tick until it is copied from `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/expected_orphans.example.json`. Backlog item 0b is decided rather than open: hub ruling of 2026-09-07. See `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/README_expected_orphans.md`.
 
 ---
 
