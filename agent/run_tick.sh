@@ -148,6 +148,81 @@ LAUNCHD_GAP_SECONDS="${AGENTIC_TRADING_LAUNCHD_GAP:-300}"
 # nonsense number this is what stops this script running forever.
 MAX_SUB_TICKS=9
 
+# THE HARD CAP ON ONE TICK.
+#
+# 240 seconds, a constant here rather than a setting, because this script does
+# not read config/guardrails.yaml and a bash yaml parser would be a worse thing
+# to own than a number with a comment. It sits inside LAUNCHD_GAP_SECONDS on
+# purpose: a killed tick is over before the next wake up is due.
+#
+# Why there is a cap at all. On 2026-09-07 IB Gateway lost its upstream
+# connection to IBKR, every read through the MCP server hung, and one tick that
+# started at 07:37 New York did not finish until 09:25. launchd will not start a
+# second copy of a job that is still running, so every one minute pre-open wake
+# up between 09:00 and 09:26 was lost. A tick that has stopped making progress
+# is worth nothing; the next one starting on time is worth a great deal.
+#
+# The client side deadline in agent/mcp_client.py should mean this never fires.
+# This is the belt to that pair of braces.
+TICK_MAX_SECONDS="${AGENTIC_TRADING_TICK_MAX_SECONDS:-240}"
+
+# What run_loop_once returns when the cap fired, which is what timeout(1) would
+# have returned had macOS shipped one.
+TICK_KILLED_EXIT=124
+
+# Run one tick of the loop with the cap on it, and hand back its exit code.
+#
+# macOS has no timeout(1), so the loop goes into the background and a watcher
+# subshell kills it if it is still going when the cap is up. The watcher leaves
+# a marker file behind before it kills, which is how this function tells "the
+# cap fired" from "the loop chose to exit 143", and it is shot as soon as the
+# loop finishes, so an ordinary tick pays nothing for any of this.
+#
+# Nothing is written to the heartbeat here, on a killed tick or any other kind.
+# agent/loop.py writes that, and a tick that was killed never reaches the line
+# that does, which is exactly what the dead man's handle should see.
+run_loop_once() {
+  local marker loop_pid watcher_pid status
+  marker="${TMPDIR:-/tmp}/agentic-trading-tick-killed.$$"
+  rm -f "$marker"
+
+  python "$PROJECT/agent/loop.py" >> "$LOG" 2>&1 &
+  loop_pid=$!
+
+  # The watcher counts in one second steps rather than sleeping the whole cap in
+  # one go, so that it is gone within a second of an ordinary tick finishing. A
+  # single long sleep would sit there holding this script's own output open for
+  # the full four minutes after every clean tick, which is the sort of thing
+  # that makes a wrapper look hung when it is not.
+  (
+    waited=0
+    while (( waited < TICK_MAX_SECONDS )); do
+      sleep 1
+      waited=$(( waited + 1 ))
+      kill -0 "$loop_pid" 2>/dev/null || exit 0
+    done
+    : > "$marker"
+    kill -TERM "$loop_pid" 2>/dev/null
+    # A few seconds to write down what it was doing, then no more asking.
+    sleep 5
+    kill -KILL "$loop_pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  watcher_pid=$!
+
+  wait "$loop_pid"
+  status=$?
+
+  kill -TERM "$watcher_pid" 2>/dev/null
+  wait "$watcher_pid" 2>/dev/null
+
+  if [[ -f "$marker" ]]; then
+    rm -f "$marker"
+    say "KILLED: this tick ran longer than $TICK_MAX_SECONDS seconds and was stopped, so the next launchd wake up starts fresh. Nothing was written to the heartbeat. A read that never returns is usually IB Gateway having lost its link to IBKR: look for warning 2110 in $LOG_DIR/ibc_logs/ and at $LOG_DIR/mcp_logs/mcp_ibkr.log"
+    return $TICK_KILLED_EXIT
+  fi
+  return $status
+}
+
 # How soon the loop wants looking at again, in whole seconds, or the launchd gap
 # when it did not say. Anything that is not a plain number is ignored.
 next_tick_seconds() {
@@ -160,7 +235,7 @@ next_tick_seconds() {
   fi
 }
 
-python "$PROJECT/agent/loop.py" >> "$LOG" 2>&1
+run_loop_once
 STATUS=$?
 
 # The fast window. Only ever entered when the tick above finished cleanly: a
@@ -184,7 +259,7 @@ while [[ $STATUS -eq 0 ]] && (( SUB_TICKS < MAX_SUB_TICKS )); do
   fi
 
   say "fast window: sub-tick $SUB_TICKS, $WAIT seconds after the last one"
-  python "$PROJECT/agent/loop.py" >> "$LOG" 2>&1
+  run_loop_once
   STATUS=$?
 done
 
