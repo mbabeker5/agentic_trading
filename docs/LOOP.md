@@ -143,7 +143,7 @@ which forgives any quantity of that symbol, or
 
 which forgives exactly one share and complains again if the number changes. That second shape is the better one and it is what ships.
 
-**That file now exists, and since 2026-09-06 it has to.** An unclaimed position halts EVERY book, because something in the account that no strategy decided to buy means either a book has lost its record or somebody traded the account by hand, and in both cases all five books are sizing their next order against a picture that is not true. The known SPY share is forgiven in that file, so it gets the line and no halt. If the file ever goes missing, that one share halts all five books on every tick of every day, which is loud rather than dangerous but is still the wrong day to find out. `output/` is gitignored, so a fresh clone or the Mac Mini needs the copy at `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/expected_orphans.example.json` put in place first. See `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/README_expected_orphans.md`.
+**What the code does today (commit c5c92a2):** an unclaimed position is written down, Mo is told once per symbol per day, and no book is halted. The forgiveness file `output/expected_orphans.json` is optional: a symbol and share count listed there gets the log line and no alert, and the file is gitignored, so a fresh clone or the Mac Mini starts without one. Whether an unexpected orphan should instead halt every book is Mo's decision, recorded as backlog item 0b with both arguments; the code follows the committed answer until that changes. See `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/config/README_expected_orphans.md`.
 
 ---
 

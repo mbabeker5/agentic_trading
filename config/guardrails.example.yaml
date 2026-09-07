@@ -326,7 +326,7 @@ schedule:
                               # look every thirty minutes, so a 30 second window
                               # would be thirty pointless wake ups an hour.
   trade_only_regular_hours: true  # no pre-market or after-hours trading
-  holidays: []                # days the US market is shut that are not weekends,
+  holidays: [2026-09-07, 2026-11-26, 2026-12-25]                # days the US market is shut that are not weekends,
                               # written as [2026-11-26, 2026-12-25]. Empty today.
                               # Only the day trade counter in agent/pdt.py reads
                               # this, to work out what a business day is. The
