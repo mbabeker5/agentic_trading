@@ -1,6 +1,6 @@
 # Hub status
 
-Written 2026-09-08 at 09:45 New York by the Tuesday worker. Overwritten each
+Written 2026-09-08 at 10:40 New York by the Tuesday worker. Overwritten each
 time, so this file is always now and never a history.
 
 ## For Mo right now
@@ -8,9 +8,10 @@ time, so this file is always now and never a history.
 **Log out of IBKR Mobile, TWS and Client Portal on the mbabeker5 login.** Since
 09:00 the paper Gateway has had IBKR error 10197, no market data during
 competing live session, on every quote. No quotes, no scanner rows, empty
-shortlist, no picks. Nothing is at risk (all dry_run, account flat), but the
-first day is producing no decisions until that session closes. Alerted 09:22
-and 09:45.
+shortlist, no picks. Still true at 10:33: 363 more 10197 errors after 10:00,
+nothing served in 234 quote requests, no shortlist. Nothing is at risk (all
+dry_run, account flat), but the first day is producing no decisions until that
+session closes, and the subscription cannot be judged. Alerted 09:22 and 09:45.
 
 ## The five rulings
 
