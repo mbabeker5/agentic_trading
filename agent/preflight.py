@@ -42,8 +42,14 @@ The five checks that can stop the day
                    any IBKR error 162, 165 or 365 sitting in the scan
                    diagnostics of the file it wrote.
 4. reconcile       What the books think they hold matches what the broker says
-                   they hold, symbol by symbol. With no book state files yet,
-                   this reports "no books active" and passes.
+                   they hold. The comparison is agent/reconcile.py's, the same
+                   one the trading loop runs on every tick, forgiving the same
+                   orphans through output/expected_orphans.json. It fails only
+                   when a book would be halted. A holding no book claims that
+                   the forgiveness file names, and an order at the broker with
+                   no book's tag on it, are notes: the loop lets both through,
+                   so the morning does too. With no book state files yet, this
+                   reports "no books active" and passes.
 5. day_trades      Every day trade counter file present can be read.
                    agent/pdt.py writes one per book as output/pdt_BOOK_A.json.
                    Missing files pass; a corrupt one fails.
@@ -132,6 +138,8 @@ try:
 except Exception:           # noqa: BLE001
     db_module = None        # type: ignore[assignment]
 import mcp_client as mcp  # noqa: E402
+import orphans as orphans_mod  # noqa: E402
+import reconcile as reconcile_mod  # noqa: E402
 import watchdog as wd  # noqa: E402
 from margin_regime import (  # noqa: E402
     DAY_TRADE_TAGS,
@@ -206,11 +214,6 @@ SCAN_HARD_ERROR_CODES = (162, 165, 365)
 
 #: The one benign 162. IBKR sends it to confirm a finished one-shot scan closed.
 BENIGN_162_TEXT = "scanner subscription cancelled"
-
-#: How far the books and the broker may disagree on a share count before it is a
-#: problem. Shares are whole numbers, so this is only here to absorb the way
-#: IBKR reports quantities as floats.
-POSITION_TOLERANCE = 0.001
 
 CHECK_GATEWAY = "gateway_login"
 CHECK_MARKET_DATA = "market_data"
@@ -533,14 +536,18 @@ def check_scanner_filters() -> Result:
     return Result(CHECK_SCANNER_FILTERS, True, detail, facts=facts)
 
 
-def newest_book_files(folder: Path) -> list[Path]:
-    """The most recent state file for each book, and only that one.
+def newest_book_files_by_book(folder: Path) -> dict[str, Path]:
+    """The most recent state file for each book, keyed by the book it belongs to.
 
     agent/book_state.py writes one file per book per day, named like
     state_BOOK_A_2026-09-08.json. Adding every file in the folder together would
     count Monday's positions again on Tuesday, so the files are grouped by book
     and only the newest day of each is kept. ISO dates sort in date order, which
     is why a plain sort is enough to find it.
+
+    The book id has to come back with the file, because agent/reconcile.py works
+    book by book: which books stop over a disagreement depends on which books
+    hold the disputed name.
     """
     by_book: dict[str, Path] = {}
     for path in sorted(folder.glob("state_BOOK_*.json")):
@@ -549,6 +556,12 @@ def newest_book_files(folder: Path) -> list[Path]:
         if not (book and len(maybe_date) == 10 and maybe_date.count("-") == 2):
             book = tail          # no date on the end, so the whole tail is the book
         by_book[book] = path     # sorted order means the last one wins
+    return by_book
+
+
+def newest_book_files(folder: Path) -> list[Path]:
+    """The same files as above, in book order, for a caller that wants the paths."""
+    by_book = newest_book_files_by_book(folder)
     return [by_book[book] for book in sorted(by_book)]
 
 
@@ -610,31 +623,155 @@ def _as_float(value) -> float | None:
         return None
 
 
+def _working_orders_from_book(loaded) -> dict:
+    """The orders one book believes are still working, keyed by broker order id.
+
+    agent/book_state.py writes them as a dictionary under working_orders.
+    Anything else is read as none at all, which shows up as the broker working an
+    order no book has a record of rather than as everything being fine.
+    """
+    if not isinstance(loaded, dict):
+        return {}
+    raw = loaded.get("working_orders")
+    return raw if isinstance(raw, dict) else {}
+
+
+def broker_orders_for_reconcile(rows) -> list[dict]:
+    """The account's working orders in the five fields agent/reconcile.py reads.
+
+    The same field names as broker_orders_for_reconcile in agent/loop.py,
+    because both of them are reading the same answer out of the same MCP tool.
+    """
+    out: list[dict] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        out.append({
+            "orderId": row.get("orderId") or row.get("order_id"),
+            "symbol": row.get("symbol"),
+            "side": row.get("action") or row.get("side"),
+            "qty": row.get("totalQuantity") or row.get("qty") or row.get("remaining"),
+            "order_ref": row.get("orderRef") or row.get("order_ref"),
+        })
+    return out
+
+
+def _shares_in_words(qty) -> str:
+    """1 share, 2 shares, and never 1 shares."""
+    count = abs(int(qty))
+    return "1 share" if count == 1 else f"{count} shares"
+
+
+def reconcile_notes(report) -> list[str]:
+    """Everything the reconciliation found that halts nobody, in short sentences.
+
+    Three kinds, and all three are notes rather than failures because that is
+    exactly what the trading loop does with them. The pre-flight must not stop a
+    day over something the loop lets through on every tick.
+
+    A FORGIVEN ORPHAN. A holding no book claims that output/expected_orphans.json
+    names. This paper account holds one share of SPY, bought by hand during the
+    first manual test on 2026-09-02, and the file forgives it. An orphan that
+    file does NOT name is a different matter: it halts every book, so it lands in
+    the failures below instead. See config/README_expected_orphans.md.
+
+    A LOOSE ORDER. An order working at the broker whose reference belongs to no
+    book, such as order 4, the market-on-open sell of that SPY share. An order
+    that is only working has changed nothing about what any book holds, so nobody
+    is sizing anything against a wrong picture, and agent/reconcile.py leaves it
+    out of books_to_halt on purpose. Somebody still has to look at it by hand.
+
+    A SHARED TICKER that adds up. Two books holding the same name has been
+    allowed since 2026-09-06, and reconcile.py writes its own sentence for it.
+    """
+    notes: list[str] = []
+    for orphan in report.orphans:
+        if not orphan.expected:
+            continue
+        verb = "belongs" if abs(orphan.qty) == 1 else "belong"
+        notes.append(f"{orphan.symbol}: {_shares_in_words(orphan.qty)} {verb} to no "
+                     f"book, forgiven by output/{orphans_mod.FILE_NAME}.")
+    for mismatch in report.mismatches:
+        if mismatch.book_id is not None:
+            continue
+        where = (f"order {mismatch.order_id}" if mismatch.order_id
+                 else "an order with no id on it")
+        notes.append(f"{where} at the broker belongs to no book, so no book stops "
+                     "for it, the same answer the trading loop gives. Someone has "
+                     "to look at that order by hand.")
+    notes.extend(record.line for record in report.shared if record.matches)
+    return notes
+
+
+def reconcile_problems(report) -> list[str]:
+    """The reconciliation's own sentence for each thing that halts a book.
+
+    agent/reconcile.py already writes one plain sentence per problem, naming the
+    books involved, what each of them believes, what the broker says instead and
+    who stops trading. The pre-flight quotes those rather than writing a second,
+    differently worded description of the same disagreement. That is the other
+    half of the 2026-09-08 bug: the pre-flight called an orphan a book mismatch,
+    which is a different thing with a different sentence.
+
+    One quantity mismatch can name several books and is one sentence shared
+    between them, so the same line is only kept once.
+    """
+    lines = [m.line for m in report.mismatches if m.book_id is not None]
+    lines += [orphan.line for orphan in report.orphans if not orphan.expected]
+    kept: list[str] = []
+    for line in lines:
+        if line not in kept:
+            kept.append(line)
+    return kept
+
+
 def check_reconcile() -> Result:
     """Does what the books think they hold match what the broker says?
 
-    Book by book, the newest state file under output/state_BOOK_*.json is added
-    up per symbol and compared with the broker's own position list. There is one
-    file per book per day, so only the newest day of each book counts: adding
-    every file in the folder together would count Monday's positions again on
-    Tuesday. A book that has not started yet has no state file, and with no state
-    files at all this passes with "no books active".
+    The comparison itself is agent/reconcile.py's, the same function the trading
+    loop asks on every tick, handed the same forgiveness file through the same
+    reader in agent/orphans.py. That is deliberate and it is the fix for the
+    2026-09-08 morning: the pre-flight used to do its own arithmetic here, never
+    opened output/expected_orphans.json, and stopped the whole day over the one
+    unclaimed share of SPY that every tick of the loop was already forgiving.
+
+    What is gathered here is only the two pictures. Book by book, the newest
+    state file under output/state_BOOK_*.json gives what that book believes it
+    holds and which orders it is waiting on. There is one file per book per day,
+    so only the newest day of each book counts: adding every file in the folder
+    together would count Monday's positions again on Tuesday. A book that has
+    not started yet has no state file, and with no state files at all this
+    passes with "no books active".
+
+    IT PASSES WHEN NOBODY WOULD BE HALTED, which is books_to_halt being empty,
+    and not when reconcile says ok. Those are two different questions. ok is
+    False on every tick of every day while order 4 sits at the broker with no
+    book's tag on it, and an untagged order halts nobody, so reading ok as the
+    verdict would fail every morning forever. A forgiven orphan and a shared
+    ticker that adds up are notes here for the same reason: the loop lets them
+    through, so the morning must too.
     """
-    books = newest_book_files(output_dir())
+    by_book = newest_book_files_by_book(output_dir())
+    books = [by_book[book] for book in sorted(by_book)]
     if not books:
         return Result(CHECK_RECONCILE, True,
                       "No books active: there are no output/state_BOOK_*.json "
                       "files yet, so there is nothing to reconcile.")
 
+    books_state: dict[str, dict] = {}
     believed: dict[str, float] = {}
     unreadable: list[str] = []
-    for path in books:
+    for book in sorted(by_book):
+        path = by_book[book]
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             unreadable.append(f"{path.name} ({exc})")
             continue
-        for symbol, shares in _positions_from_book(loaded).items():
+        held = _positions_from_book(loaded)
+        books_state[book] = {"positions": held,
+                             "working_orders": _working_orders_from_book(loaded)}
+        for symbol, shares in held.items():
             believed[symbol] = believed.get(symbol, 0.0) + shares
 
     if unreadable:
@@ -646,40 +783,63 @@ def check_reconcile() -> Result:
         client = mcp.McpClient()
         holdings = client.portfolio() or {}
         values = client.account_values() or {}
+        working = (client.open_orders() or {}).get("orders") or []
     except Exception as exc:                                      # noqa: BLE001
         return Result(CHECK_RECONCILE, False,
                       f"Could not read the account through the MCP server: {exc}")
 
     actual: dict[str, float] = {}
+    broker_positions: list[dict] = []
     for position in holdings.get("positions") or []:
         symbol = str(position.get("symbol"))
-        try:
-            actual[symbol] = actual.get(symbol, 0.0) + float(position.get("position") or 0.0)
-        except (TypeError, ValueError):
-            pass
+        shares = _as_float(position.get("position") or 0.0)
+        if shares is None:
+            continue
+        actual[symbol] = actual.get(symbol, 0.0) + shares
+        broker_positions.append({"symbol": symbol, "qty": shares,
+                                 "avg_cost": _as_float(position.get("avgCost")) or 0.0})
 
-    mismatches = []
-    for symbol in sorted(set(believed) | set(actual)):
-        theirs = actual.get(symbol, 0.0)
-        ours = believed.get(symbol, 0.0)
-        if abs(theirs - ours) > POSITION_TOLERANCE:
-            mismatches.append(f"{symbol}: the books say {ours:g}, the broker says {theirs:g}")
-
+    forgiven = orphans_mod.expected_orphans(output_dir())
     facts = {
         "books": [p.name for p in books],
         "books_believe": believed,
         "broker_holds": actual,
+        "broker_working_orders": len(working),
         "broker_cash": values.get("TotalCashValue"),
         "broker_net_liquidation": values.get("NetLiquidation"),
+        "expected_orphans": forgiven,
+        "expected_orphans_file": str(output_dir() / orphans_mod.FILE_NAME),
     }
-    if mismatches:
+
+    try:
+        report = reconcile_mod.reconcile(
+            broker_positions, broker_orders_for_reconcile(working), books_state,
+            expected_orphans=forgiven)
+    except ValueError as exc:
         return Result(CHECK_RECONCILE, False,
-                      "The books and the broker disagree. " + "; ".join(mismatches),
+                      "The reconciliation could not make sense of what the books "
+                      f"and the broker say: {exc}", facts=facts)
+
+    notes = reconcile_notes(report)
+    facts.update({
+        "books_to_halt": list(report.books_to_halt),
+        "orphans": [{"symbol": orphan.symbol, "qty": orphan.qty,
+                     "expected": orphan.expected} for orphan in report.orphans],
+        "reconcile_ok": bool(report.ok),
+        "reconcile_lines": list(report.lines),
+        "notes": notes,
+    })
+    spoken_notes = (" " + " ".join(notes)) if notes else ""
+
+    if report.books_to_halt:
+        return Result(CHECK_RECONCILE, False,
+                      f"{report.summary}. "
+                      + " ".join(reconcile_problems(report)) + spoken_notes,
                       facts=facts)
     return Result(CHECK_RECONCILE, True,
                   f"{len(books)} book state files agree with the broker on "
                   f"{len(actual)} positions. Broker cash "
-                  f"{values.get('TotalCashValue', 'unknown')}.",
+                  f"{values.get('TotalCashValue', 'unknown')}." + spoken_notes,
                   facts=facts)
 
 

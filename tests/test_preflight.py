@@ -29,9 +29,10 @@ NINE_AM = datetime(2026, 9, 8, 9, 0, tzinfo=preflight.EASTERN)
 class FakeMcp:
     """Stands in for the MCP server. Reads only, like the real read tools."""
 
-    def __init__(self, positions, cash="999233.85"):
+    def __init__(self, positions, cash="999233.85", orders=None):
         self._positions = positions
         self._cash = cash
+        self._orders = list(orders or [])
 
     def portfolio(self, *a, **k):
         return {"account": "DUT077572",
@@ -39,6 +40,9 @@ class FakeMcp:
 
     def account_values(self, *a, **k):
         return {"TotalCashValue": self._cash, "NetLiquidation": "1000175.35"}
+
+    def open_orders(self, *a, **k):
+        return {"orders": self._orders}
 
 
 def use_temp_output(monkeypatch, tmp_path: Path) -> Path:
@@ -51,6 +55,19 @@ def use_temp_output(monkeypatch, tmp_path: Path) -> Path:
 def write_book(folder: Path, book: str, positions) -> Path:
     path = folder / f"state_BOOK_{book}.json"
     path.write_text(json.dumps({"book_id": book, "positions": positions}), encoding="utf-8")
+    return path
+
+
+def forgive(folder: Path, contents) -> Path:
+    """Write output/expected_orphans.json, the only thing that forgives an orphan.
+
+    The same file the trading loop reads on every tick, through the same reader
+    in agent/orphans.py. Written as raw text so a half finished file can be
+    tested too.
+    """
+    path = folder / "expected_orphans.json"
+    path.write_text(contents if isinstance(contents, str) else json.dumps(contents),
+                    encoding="utf-8")
     return path
 
 
@@ -112,15 +129,33 @@ def test_two_books_holding_the_same_symbol_are_added_together(monkeypatch, tmp_p
 
 
 def test_a_share_count_that_does_not_match_fails_and_says_which_symbol(monkeypatch, tmp_path):
+    """A real book mismatch fails, in agent/reconcile.py's own words."""
     folder = use_temp_output(monkeypatch, tmp_path)
     write_book(folder, "A", [{"symbol": "SPY", "position": 5}])
     monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"SPY": 1.0}))
 
     result = preflight.check_reconcile()
     assert result.passed is False
-    assert "SPY" in result.detail
-    assert "the books say 5" in result.detail
-    assert "the broker says 1" in result.detail
+    assert "Book A believes it holds 5 shares of SPY" in result.detail
+    assert "the broker reports 1" in result.detail
+    assert "Book A stops trading until someone looks." in result.detail
+    assert result.facts["books_to_halt"] == ["A"]
+
+
+def test_a_book_mismatch_fails_even_when_the_orphan_file_forgives_something(
+        monkeypatch, tmp_path):
+    """A forgiven orphan is not a licence to ignore a book that is out of step."""
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [{"symbol": "DELL", "position": 5}])
+    forgive(folder, {"SPY": 1})
+    monkeypatch.setattr(preflight.mcp, "McpClient",
+                        lambda *a, **k: FakeMcp({"DELL": 1.0, "SPY": 1.0}))
+
+    result = preflight.check_reconcile()
+    assert result.passed is False
+    assert "Book A believes it holds 5 shares of DELL" in result.detail
+    assert "forgiven by output/expected_orphans.json" in result.detail
+    assert result.facts["books_to_halt"] == ["A"]
 
 
 def test_a_position_the_books_have_never_heard_of_fails(monkeypatch, tmp_path):
@@ -131,6 +166,116 @@ def test_a_position_the_books_have_never_heard_of_fails(monkeypatch, tmp_path):
     result = preflight.check_reconcile()
     assert result.passed is False
     assert "SPY" in result.detail
+
+
+# ------------------------------------------- the orphan the loop already forgives
+#
+# The 2026-09-08 bug. The account holds one share of SPY that belongs to no book,
+# bought by hand on 2026-09-02, and output/expected_orphans.json forgives it, so
+# every tick of the trading loop lets it through. The pre-flight did its own
+# arithmetic, never opened that file, and failed the whole day on it, calling it a
+# book mismatch when no book claims the share at all.
+
+
+def test_a_forgiven_orphan_passes_with_a_note(monkeypatch, tmp_path):
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [])
+    forgive(folder, {"SPY": 1})
+    monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"SPY": 1.0}))
+
+    result = preflight.check_reconcile()
+    assert result.passed is True
+    assert ("SPY: 1 share belongs to no book, forgiven by "
+            "output/expected_orphans.json") in result.detail
+    assert result.facts["books_to_halt"] == []
+    assert result.facts["expected_orphans"] == {"SPY": 1}
+
+
+def test_an_orphan_nobody_wrote_down_fails_and_halts_every_book(monkeypatch, tmp_path):
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [])
+    write_book(folder, "B", [])
+    forgive(folder, {"SPY": 1})
+    monkeypatch.setattr(preflight.mcp, "McpClient",
+                        lambda *a, **k: FakeMcp({"SPY": 1.0, "GHOST": 4.0}))
+
+    result = preflight.check_reconcile()
+    assert result.passed is False
+    assert "no book claims them" in result.detail
+    assert "GHOST" in result.detail
+    assert result.facts["books_to_halt"] == ["A", "B"]
+
+
+def test_the_forgiven_quantity_has_to_be_the_one_the_broker_holds(monkeypatch, tmp_path):
+    """{"SPY": 1} forgives one share. Two is a different fact, so it halts."""
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [])
+    forgive(folder, {"SPY": 1})
+    monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"SPY": 2.0}))
+
+    result = preflight.check_reconcile()
+    assert result.passed is False
+    assert "We expected 1 share of SPY to be sitting there unclaimed" in result.detail
+    assert result.facts["books_to_halt"] == ["A"]
+
+
+def test_a_missing_forgiveness_file_forgives_nothing(monkeypatch, tmp_path):
+    """No output/expected_orphans.json at all is None, and None forgives nothing.
+
+    The safe way round on purpose, and the same answer expected_orphans() in
+    agent/loop.py gives: halt rather than trade on a picture nobody has checked.
+    """
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [])
+    monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"SPY": 1.0}))
+
+    result = preflight.check_reconcile()
+    assert result.passed is False
+    assert result.facts["expected_orphans"] is None
+    assert result.facts["books_to_halt"] == ["A"]
+
+
+def test_a_half_written_forgiveness_file_forgives_nothing_either(monkeypatch, tmp_path):
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [])
+    forgive(folder, '{"SPY": ')
+    monkeypatch.setattr(preflight.mcp, "McpClient", lambda *a, **k: FakeMcp({"SPY": 1.0}))
+
+    result = preflight.check_reconcile()
+    assert result.passed is False
+    assert result.facts["expected_orphans"] is None
+
+
+def test_an_untagged_working_order_is_a_note_and_not_a_failure(monkeypatch, tmp_path):
+    """Order 4 today: a sell of the SPY share with no book's tag on it.
+
+    An order that is only working has changed nothing about what any book holds,
+    so agent/reconcile.py halts nobody for it and neither does the morning.
+    """
+    folder = use_temp_output(monkeypatch, tmp_path)
+    write_book(folder, "A", [{"symbol": "SPY", "position": 1}])
+    monkeypatch.setattr(
+        preflight.mcp, "McpClient",
+        lambda *a, **k: FakeMcp({"SPY": 1.0},
+                                orders=[{"orderId": 4, "symbol": "SPY",
+                                         "action": "SELL", "totalQuantity": 1}]))
+
+    result = preflight.check_reconcile()
+    assert result.passed is True
+    assert "order 4 at the broker belongs to no book" in result.detail
+    assert result.facts["books_to_halt"] == []
+    # reconcile's own verdict is False for the loose order, and that is exactly
+    # the thing the morning must not read as a failure.
+    assert result.facts["reconcile_ok"] is False
+
+
+def test_the_pre_flight_forgives_exactly_what_the_loop_forgives(monkeypatch, tmp_path):
+    """Both read the file through the one reader in agent/orphans.py."""
+    import orphans
+
+    assert preflight.orphans_mod is orphans
+    forgive(tmp_path, {"SPY": 1})
+    assert orphans.expected_orphans(tmp_path) == {"SPY": 1}
 
 
 def test_a_corrupt_book_state_file_fails_rather_than_passing_quietly(monkeypatch, tmp_path):

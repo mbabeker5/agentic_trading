@@ -269,8 +269,17 @@ day at all:
    shortlist is usually empty because the market has not opened. That is fine.
    It is the run that has to work, not the result.
 4. `reconcile`, every book's idea of what it holds matches what the broker
-   says it holds, symbol by symbol. With no books running yet this reports "no
-   books active" and passes.
+   says it holds. The comparison is `agent/reconcile.py`'s, the same one the
+   trading loop runs on every tick, reading the same
+   `output/expected_orphans.json` through the same reader in
+   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/orphans.py`,
+   so the morning forgives exactly what the loop forgives. It fails only when a
+   book would actually be halted: a book out of step with the broker about its
+   own holdings, or a position no book claims that the forgiveness file does not
+   name, which halts all five. A forgiven orphan (the one share of SPY) and an
+   order at the broker with no book's tag on it (order 4) are notes in the
+   detail rather than failures, because that is what the loop does with them.
+   With no books running yet this reports "no books active" and passes.
 5. `day_trades`, any day trade counter files that exist can be read.
 
 If anything fails it writes

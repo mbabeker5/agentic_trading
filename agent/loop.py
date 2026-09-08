@@ -95,6 +95,7 @@ import broker as broker_mod                 # noqa: E402
 import decide as decide_mod                 # noqa: E402
 import guardrails as gr                     # noqa: E402
 import ledger_writer                        # noqa: E402
+import orphans as orphans_mod               # noqa: E402
 
 # Two modules another agent wrote alongside this one. The loop has to be safe
 # whether or not they are there, so both are optional: a missing one degrades to
@@ -922,15 +923,14 @@ def expected_orphans(root: Path | None = None) -> Any:
     quantity, or {"SPY": 1}, which forgives that exact quantity and halts again
     if it changes. A missing or unreadable file forgives nothing, which is the
     safe way round: it halts rather than trades on a picture nobody checked.
+
+    The reading itself lives in agent/orphans.py so that the 9 AM pre-flight can
+    forgive exactly what this loop forgives. On 2026-09-08 it could not: the
+    pre-flight had its own comparison that never opened this file, and it stopped
+    the day over the one share of SPY that every tick of the loop was already
+    letting through.
     """
-    path = ((root or project_root()) / "output" / "expected_orphans.json")
-    if not path.exists():
-        return None
-    try:
-        loaded = json.loads(path.read_text())
-    except Exception:                        # noqa: BLE001
-        return None
-    return loaded if isinstance(loaded, (list, dict)) else None
+    return orphans_mod.expected_orphans((root or project_root()) / "output")
 
 
 def broker_positions_for_reconcile(rows: dict[str, dict]) -> list[dict]:
