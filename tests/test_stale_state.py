@@ -83,6 +83,11 @@ def sandbox(tmp_path, monkeypatch):
     for name in ("config", "strategies"):
         (tmp_path / name).symlink_to(REPO / name)
     (tmp_path / "output").mkdir()
+    # An ordinary morning: the 9 AM pre-flight passed. Without it the loop
+    # refuses to open anything and says so once per book, which is another
+    # test's subject, not this file's.
+    (tmp_path / "output" / f"preflight_{date.today():%Y-%m-%d}.json").write_text(
+        json.dumps({"verdict": "pass", "failed_checks": []}), encoding="utf-8")
     monkeypatch.setenv(loop.ROOT_ENV_VAR, str(tmp_path))
     monkeypatch.delenv(loop.OUTPUT_DIR_ENV_VAR, raising=False)
     monkeypatch.delenv("AGENTIC_TRADING_LIVE_ORDERS", raising=False)

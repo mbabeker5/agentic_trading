@@ -195,6 +195,25 @@ class Sandbox:
     def no_trade_file(self) -> Path:
         return self.output / "NO_TRADE_TODAY"
 
+    def preflight_verdict_file(self, day) -> Path:
+        return self.output / f"preflight_{day:%Y-%m-%d}.json"
+
+    def write_preflight_pass(self, day) -> Path:
+        """The passing 9 AM verdict the replayed day is assumed to have had.
+
+        Since 2026-09-10 the loop opens nothing on a day with no pre-flight
+        verdict on file. A replay is the rehearsal of a day whose morning
+        checks passed, so the sandbox is handed the verdict that morning would
+        have written. A scenario that wants the other case deletes this file or
+        rewrites it in its own setup.
+        """
+        path = self.preflight_verdict_file(day)
+        path.write_text(json.dumps({"run_at": f"{day:%Y-%m-%d}T09:00:00-04:00",
+                                    "verdict": "pass", "dry_run": False,
+                                    "failed_checks": []}, indent=2) + "\n",
+                        encoding="utf-8")
+        return path
+
 
 def build_sandbox_database(sandbox: "Sandbox", db_module) -> str:
     """Build this scenario's own SQLite file from the real migrations.
@@ -1417,6 +1436,7 @@ def run_day(recording_or_history: Any, books_yaml: Path | str,
         context.books = list(registry.enabled_books())
         context.watcher = FillWatcher()
 
+        sandbox.write_preflight_pass(scenario.day)
         _write_shortlists(context, fake)
         if scenario.setup is not None:
             scenario.setup(context)

@@ -379,15 +379,22 @@ def _momentum_shortlist():
              "score": 2.5, "gain_pct": 3.0, "rel_volume": 2.5}]
 
 
-def _pick_tick(sandbox, book_id="B", now=None, halt_reason=None, broker=None):
-    """Run one book through its pick phase with a shortlist already on disk."""
+def _pick_tick(sandbox, book_id="B", now=None, halt_reason=None, broker=None,
+               guards=None):
+    """Run one book through its pick phase with a shortlist already on disk.
+
+    guards defaults to the marker files alone, with no day, so the pre-flight
+    verdict is not consulted. Pass loop.read_guards(day=...) to test that half.
+    """
     now = now or at(9, 40)
     write_shortlist(sandbox, f"shortlist_{now.date():%Y-%m-%d}.json",
                     _momentum_shortlist())
     registry = gr.load_books(BOOKS_YAML)
     book = registry.get(book_id)
     broker = broker or CountingBroker(price=100.0)
-    return loop.run_book(book, guard_for(book_id), now, loop.read_guards(), broker,
+    return loop.run_book(book, guard_for(book_id), now,
+                         guards if guards is not None else loop.read_guards(),
+                         broker,
                          "DUT077572", {}, "testhash", write_ledger=False,
                          halt_reason=halt_reason, quiet=True), broker
 
@@ -425,6 +432,112 @@ def test_no_trade_today_stops_entries_and_leaves_exits_alone(sandbox):
     decision = gr.check_order(guard, account_state, exit_intent)
     assert decision.allowed is True, decision.reasons
     assert loop.entries_blocked_reason(guards, state) is not None
+
+
+# --------------------------------- no pre-flight pass, no new position
+#
+# 2026-09-10. IB Gateway was down from about 03:00 to 11:27, the 09:00
+# pre-flight could not reach it and wrote no verdict at all, and when Gateway
+# came back nothing on disk said the morning had failed. The loop had no way of
+# telling "the checks passed" from "the checks never ran". These tests hold the
+# rule that fixes it: a missing verdict counts exactly like NO_TRADE_TODAY.
+
+
+def write_verdict(sandbox, verdict, day=TUESDAY, failed=None):
+    """Write output/preflight_YYYY-MM-DD.json the way agent/preflight.py does."""
+    path = sandbox / "output" / f"preflight_{day:%Y-%m-%d}.json"
+    path.write_text(json.dumps({"run_at": f"{day}T09:00:00-04:00",
+                                "verdict": verdict, "dry_run": False,
+                                "failed_checks": list(failed or [])}),
+                    encoding="utf-8")
+    return path
+
+
+def test_no_pre_flight_verdict_stops_entries_and_leaves_exits_alone(sandbox):
+    guards = loop.read_guards(day=TUESDAY)
+    assert not guards.preflight_verdict.exists(), "no verdict was written"
+
+    (tick, state), broker = _pick_tick(sandbox, "B", guards=guards)
+
+    assert state.picks, "the picks are still made and written down"
+    assert tick.would_be_orders == 0, "and not one of them became an order"
+    assert broker.order_calls == []
+    assert any("no pre-flight verdict" in row["rationale"]
+               for row in state.decisions)
+
+    # An exit still goes through the checks, which is the half that matters.
+    guard = guard_for("B")
+    guard = dataclasses.replace(
+        guard, universe=dataclasses.replace(guard.universe, allow_shorts=True))
+    exit_intent = gr.OrderIntent(symbol="AAPL", side="SELL", qty=10,
+                                 limit_price=100.0, purpose="exit", book_id="B")
+    account_state = bs.account_state_for(state, gr, at(10, 0), "DUT077572", False, {})
+    decision = gr.check_order(guard, account_state, exit_intent)
+    assert decision.allowed is True, decision.reasons
+    assert loop.entries_blocked_reason(guards, state) is not None
+
+
+def test_a_pre_flight_that_passed_lets_entries_through(sandbox):
+    write_verdict(sandbox, "pass")
+    guards = loop.read_guards(day=TUESDAY)
+    assert guards.preflight_refusal is None
+
+    (tick, state), broker = _pick_tick(sandbox, "B", guards=guards)
+
+    assert state.picks
+    assert tick.would_be_orders >= 1, "a passing morning opens positions"
+    assert broker.order_calls == [], "still dry run, so nothing was sent"
+
+
+def test_a_failed_pre_flight_verdict_stops_entries_and_names_the_checks(sandbox):
+    write_verdict(sandbox, "fail", failed=["gateway_login", "market_data"])
+    guards = loop.read_guards(day=TUESDAY)
+
+    (tick, state), broker = _pick_tick(sandbox, "B", guards=guards)
+
+    assert tick.would_be_orders == 0
+    reason = loop.entries_blocked_reason(guards, state)
+    assert reason and "gateway_login" in reason and "market_data" in reason
+
+
+def test_yesterdays_verdict_does_not_count_for_today(sandbox):
+    """A pass on file from Monday says nothing about Tuesday."""
+    write_verdict(sandbox, "pass", day=date(2026, 9, 7))
+    guards = loop.read_guards(day=TUESDAY)
+    assert guards.preflight_refusal is not None
+    assert "no pre-flight verdict" in guards.preflight_refusal
+
+
+def test_a_verdict_file_that_cannot_be_read_counts_as_a_fail(sandbox):
+    (sandbox / "output" / f"preflight_{TUESDAY:%Y-%m-%d}.json").write_text(
+        "{half written", encoding="utf-8")
+    guards = loop.read_guards(day=TUESDAY)
+    reason = guards.preflight_refusal
+    assert reason and "could not be read" in reason
+
+
+def test_guards_with_no_day_do_not_consult_a_verdict(sandbox):
+    """The readers that run before the clock is known must not be blocked."""
+    guards = loop.read_guards()
+    assert guards.preflight_verdict is None
+    assert guards.preflight_refusal is None
+
+
+def test_a_missing_verdict_shuts_the_live_order_path_too(sandbox):
+    """Belt and braces: the same brake as NO_TRADE_TODAY on the live locks."""
+    registry = gr.load_books(BOOKS_YAML)
+    book = registry.get("B")
+    open_now, shut = loop.live_locks(book, "DUT077572",
+                                     loop.read_guards(day=TUESDAY))
+    assert open_now is False
+    assert any("pre-flight" in reason for reason in shut)
+
+
+def test_the_tick_asks_for_the_verdict_of_the_day_it_thinks_it_is(sandbox):
+    """A rehearsal of another date must look for that date's verdict."""
+    source = (REAL_ROOT / "agent" / "loop.py").read_text(encoding="utf-8")
+    assert "read_guards(day=now.date())" in source, (
+        "run_one_tick has to pass the tick's own day, or the whole brake is off")
 
 
 def test_stop_allows_exits_only(sandbox):

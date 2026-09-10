@@ -465,11 +465,21 @@ def rehearsal_output_dir(now: datetime, real_now: datetime) -> Path | None:
 
 @dataclass(frozen=True)
 class Guards:
-    """The three files that stop the loop, and whether each of them is there."""
+    """The files that stop the loop, and whether each of them is there.
+
+    Three of them are markers: they stop the day by existing. The fourth is the
+    other way round. output/preflight_YYYY-MM-DD.json has to BE there, and has
+    to say pass, before any book may open a position. A missing verdict is a
+    refusal, not a permission.
+    """
 
     loop_disabled: Path
     stop: Path
     no_trade_today: Path
+    #: Today's pre-flight report. None means nobody asked which day this is, in
+    #: which case the verdict is not consulted at all. Only read_guards(day=...)
+    #: fills it in, and agent/loop.py's own tick always passes the day.
+    preflight_verdict: Path | None = None
 
     @property
     def loop_disabled_present(self) -> bool:
@@ -483,12 +493,63 @@ class Guards:
     def no_trade_present(self) -> bool:
         return self.no_trade_today.exists()
 
+    @property
+    def preflight_refusal(self) -> str | None:
+        """Why today's pre-flight forbids opening anything, or None when it does not.
 
-def read_guards(root: Path | None = None) -> Guards:
+        WHY THIS EXISTS, 2026-09-10. IB Gateway was down from about 03:00 to
+        11:27. The 09:00 pre-flight could not reach it and wrote neither
+        output/preflight_2026-09-10.json nor output/NO_TRADE_TODAY. Gateway came
+        back mid morning and nothing on disk said the morning had failed, so
+        nothing told the loop to stay out. Every book was in dry_run, which is
+        the only reason it cost nothing, and mode is not the contract.
+
+        The contract is "no pre-flight pass, no new position", and there are
+        three ways to fail it: no verdict file for today, a file that cannot be
+        read, and a file that says anything other than pass. All three read
+        exactly like output/NO_TRADE_TODAY. Exits are never blocked by any of
+        them: getting out is always allowed.
+        """
+        path = self.preflight_verdict
+        if path is None:
+            return None
+        if not path.exists():
+            return (f"there is no pre-flight verdict at {path}, so nothing has "
+                    "checked the broker for today. No pre-flight pass, no new "
+                    "position. Closing orders still work.")
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return (f"the pre-flight verdict at {path} could not be read "
+                    f"({type(exc).__name__}: {exc}), so it counts as a fail. "
+                    "Closing orders still work.")
+        if not isinstance(report, dict):
+            return (f"the pre-flight verdict at {path} is not a report, so it "
+                    "counts as a fail. Closing orders still work.")
+        verdict = str(report.get("verdict") or "").strip().lower()
+        if verdict == "pass":
+            return None
+        failed = ", ".join(str(name) for name in (report.get("failed_checks") or []))
+        return (f"the pre-flight verdict at {path} says "
+                f"{verdict or 'nothing at all'}"
+                + (f" and names {failed}" if failed else "")
+                + ", so no book opens anything today. Closing orders still work.")
+
+
+def read_guards(root: Path | None = None, day: date_type | None = None) -> Guards:
+    """The guard files, and with a day, that day's pre-flight verdict too.
+
+    Pass the day the tick thinks it is, not the wall clock, so a rehearsal of
+    another date looks for that date's verdict. Leaving it out means the
+    verdict is not consulted, which is what the guard file readers that run
+    before the clock is known want.
+    """
     folder = (root or project_root()) / "output"
     return Guards(loop_disabled=folder / "LOOP_DISABLED",
                   stop=folder / "STOP",
-                  no_trade_today=folder / "NO_TRADE_TODAY")
+                  no_trade_today=folder / "NO_TRADE_TODAY",
+                  preflight_verdict=(folder / f"preflight_{day:%Y-%m-%d}.json"
+                                     if day is not None else None))
 
 
 def entries_blocked_reason(guards: Guards, state: bs.BookState,
@@ -503,6 +564,9 @@ def entries_blocked_reason(guards: Guards, state: bs.BookState,
     if guards.no_trade_present:
         return (f"the file {guards.no_trade_today} exists, so no book opens "
                 "anything today. Closing orders still work.")
+    verdict = guards.preflight_refusal
+    if verdict:
+        return verdict
     if state.halted:
         return f"book {state.book_id} is halted today: {state.halt_reason}"
     return None
@@ -1935,6 +1999,8 @@ def live_locks(book: gr.BookConfig, account_id: str,
         shut.append(f"{guards.stop} exists")
     if guards.no_trade_present:
         shut.append(f"{guards.no_trade_today} exists")
+    if guards.preflight_refusal:
+        shut.append(f"today's pre-flight did not pass: {guards.preflight_refusal}")
     return (not shut), shut
 
 
@@ -4630,6 +4696,21 @@ def run_book(book: gr.BookConfig, guard: gr.Guardrails, now: datetime, guards: G
         if state.halted:
             print(f"  HALTED: {state.halt_reason}")
 
+    # Said once per book per day rather than on every tick. A morning with no
+    # pre-flight pass repeats itself 80 times between the open and the close,
+    # and an alert that arrives 80 times is one nobody reads.
+    refusal = guards.preflight_refusal
+    if refusal:
+        tick.alert(
+            "warn", f"Book {book.book_id} opens nothing today: no pre-flight pass",
+            f"{refusal}\n\nThe 9 AM pre-flight is what proves the broker, the "
+            "scanner, the books and the account are all in a fit state to trade. "
+            "Until it has passed for today, this book may close and manage what "
+            "it holds and may not open anything new.\n\nRun it by hand when the "
+            "broker is back, from the project folder:\n"
+            "  venv312/bin/python agent/preflight.py",
+            key="preflight_verdict", quiet_minutes=ALERT_ONCE_A_DAY_MINUTES)
+
     try:
         if phase == PREOPEN:
             do_preopen(tick, state, broker)
@@ -5486,6 +5567,11 @@ def run_one_tick(argv: list[str] | None = None,
 
     zone = ZoneInfo(registry.shared.timezone)
     now = parse_now(args.now, zone)
+    # Read a second time, now that the tick knows what day it thinks it is, so
+    # the guards carry today's pre-flight verdict as well as the marker files.
+    # The first read had to happen before the books were loaded, because
+    # LOOP_DISABLED is honoured before anything else is even attempted.
+    guards = read_guards(day=now.date())
     real_now = datetime.now(zone)
     rehearsal = rehearsal_output_dir(now, real_now)
     if rehearsal is not None:
@@ -5526,6 +5612,8 @@ def run_one_tick(argv: list[str] | None = None,
     if guards.no_trade_present:
         print(f"\nNO TRADE TODAY: {guards.no_trade_today} exists. No book opens "
               "anything today. Closing orders still work.")
+    if guards.preflight_refusal:
+        print(f"\nNO PRE-FLIGHT PASS: {guards.preflight_refusal}")
     alert_on_guard_files(guards, now)
 
     if broker is None:
