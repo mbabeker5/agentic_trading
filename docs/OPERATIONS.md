@@ -254,6 +254,81 @@ holds what the start script said, and
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/ibc_logs/`
 holds what Gateway itself said.
 
+#### A Gateway that is running but silent
+
+Added 2026-09-10, after the same failure cost two mornings in a row.
+
+On 2026-09-09 and again on 2026-09-10 the API port on 4002 was shut for over
+eight hours while the Gateway process stayed alive, trying and failing to log
+in. The watchdog saw the shut port on every wake up, said so every hour, and
+repaired nothing. Its rule refused to touch a Gateway whose process was up,
+and the reasoning behind that rule is sound: starting a second Gateway on top
+of a running one gives two logins fighting over one session, which is worse
+than the hang it would be fixing, and a shut port on a process that started a
+minute ago usually just means it has not finished starting. What was missing
+was a clock. Nothing turned the patience back into action, and the person it
+was left to could not be reached, because the same network fault that broke
+the Gateway had also broken Slack.
+
+The rule now has a clock on it. Three things have to be true together:
+
+1. `gateway_port` has been failing for more than **fifteen minutes**. The
+   watchdog knows when it started from `failing_since` in
+   `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/watchdog_state.json`.
+   Gateway takes about a minute to start and open its port, so fifteen minutes
+   is far past any honest start up and far short of a morning.
+2. `gateway_process` is passing, so there is a live Gateway to stop.
+3. The market is open, or opens within the next **ninety minutes**. Repairing
+   the broker at four in the morning helps nobody. Repairing it at eight gives
+   the 09:00 pre-flight a working Gateway to check.
+
+When all three hold, the watchdog runs
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/stop_gateway.sh`
+and then
+`/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/start_gateway.sh`.
+The stop kills the process, so the thing the old rule was guarding against
+cannot happen: there is never a second Gateway logging in on top of the first.
+It is then proved the same four ways as any other restart, described just
+above.
+
+Everything that made the old rule safe is still there. One attempt per outage.
+Nothing between 01:45 and 02:30, which is IBC's own nightly restart. And no
+restart at all on error 10197, which means Mo's own quote screen has the data
+feed and Gateway is perfectly well.
+
+One thing did have to change with it. An unproved restart is normally not
+written down, so an outage keeps its one attempt in hand rather than spending
+it on a start that achieved nothing. That is right for a rule that fires once,
+on the first miss. This rule is looked at on every wake up, so if a failed
+attempt were not recorded it would stop and start Gateway every five minutes
+for as long as the outage lasted. So this one attempt is written down whether
+or not it could be proved, and if it did not work you get the "restart did not
+take" message and it becomes yours to look at.
+
+You are told before and after. Before:
+
+```
+[WARN] Restarting a Gateway that is running but silent
+
+IB Gateway's process is alive but nothing has answered on its API port for 20
+minutes, and the market is open or about to open.
+
+The watchdog is now stopping Gateway with agent/stop_gateway.sh and starting it
+again with agent/start_gateway.sh. The stop kills the process first, so there
+is never a second Gateway logging in on top of the first.
+
+This happens once per outage. If it does not work, the next message will say so
+and it becomes yours to look at.
+```
+
+And after, which is new for every kind of restart and not only this one. A
+verified restart used to say nothing at all, so the only way to learn that a
+machine had repaired the broker while you were away was to read a log:
+
+```
+[INFO] Watchdog: IB Gateway is back
+```
+
 ### The pre-flight
 
 ```
@@ -287,6 +362,58 @@ If anything fails it writes
 which stops the loop opening anything for the rest of the day, and messages you
 with the names of the checks that failed. It writes the full answer to
 `output/preflight_YYYY-MM-DD.json` either way.
+
+#### A verdict is always written
+
+Added 2026-09-10, after a morning that produced no verdict at all.
+
+IB Gateway was down from about 03:00 to 11:27. The 09:00 pre-flight could not
+reach it on 127.0.0.1:4002 and left neither `output/preflight_2026-09-10.json`
+nor `output/NO_TRADE_TODAY` behind. Gateway came back mid morning and nothing
+on disk said the morning had failed, so nothing downstream could tell "the
+checks passed" from "the checks never ran". Mo created the marker by hand at
+11:35. Every book was in dry run, which is the only reason it cost nothing,
+and the mode a book happens to be in is not the contract.
+
+Two rules close it, one on each side.
+
+**The pre-flight always writes a verdict.** Every check runs inside a guard,
+so a check that throws fails its own line, carries the error text into the
+report and the alert, and the checks after it still run. A Gateway that throws
+instead of answering fails `gateway_login` and `market_data` rather than
+ending the run. Underneath that, the report is written from a `finally` block,
+so a run that falls over anywhere, or is killed where it stands, still leaves
+an answer on disk. A verdict the pre-flight could not reach is a fail:
+`NO_TRADE_TODAY` is created and you are messaged. There is also a line called
+`run_completed` that fails when the run stopped short without recording a
+failure of its own, and names the checks that never ran. Checks that did not
+run must never be counted as checks that passed.
+
+**The loop refuses to open anything without a pass on file.** Nothing in
+`agent/loop.py` had ever read the verdict, so a morning whose checks never ran
+looked exactly like a morning that passed. Now every tick looks for
+`output/preflight_<today>.json` and there are three ways to fail it: the file
+is not there, it cannot be read, or it says anything other than `pass`. All
+three behave exactly like `NO_TRADE_TODAY`. No book opens a position. Closing
+and managing what is already held is untouched. The reason goes in the
+decision row, and you are told once per book per day rather than on every
+tick, because a morning like this repeats itself eighty times between the open
+and the close. The same brake sits on the live order path, next to the one for
+`NO_TRADE_TODAY`.
+
+So if you find the loop refusing to trade and there is no obvious marker file,
+look for today's verdict:
+
+```
+ls /Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/preflight_$(date +%F).json
+```
+
+If it is missing, run the pre-flight by hand and it will write one:
+
+```
+cd /Users/mtalib/workspace_repos/personal_repo/agentic_trading
+venv312/bin/python agent/preflight.py
+```
 
 ### A read that never returns
 
@@ -604,7 +731,7 @@ handle's note of which silence it has already acted on, because starting the
 agent again is starting over. It does not restart Gateway, reload any launchd
 job, or buy back anything the kill switch sold.
 
-## The three brakes
+## The brakes
 
 Three files, all in
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/`, all
@@ -618,6 +745,14 @@ removed by `agent/reenable.sh`.
 
 `NO_TRADE_TODAY` does not clear itself at midnight, on purpose. A morning that
 failed its checks should need a person to look before the agent trades again.
+
+There is a fourth brake and it is the other way round. `STOP`,
+`LOOP_DISABLED` and `NO_TRADE_TODAY` stop the day by existing.
+`output/preflight_<today>.json` has to **be** there, and has to say `pass`,
+before any book may open a position. A missing verdict is a refusal, not a
+permission. It is not removed by `agent/reenable.sh`, because the way to clear
+it is to run the pre-flight and have it pass. See "A verdict is always
+written" above.
 
 To pause without stopping the launchd job at all, one line does it:
 
