@@ -691,8 +691,10 @@ def test_the_backup_script_makes_a_copy_and_deletes_the_old_ones(tmp_path):
     left = sorted(p.name for p in backups.glob("*"))
     assert old.name not in left, "a copy older than thirty days should be gone"
     assert recent.name in left, "yesterday's copy should have been kept"
-    made = [name for name in left if name.startswith("trading_2026-09-0")
-            and name not in {recent.name}]
+    # Whatever today is. This used to look for a name starting
+    # "trading_2026-09-0", which stopped matching on the tenth of the month.
+    made = [name for name in left
+            if name.startswith("trading_") and name != recent.name]
     assert made, f"no new backup was written, folder holds {left}"
     assert not [name for name in left if name.endswith(("-wal", "-shm"))], (
         "opening the copy to check it must not leave WAL files behind")
