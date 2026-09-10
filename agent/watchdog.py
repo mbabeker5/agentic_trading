@@ -52,6 +52,15 @@ properly. The rules are:
   attempt per outage, not one per wake up, and never a second Gateway on top of
   a running one: when a Gateway is sitting there useless, agent/stop_gateway.sh
   runs first and the start only follows once it is gone.
+* If the port has been shut for more than fifteen minutes while the Gateway
+  process is still alive, and the market is open or opens within ninety
+  minutes, stop that Gateway with agent/stop_gateway.sh and start a new one.
+  Still one attempt per outage, and still never two Gateways, because the stop
+  kills the process before anything else is started. This is the rule that
+  gave back the mornings of 2026-09-09 and 2026-09-10, when the port was shut
+  for over eight hours on a live process and the watchdog was forbidden to act.
+  The old refusal was right for the first few minutes and wrong after that;
+  what was missing was a clock on the patience.
 * A restart only counts once it has been proved. The start script exiting 0
   proves nothing, because that script becomes Gateway when it works. So the
   watchdog looks at Gateway before it starts anything, then watches for two
@@ -59,7 +68,12 @@ properly. The rules are:
   completed" line in the IBC log newer than the one it saw before, port 4002
   accepting a connection, and a read that actually comes back. Anything less is
   a "restart did not take" message that says which of the four did and did not
-  happen, and the attempt is not written down as an attempt.
+  happen, and the attempt is not written down as an attempt. The one exception
+  is the shut port rule above: that one writes its attempt down either way,
+  because it fires on every wake up and would otherwise stop and start Gateway
+  every five minutes for as long as the outage lasted.
+* A restart that worked says so, at level info, so a repair made while nobody
+  was watching is not something Mo has to find in a log.
 * A check that keeps missing re-alerts at most every thirty minutes, so an
   outage over lunch is two or three messages rather than fifty.
 * A check that comes back alerts once, at level info, so Mo knows it is over.
@@ -263,6 +277,35 @@ CHECK_ORDER = (
 #: Only a miss on one of these can lead to starting IB Gateway.
 RESTART_CHECKS = (CHECK_GATEWAY_PROCESS, CHECK_GATEWAY_PORT, CHECK_IB_ANSWERS)
 
+#: The misses where a restart has to stop the old Gateway before it starts a
+#: new one. Both of these can happen with a Gateway process still running, and
+#: two logins fighting over one session is worse than the hang being fixed.
+#: restart_gateway() only actually stops something when there is something to
+#: stop, so this is safe for the case where the process is already gone.
+RESTART_STOPS_FIRST = (CHECK_IB_ANSWERS, CHECK_GATEWAY_PORT)
+
+#: HOW LONG A SHUT PORT ON A LIVE GATEWAY IS GIVEN BEFORE IT IS RESTARTED.
+#:
+#: Why it exists. On 2026-09-09 and again on 2026-09-10 the API port on 4002
+#: was shut for eight hours while the Gateway process stayed alive and kept
+#: trying to log in. The old rule forbade a restart in exactly that shape, for
+#: a good reason: a second Gateway on top of a running one gives two logins
+#: fighting over one session, and a shut port on a fresh process may only mean
+#: it is still starting up. The gap was that there was no clock on the
+#: patience. Fifteen minutes is far longer than any honest start up (Gateway
+#: needs about a minute) and far shorter than a morning.
+#:
+#: The restart this leads to stops the old Gateway first, through
+#: agent/stop_gateway.sh, which kills the process. There is never a second
+#: Gateway.
+PORT_SHUT_PATIENCE = timedelta(minutes=15)
+
+#: How far ahead of the open the restart above is worth doing. Repairing a
+#: Gateway at four in the morning helps nobody and risks colliding with IBC's
+#: own nightly restart; repairing it at eight gives the 09:00 pre-flight a
+#: working broker to check.
+RESTART_LOOKAHEAD = timedelta(minutes=90)
+
 ACTION_ALERT = "alert"
 ACTION_RESTART = "restart_gateway"
 
@@ -330,6 +373,12 @@ class Action:
     level: str = "info"
     title: str = ""
     body: str = ""
+    #: Write this restart down as the outage's one attempt even when it could
+    #: not be proved. Off by default, so an outage whose start script achieved
+    #: nothing keeps its attempt in hand. On for the shut port rule below,
+    #: which fires from the still failing branch and would otherwise stop and
+    #: start Gateway every five minutes for as long as the outage lasted.
+    record_attempt: bool = False
 
 
 @dataclass(frozen=True)
@@ -484,6 +533,23 @@ def in_market_hours(now: datetime, schedule: Schedule) -> bool:
     return schedule.open_at <= now.time() < schedule.close_at
 
 
+def open_or_opening_soon(now: datetime, schedule: Schedule,
+                         within: timedelta = RESTART_LOOKAHEAD) -> bool:
+    """True when the market is open, or opens within `within` of now.
+
+    Only today's open is looked at. At eleven at night the next open is
+    tomorrow morning, which is a great deal more than ninety minutes away, so
+    saying no is the right answer and saying it without working out which day
+    trades next is the simple way to get there.
+    """
+    if in_market_hours(now, schedule):
+        return True
+    if not is_trading_day(now, schedule):
+        return False
+    opens = datetime.combine(now.date(), schedule.open_at, tzinfo=now.tzinfo)
+    return timedelta(0) <= opens - now <= within
+
+
 def state_path() -> Path:
     return output_dir() / "watchdog_state.json"
 
@@ -555,6 +621,50 @@ def _may_restart(check: Check, checks: dict[str, Check]) -> bool:
         return True
     process = checks.get(CHECK_GATEWAY_PROCESS)
     return process is not None and not process.ok and not process.skipped
+
+
+def silent_gateway_needs_a_restart(check: Check, checks: dict[str, Check],
+                                   previous: dict, now: datetime,
+                                   schedule: Schedule) -> bool:
+    """Whether a shut port on a Gateway that is still running has waited long enough.
+
+    This is the rule that would have given back the mornings of 2026-09-09 and
+    2026-09-10. On both days the port on 4002 was shut for eight hours while
+    the Gateway process stayed alive, and _may_restart above refused to touch
+    it, so the watchdog alerted every hour and repaired nothing.
+
+    Four things have to be true, and each one is here for a reason.
+
+    The port is what failed. Not the process, which the old rule already
+    handles, and not ib_answers, which has its own way in.
+
+    The process is alive. If it were not, this is the ordinary first failure
+    the old rule restarts anyway. Alive is also what makes the stop first
+    matter: agent/stop_gateway.sh kills that process, so there is never a
+    second Gateway.
+
+    It has been shut for more than PORT_SHUT_PATIENCE. A Gateway that started
+    a minute ago and has not opened its port yet is starting up, not wedged.
+
+    The market is open or opens soon. A Gateway repaired at four in the
+    morning helps nobody, and the quiet window around IBC's own nightly
+    restart is checked separately by the caller.
+
+    Message code 10197 is never a reason, for the same reason as in
+    _may_restart: it means Mo's own quote screen has the data feed and Gateway
+    is perfectly healthy.
+    """
+    if check.name != CHECK_GATEWAY_PORT:
+        return False
+    if check.code == CODE_COMPETING_SESSION:
+        return False
+    process = checks.get(CHECK_GATEWAY_PROCESS)
+    if process is None or process.skipped or not process.ok:
+        return False
+    shut_since = _read_time(previous.get("failing_since"))
+    if shut_since is None or now - shut_since <= PORT_SHUT_PATIENCE:
+        return False
+    return open_or_opening_soon(now, schedule)
 
 
 def in_nightly_restart_window(now: datetime) -> bool:
@@ -649,6 +759,25 @@ def restart_did_not_take_alert(check: str, outcome: RestartOutcome) -> Action:
               "output/gateway_launch.log and output/ibc_logs hold what happened."))
 
 
+def restart_took_alert(check: str, outcome: RestartOutcome) -> Action:
+    """The message for a restart that worked. Pure.
+
+    A restart used to say nothing at all when it succeeded, so the only way to
+    learn that the watchdog had repaired something was to read a log. The
+    quiet ones are the ones worth telling Mo about: it means a machine did
+    something to his broker while he was not looking.
+    """
+    return Action(
+        kind=ACTION_ALERT, check=check, level="info",
+        title="Watchdog: IB Gateway is back",
+        body=("IB Gateway was restarted and is answering again. It took "
+              f"{outcome.waited_seconds} seconds and was checked four ways:\n\n"
+              f"{outcome.detail}\n\n"
+              f"What led to it: the {check} check was failing.\n\n"
+              "Nothing else needs doing. The next run of the checks will say "
+              "the check has recovered."))
+
+
 def _restart_already_tried(state: dict) -> bool:
     """True when this outage has already had its one restart attempt."""
     for name in RESTART_CHECKS:
@@ -658,13 +787,18 @@ def _restart_already_tried(state: dict) -> bool:
     return False
 
 
-def decide_actions(checks: dict, now: datetime, state: dict) -> list[Action]:
+def decide_actions(checks: dict, now: datetime, state: dict,
+                   schedule: Schedule | None = None) -> list[Action]:
     """Work out what to do. Pure: no files, no network, no clock of its own.
 
     checks is {check name: Check} (a plain dict per check works too), now is the
     time, state is what load_state() returned last run. The answer is a list of
     Actions for the caller to carry out, or to print and ignore in a dry run.
+
+    schedule says when the market opens, which the shut port rule needs. Left
+    out, the ordinary 09:30 to 16:00 weekday calendar is assumed.
     """
+    schedule = schedule or Schedule()
     remembered = state.get("checks") or {}
     actions: list[Action] = []
     restart_scheduled = False
@@ -718,6 +852,37 @@ def decide_actions(checks: dict, now: datetime, state: dict) -> list[Action]:
                 kind=ACTION_ALERT, check=name, level=check.level,
                 title=f"Watchdog: {name} is still failing",
                 body=f"{body}\n\nFailing since {since}."))
+
+        # A port that has been shut a while on a Gateway that is still running
+        # is the eight hour outage of 2026-09-09 and 2026-09-10. Stop it and
+        # start it again, once, and say so before and after.
+        if (not restart_scheduled and not already_tried
+                and not in_nightly_restart_window(now)
+                and silent_gateway_needs_a_restart(
+                    check, normalised, previous, now, schedule)):
+            restart_scheduled = True
+            shut_for = now - _read_time(previous.get("failing_since"))
+            minutes = int(shut_for.total_seconds() // 60)
+            actions.append(Action(
+                kind=ACTION_ALERT, check=name, level="warn",
+                title="Restarting a Gateway that is running but silent",
+                body=(f"IB Gateway's process is alive but nothing has answered "
+                      f"on its API port for {minutes} minutes, and the market "
+                      "is open or about to open.\n\n"
+                      "The watchdog is now stopping Gateway with "
+                      "agent/stop_gateway.sh and starting it again with "
+                      "agent/start_gateway.sh. The stop kills the process "
+                      "first, so there is never a second Gateway logging in "
+                      "on top of the first.\n\n"
+                      "This happens once per outage. If it does not work, the "
+                      "next message will say so and it becomes yours to look "
+                      "at.")))
+            actions.append(Action(
+                kind=ACTION_RESTART, check=name, level="info",
+                title="Stopping IB Gateway and starting it again",
+                body=("One stop and start, through agent/stop_gateway.sh then "
+                      "agent/start_gateway.sh."),
+                record_attempt=True))
 
     return actions
 
@@ -1434,21 +1599,32 @@ def perform(actions: list[Action], allow_restart: bool) -> tuple[list[str], list
             if not allow_restart:
                 done.append("restart skipped, --no-restart was given")
                 continue
-            # A Gateway that is up and not answering has to be stopped before a
-            # new one is worth anything. A Gateway that is not running at all
-            # has nothing to stop.
-            outcome = restart_gateway(stop_first=(action.check == CHECK_IB_ANSWERS))
+            # A Gateway that is up and not answering, or up with a shut port,
+            # has to be stopped before a new one is worth anything. A Gateway
+            # that is not running at all has nothing to stop.
+            outcome = restart_gateway(
+                stop_first=(action.check in RESTART_STOPS_FIRST))
             done.append(f"restart: {'verified' if outcome.took else 'NOT verified'} "
                         f"after {outcome.waited_seconds}s")
             done.extend(outcome.detail.splitlines())
             if outcome.took:
+                took = restart_took_alert(action.check, outcome)
+                delivered = alerts_module.alert(took.level, took.title, took.body)
+                done.append(f"alert [{took.level}] {took.title} "
+                            f"-> {', '.join(delivered) or 'nothing'}")
                 happened.append(action)
+                happened.append(took)
                 continue
             failed = restart_did_not_take_alert(action.check, outcome)
             delivered = alerts_module.alert(failed.level, failed.title, failed.body)
             done.append(f"alert [{failed.level}] {failed.title} "
                         f"-> {', '.join(delivered) or 'nothing'}")
             happened.append(failed)
+            # A rule that fires on every run has to write its attempt down
+            # whether or not it worked, or it would stop and start Gateway
+            # every five minutes for as long as the outage lasted.
+            if action.record_attempt:
+                happened.append(action)
     return done, happened
 
 
@@ -1528,7 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
 
     checks = run_checks(now, schedule, Deadline())
     state = load_state()
-    actions = decide_actions(checks, now, state)
+    actions = decide_actions(checks, now, state, schedule)
 
     print(f"{now:%Y-%m-%d %H:%M:%S %Z} watchdog, market hours: "
           f"{'yes' if market_hours else 'no'}")

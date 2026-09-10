@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock_time, timedelta
 from pathlib import Path
 
 AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
@@ -107,9 +107,14 @@ def gateway_not_answering() -> dict[str, wd.Check]:
     return checks
 
 
-def step(checks: dict, now: datetime, state: dict) -> tuple[list[wd.Action], dict]:
-    """One whole run: decide, then record, the way main() does it."""
-    actions = wd.decide_actions(checks, now, state)
+def step(checks: dict, now: datetime, state: dict,
+         schedule=None) -> tuple[list[wd.Action], dict]:
+    """One whole run: decide, then record, the way main() does it.
+
+    schedule is only needed by the tests that care about market hours. Left
+    out, decide_actions assumes the ordinary 09:30 to 16:00 weekday calendar.
+    """
+    actions = wd.decide_actions(checks, now, state, schedule)
     return actions, wd.update_state(checks, now, state, actions)
 
 
@@ -1387,3 +1392,246 @@ def test_a_read_that_fails_some_other_way_is_a_miss_without_a_diagnosis():
     assert not check.ok
     assert "Socket disconnect" in check.detail
     assert "lost its upstream connection" not in check.detail
+
+
+# ------------------- a Gateway that is running but has been silent too long
+#
+# 2026-09-09 and 2026-09-10, the same failure both days. The API port on 4002
+# was shut for over eight hours while the Gateway process stayed alive and
+# kept trying to log in. The watchdog saw the shut port every hour, said so
+# every hour, and was forbidden by its own rule from touching a Gateway whose
+# process was up. On the ninth it took a piece of luck (the wedged process
+# vanishing on its own) to unblock it, by which time the morning was gone.
+#
+# The rule is unchanged in spirit and now has a clock on it. After fifteen
+# minutes of a shut port on a live process, with the market open or about to
+# open, the watchdog stops that Gateway (which kills the process, so there is
+# never a second one) and starts a new one. Once per outage.
+
+BEFORE_THE_OPEN = datetime(2026, 9, 8, 8, 30, tzinfo=wd.EASTERN)   # 60 min early
+EARLY_MORNING = datetime(2026, 9, 8, 6, 0, tzinfo=wd.EASTERN)      # 210 min early
+QUIET_WINDOW = datetime(2026, 9, 8, 2, 0, tzinfo=wd.EASTERN)       # IBC's own restart
+
+
+def port_shut_process_alive() -> dict[str, wd.Check]:
+    """The 2026-09-09 shape: Gateway is running, nothing answers on its port."""
+    checks = healthy()
+    checks[wd.CHECK_GATEWAY_PORT] = wd.Check(
+        wd.CHECK_GATEWAY_PORT, ok=False,
+        detail="Nothing is accepting connections on 127.0.0.1:4002.")
+    for name in (wd.CHECK_IB_CONNECT, wd.CHECK_IB_ANSWERS, wd.CHECK_MARKET_DATA):
+        checks[name] = wd.Check(name, ok=True, skipped=True,
+                                detail="not checked, the port is shut")
+    return checks
+
+
+def shut_for(minutes: int, at: datetime = MID_MORNING, schedule=None):
+    """Run the checks once, then again `minutes` later. Returns the second run."""
+    checks = port_shut_process_alive()
+    _first, state = step(checks, at, {"checks": {}}, schedule)
+    return step(checks, at + timedelta(minutes=minutes), state, schedule)
+
+
+def test_ten_minutes_of_a_shut_port_is_still_patience():
+    """A Gateway that started a minute ago is starting up, not wedged."""
+    actions, state = shut_for(10)
+
+    assert restarts_in(actions) == []
+    assert alerts_in(actions) == [], "and not worth mentioning again this soon"
+    assert state["checks"][wd.CHECK_GATEWAY_PORT]["restart_attempted"] is False
+
+
+def test_twenty_minutes_of_a_shut_port_in_market_hours_is_a_restart():
+    """The whole point: the eight hour outage becomes a twenty minute one."""
+    actions, state = shut_for(20)
+
+    started = restarts_in(actions)
+    assert len(started) == 1, "one stop and start, not one per failing check"
+    assert started[0].check == wd.CHECK_GATEWAY_PORT
+    assert started[0].record_attempt is True
+
+    # Said before it happens, in words that explain themselves.
+    said = alerts_in(actions)
+    assert len(said) == 1
+    assert said[0].title == "Restarting a Gateway that is running but silent"
+    assert said[0].level == "warn"
+    assert "20 minutes" in said[0].body
+    assert "stop_gateway.sh" in said[0].body
+    assert "never a second Gateway" in said[0].body
+    assert actions.index(said[0]) < actions.index(started[0]), "before, not after"
+
+    assert state["checks"][wd.CHECK_GATEWAY_PORT]["restart_attempted"] is True
+
+
+def test_the_same_shut_port_an_hour_before_the_open_is_a_restart_too():
+    """08:30 is inside the ninety minutes, so the pre-flight finds a live broker."""
+    actions, _ = shut_for(20, at=BEFORE_THE_OPEN)
+    assert len(restarts_in(actions)) == 1
+
+
+def test_the_same_shut_port_at_six_in_the_morning_only_says_so():
+    """Three and a half hours before the open. Nothing is waiting on it yet."""
+    actions, state = shut_for(40, at=EARLY_MORNING)
+
+    assert restarts_in(actions) == []
+    said = alerts_in(actions)
+    assert [a.title for a in said] == ["Watchdog: gateway_port is still failing"]
+    assert state["checks"][wd.CHECK_GATEWAY_PORT]["restart_attempted"] is False
+
+
+def test_nothing_happens_during_ibcs_own_nightly_restart():
+    """Two in the morning. IBC is restarting Gateway itself and must be left alone."""
+    actions, _ = shut_for(20, at=QUIET_WINDOW)
+    assert restarts_in(actions) == []
+
+
+def test_the_quiet_window_is_what_stops_it_and_not_only_the_hour():
+    """Pretend the market opened at 02:15, so only the quiet window can refuse."""
+    open_in_the_night = wd.Schedule(open_at=clock_time(2, 15),
+                                    close_at=clock_time(16, 0))
+    assert wd.open_or_opening_soon(QUIET_WINDOW, open_in_the_night) is True
+    actions, _ = shut_for(20, at=QUIET_WINDOW, schedule=open_in_the_night)
+    assert restarts_in(actions) == [], "the nightly window wins"
+
+
+def test_a_gateway_that_is_up_with_its_port_open_is_left_alone():
+    checks = healthy()
+    _first, state = step(checks, MID_MORNING, {"checks": {}})
+    actions, _ = step(checks, MID_MORNING + timedelta(minutes=20), state)
+    assert actions == []
+    assert wd.silent_gateway_needs_a_restart(
+        checks[wd.CHECK_GATEWAY_PORT], checks, {}, MID_MORNING, wd.Schedule()) is False
+
+
+def test_a_shut_port_with_no_gateway_process_is_the_old_rule_not_this_one():
+    """Nothing to stop, so the ordinary first failure restart already covers it."""
+    checks = gateway_down()
+    port = checks[wd.CHECK_GATEWAY_PORT]
+    previous = {"failing_since": (MID_MORNING - timedelta(hours=2)).isoformat()}
+    assert wd.silent_gateway_needs_a_restart(
+        port, checks, previous, MID_MORNING, wd.Schedule()) is False
+
+
+def test_a_competing_session_is_never_a_reason_to_restart():
+    """10197 means Mo's own quote screen has the feed. Gateway is perfectly well."""
+    checks = port_shut_process_alive()
+    checks[wd.CHECK_GATEWAY_PORT] = wd.Check(
+        wd.CHECK_GATEWAY_PORT, ok=False, code=wd.CODE_COMPETING_SESSION,
+        detail="A competing live session has the market data line.")
+    previous = {"failing_since": (MID_MORNING - timedelta(hours=2)).isoformat()}
+    assert wd.silent_gateway_needs_a_restart(
+        checks[wd.CHECK_GATEWAY_PORT], checks, previous, MID_MORNING,
+        wd.Schedule()) is False
+
+
+def test_the_shut_port_outage_only_ever_gets_one_restart_even_over_hours():
+    """The eight hours of 2026-09-09, five minutes at a time."""
+    checks = port_shut_process_alive()
+    state: dict = {"checks": {}}
+    now = MID_MORNING
+    started = 0
+    for _ in range(60):                       # five hours of wake ups
+        actions, state = step(checks, now, state)
+        started += len(restarts_in(actions))
+        now += timedelta(minutes=5)
+    assert started == 1, "one repair attempt for the whole outage"
+
+
+def test_a_restart_that_could_not_be_proved_still_spends_the_outages_one_attempt(
+        monkeypatch):
+    """Otherwise this rule would stop and start Gateway every five minutes."""
+    catch_alerts(monkeypatch)
+    monkeypatch.setattr(wd, "restart_gateway", lambda *a, **k: fake_outcome(False))
+
+    checks = port_shut_process_alive()
+    _first, state = step(checks, MID_MORNING, {"checks": {}})
+    later = MID_MORNING + timedelta(minutes=20)
+    actions = wd.decide_actions(checks, later, state)
+    _lines, happened = wd.perform(actions, allow_restart=True)
+    state = wd.update_state(checks, later, state, happened)
+
+    assert state["checks"][wd.CHECK_GATEWAY_PORT]["restart_attempted"] is True
+    assert wd.decide_actions(checks, later + timedelta(minutes=5), state) == []
+
+
+def test_a_shut_port_restart_kills_the_old_gateway_before_starting_one(monkeypatch):
+    catch_alerts(monkeypatch)
+    asked: list = []
+
+    def fake_restart(*args, **kwargs):
+        asked.append(kwargs.get("stop_first"))
+        return fake_outcome(True)
+
+    monkeypatch.setattr(wd, "restart_gateway", fake_restart)
+
+    checks = port_shut_process_alive()
+    _first, state = step(checks, MID_MORNING, {"checks": {}})
+    actions = wd.decide_actions(checks, MID_MORNING + timedelta(minutes=20), state)
+    wd.perform(actions, allow_restart=True)
+
+    assert asked == [True], "stop first, so two Gateways never fight over one session"
+
+
+def test_the_stop_really_does_come_before_the_start():
+    """End to end through restart_gateway, with the scripts faked out."""
+    order: list[str] = []
+    outcome = wd.restart_gateway(
+        wait_seconds=10, poll_seconds=5,
+        probe=FakeProbe(BEFORE, ALL_THREE),
+        launcher=lambda: order.append("start_gateway.sh") or (FakeHandle(None), "starting"),
+        sleep=lambda seconds: None, stop_first=True,
+        stopper=lambda: order.append("stop_gateway.sh") or (True, "the old Gateway was stopped"),
+        answering=lambda: True)
+
+    assert order == ["stop_gateway.sh", "start_gateway.sh"]
+    assert outcome.took is True
+
+
+def test_a_restart_that_worked_says_so_afterwards(monkeypatch):
+    """Alert before and after. A machine touched the broker while Mo was away."""
+    sent = catch_alerts(monkeypatch)
+    monkeypatch.setattr(wd, "restart_gateway", lambda *a, **k: fake_outcome(True))
+
+    checks = port_shut_process_alive()
+    _first, state = step(checks, MID_MORNING, {"checks": {}})
+    actions = wd.decide_actions(checks, MID_MORNING + timedelta(minutes=20), state)
+    wd.perform(actions, allow_restart=True)
+
+    assert sent == [("warn", "Restarting a Gateway that is running but silent"),
+                    ("info", "Watchdog: IB Gateway is back")]
+
+
+# ------------------------------------------- the market hours look ahead
+
+def test_the_market_being_open_counts_as_open():
+    assert wd.open_or_opening_soon(MID_MORNING, wd.Schedule()) is True
+
+
+def test_ninety_minutes_before_the_open_counts_and_ninety_one_does_not():
+    schedule = wd.Schedule()
+    just_inside = datetime(2026, 9, 8, 8, 0, tzinfo=wd.EASTERN)      # 90 minutes
+    just_outside = datetime(2026, 9, 8, 7, 59, tzinfo=wd.EASTERN)    # 91 minutes
+    assert wd.open_or_opening_soon(just_inside, schedule) is True
+    assert wd.open_or_opening_soon(just_outside, schedule) is False
+
+
+def test_after_the_close_does_not_count():
+    assert wd.open_or_opening_soon(AFTER_HOURS, wd.Schedule()) is False
+
+
+def test_a_saturday_never_counts():
+    early_saturday = datetime(2026, 9, 12, 8, 30, tzinfo=wd.EASTERN)
+    assert wd.open_or_opening_soon(early_saturday, wd.Schedule()) is False
+
+
+def test_a_holiday_never_counts():
+    labor_day = datetime(2026, 9, 7, 8, 30, tzinfo=wd.EASTERN)       # a Monday
+    schedule = wd.Schedule(holidays=("2026-09-07",))
+    assert wd.open_or_opening_soon(labor_day, schedule) is False
+
+
+def test_the_patience_is_fifteen_minutes_and_the_look_ahead_ninety():
+    assert wd.PORT_SHUT_PATIENCE == timedelta(minutes=15)
+    assert wd.RESTART_LOOKAHEAD == timedelta(minutes=90)
+    assert wd.CHECK_GATEWAY_PORT in wd.RESTART_STOPS_FIRST
+    assert wd.CHECK_IB_ANSWERS in wd.RESTART_STOPS_FIRST
