@@ -1152,3 +1152,203 @@ def test_a_dry_run_that_runs_out_of_time_creates_nothing(monkeypatch, tmp_path):
     assert preflight.main(["--dry-run"]) == 1
     assert not (tmp_path / "NO_TRADE_TODAY").exists()
     assert sent == []
+
+
+# ------------------------------- a morning that throws still writes a verdict
+#
+# 2026-09-10. IB Gateway was down from about 03:00 to 11:27. The 09:00
+# pre-flight could not reach it on 127.0.0.1:4002 and left neither
+# output/preflight_2026-09-10.json nor output/NO_TRADE_TODAY behind. When
+# Gateway came back at 11:27 nothing on disk said the morning had failed, so
+# nothing told the loop to stay out. Every book was in dry run, which is the
+# only reason the day was safe, and mode is not the contract.
+#
+# The rule these tests hold: whatever happens to the run, a verdict file is
+# written, a run that could not answer is a fail, NO_TRADE_TODAY is created and
+# an alert goes out.
+
+def catch_alerts(monkeypatch) -> list:
+    """Collect alerts instead of sending them. Returns the list it fills."""
+    sent: list = []
+    monkeypatch.setattr(
+        preflight.alerts_module, "alert",
+        lambda level, subject, body: sent.append((level, subject, body)) or ["test"])
+    return sent
+
+
+def test_a_check_that_throws_fails_its_own_line_and_the_rest_still_run(
+        monkeypatch, tmp_path):
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+
+    def throws(*args, **kwargs):
+        raise RuntimeError("the reconcile blew up")
+
+    monkeypatch.setattr(preflight, "check_reconcile", throws)
+
+    results = preflight.run_checks(tmp_path / "scan.json", clock=stub_clock(0.0))
+
+    by_name = {r.name: r for r in results}
+    assert by_name[preflight.CHECK_RECONCILE].passed is False
+    assert "the reconcile blew up" in by_name[preflight.CHECK_RECONCILE].detail
+    assert by_name[preflight.CHECK_RECONCILE].facts["error_type"] == "RuntimeError"
+    # Everything after it still ran.
+    assert by_name[preflight.CHECK_DAY_TRADES].passed is True
+    assert by_name[preflight.CHECK_TIME_ZONE].passed is True
+
+
+def test_a_gateway_that_throws_fails_both_of_its_checks(monkeypatch, tmp_path):
+    """Connection refused arriving as an exception, not as a tidy answer."""
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+
+    def refused():
+        raise ConnectionRefusedError(
+            61, "Connect call failed ('127.0.0.1', 4002)")
+
+    monkeypatch.setattr(preflight, "check_gateway_and_data", refused)
+
+    results = preflight.run_checks(tmp_path / "scan.json", clock=stub_clock(0.0))
+
+    by_name = {r.name: r for r in results}
+    assert by_name[preflight.CHECK_GATEWAY].passed is False
+    assert by_name[preflight.CHECK_MARKET_DATA].passed is False
+    assert "4002" in by_name[preflight.CHECK_GATEWAY].detail
+    # The checks that do not need Gateway still ran.
+    assert by_name[preflight.CHECK_TIME_ZONE].passed is True
+
+
+def test_the_deadline_still_stops_the_run_even_though_checks_are_guarded(
+        monkeypatch, tmp_path):
+    """The alarm has to get through. It is the run asking to stop, not a fault."""
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+
+    def rings(*args, **kwargs):
+        raise preflight.PreflightTimeout("out of time")
+
+    monkeypatch.setattr(preflight, "check_scanner", rings)
+
+    with pytest.raises(preflight.PreflightTimeout):
+        preflight.run_checks(tmp_path / "scan.json", clock=stub_clock(0.0))
+
+
+def test_connection_refused_writes_the_fail_verdict_the_file_and_the_brake(
+        monkeypatch, tmp_path):
+    """The whole 2026-09-10 gap, end to end."""
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    sent = catch_alerts(monkeypatch)
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+
+    def refused():
+        raise ConnectionRefusedError(
+            61, "Connect call failed ('127.0.0.1', 4002)")
+
+    monkeypatch.setattr(preflight, "check_gateway_and_data", refused)
+
+    code = preflight.main([])
+
+    assert code == 1
+    report = json.loads(next(tmp_path.glob("preflight_2*.json")).read_text())
+    assert report["verdict"] == "fail"
+    assert preflight.CHECK_GATEWAY in report["failed_checks"]
+    assert preflight.CHECK_MARKET_DATA in report["failed_checks"]
+    assert "4002" in report["checks"][preflight.CHECK_GATEWAY]["detail"]
+    marker = tmp_path / "NO_TRADE_TODAY"
+    assert marker.exists()
+    assert preflight.CHECK_GATEWAY in marker.read_text(encoding="utf-8")
+    assert sent, "a morning that could not reach Gateway has to say so"
+    assert sent[0][0] == "error"
+
+
+def test_an_exception_inside_a_check_writes_the_fail_verdict_and_the_brake(
+        monkeypatch, tmp_path):
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    sent = catch_alerts(monkeypatch)
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+
+    def throws(*args, **kwargs):
+        raise ValueError("the day trade counter file is nonsense")
+
+    monkeypatch.setattr(preflight, "check_day_trade_counters", throws)
+
+    code = preflight.main([])
+
+    assert code == 1
+    report = json.loads(next(tmp_path.glob("preflight_2*.json")).read_text())
+    assert report["verdict"] == "fail"
+    assert report["failed_checks"] == [preflight.CHECK_DAY_TRADES]
+    assert ("the day trade counter file is nonsense"
+            in report["checks"][preflight.CHECK_DAY_TRADES]["detail"])
+    assert (tmp_path / "NO_TRADE_TODAY").exists()
+    assert sent and sent[0][0] == "error"
+
+
+def test_an_error_outside_every_check_still_leaves_a_verdict(monkeypatch, tmp_path):
+    """Something threw where no single check owns it. The day still stops."""
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    sent = catch_alerts(monkeypatch)
+
+    def explodes(*args, **kwargs):
+        raise OSError("the output folder went away")
+
+    monkeypatch.setattr(preflight, "run_checks", explodes)
+
+    code = preflight.main([])
+
+    assert code == 1
+    report = json.loads(next(tmp_path.glob("preflight_2*.json")).read_text())
+    assert report["verdict"] == "fail"
+    assert report["failed_checks"] == [preflight.CHECK_RUN_COMPLETE]
+    detail = report["checks"][preflight.CHECK_RUN_COMPLETE]["detail"]
+    assert "the output folder went away" in detail
+    assert preflight.CHECK_GATEWAY in detail          # names what never ran
+    assert (tmp_path / "NO_TRADE_TODAY").exists()
+    assert sent and sent[0][0] == "error"
+
+
+def test_checks_that_never_ran_are_never_counted_as_a_pass(monkeypatch, tmp_path):
+    """What being killed looks like from inside: two answers, both good, no more."""
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    catch_alerts(monkeypatch)
+
+    results = [preflight.Result(preflight.CHECK_GATEWAY, True, "Gateway is up."),
+               preflight.Result(preflight.CHECK_MARKET_DATA, True, "Quotes are live.")]
+
+    code = preflight.write_verdict(results, NINE_AM, tmp_path / "scan.json")
+
+    assert code == 1
+    report = json.loads((tmp_path / "preflight_2026-09-08.json").read_text())
+    assert report["verdict"] == "fail"
+    assert report["failed_checks"] == [preflight.CHECK_RUN_COMPLETE]
+    assert (tmp_path / "NO_TRADE_TODAY").exists()
+
+
+def test_a_morning_where_everything_ran_and_passed_is_still_a_pass(
+        monkeypatch, tmp_path):
+    """The guard must not fail a good morning."""
+    use_temp_output(monkeypatch, tmp_path)
+    monkeypatch.setattr(preflight, "db_module", None)
+    sent = catch_alerts(monkeypatch)
+    ran: list[str] = []
+    stub_every_check(monkeypatch, ran)
+
+    code = preflight.main([])
+
+    assert code == 0
+    report = json.loads(next(tmp_path.glob("preflight_2*.json")).read_text())
+    assert report["verdict"] == "pass"
+    assert report["failed_checks"] == []
+    assert not (tmp_path / "NO_TRADE_TODAY").exists()
+    assert sent == []
+
+
+def test_the_run_completed_line_is_not_one_of_the_ordinary_checks():
+    assert preflight.CHECK_RUN_COMPLETE not in preflight.CHECK_ORDER
+    assert preflight.CHECK_RUN_COMPLETE != preflight.CHECK_IN_TIME

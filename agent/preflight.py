@@ -199,6 +199,20 @@ PREFLIGHT_BUDGET_SECONDS = 600.0
 #: saying it never reached the end of the list.
 CHECK_IN_TIME = "finished_in_time"
 
+#: What the pre-flight reports itself as when it stops before the end of the
+#: list for any reason other than the clock: an unexpected error somewhere in
+#: the run, or something outside killing the process. Also NOT in CHECK_ORDER,
+#: for the same reason as CHECK_IN_TIME.
+#:
+#: Why it exists. On 2026-09-10 the 09:00 pre-flight could not reach Gateway on
+#: 127.0.0.1:4002, and it wrote neither output/preflight_2026-09-10.json nor
+#: output/NO_TRADE_TODAY. When Gateway came back at 11:27 there was no verdict
+#: on file, so nothing told the loop to stay out, and only the fact that every
+#: book was in dry run kept the morning safe. The rule now is that this script
+#: writes a verdict whatever happens to it, and a verdict it could not reach is
+#: a fail. Mo created the marker by hand at 11:35.
+CHECK_RUN_COMPLETE = "run_completed"
+
 #: agent/scanner.py returns this when a scan could not be trusted. Distinct from
 #: 1, which means it could not reach Gateway at all.
 SCANNER_EXIT_SCAN_FAILURE = 3
@@ -1068,6 +1082,46 @@ def out_of_time_result(spent: float, missed: list[str],
                "checks_not_run": missed})
 
 
+def check_crashed_result(name: str, exc: BaseException) -> Result:
+    """One check that threw, written down as that check failing.
+
+    Before this existed, a check that threw took the whole pre-flight with it
+    and the morning ended with no verdict at all. Now it fails its own line,
+    the error text goes in the detail so the alert carries it, and the checks
+    after it still run.
+    """
+    return Result(
+        name, False,
+        f"The check stopped with an unexpected error and could not answer: "
+        f"{exc!r}.",
+        facts={"error": repr(exc), "error_type": type(exc).__name__})
+
+
+def run_stopped_result(missed: list[str], exc: BaseException | None = None) -> Result:
+    """The pre-flight itself stopping short, rather than any one check failing.
+
+    Two ways in. Something threw outside any single check, in which case the
+    error text is here. Or the run ended without an error and without reaching
+    the end of the list, which is what a killed process looks like from the
+    inside. Either way it fails, so the day stops: checks that never ran must
+    never be mistaken for checks that passed.
+    """
+    if exc is not None:
+        detail = (f"The pre-flight stopped with an unexpected error: {exc!r}. "
+                  "Nothing about the broker was proved, so the day stops.")
+    else:
+        detail = ("The pre-flight stopped before it reached the end of its "
+                  "checks. Nothing about the broker was proved, so the day "
+                  "stops.")
+    if missed:
+        detail += f" Checks that never ran: {', '.join(missed)}."
+    facts: dict = {"checks_not_run": missed}
+    if exc is not None:
+        facts["error"] = repr(exc)
+        facts["error_type"] = type(exc).__name__
+    return Result(CHECK_RUN_COMPLETE, False, detail, facts=facts)
+
+
 def arm_deadline(seconds: float) -> bool:
     """Ask the operating system to interrupt us if the morning runs long.
 
@@ -1114,12 +1168,33 @@ def run_checks(scan_out: Path, write_regime: bool = False,
     `collected` is how main keeps the answers of the checks that did finish even
     when the alarm goes off in the middle of one. It is the same list that comes
     back, so callers that only want the return value can ignore it.
+
+    A check that throws fails its own line and the rest still run. Only the
+    deadline is allowed through, because that is the alarm asking the whole run
+    to stop.
     """
     results = collected if collected is not None else []
     started = clock()
 
-    # The two that come out of one connection, so they are never split.
-    login, market = check_gateway_and_data()
+    def guarded(name: str, run):
+        try:
+            return run()
+        except PreflightTimeout:
+            raise
+        except Exception as exc:                                  # noqa: BLE001
+            return check_crashed_result(name, exc)
+
+    # The two that come out of one connection, so they are never split. A
+    # Gateway that refuses the connection is the ordinary case and comes back
+    # as two failed results; one that throws instead of answering, which is
+    # what happened on 2026-09-10, now does the same rather than ending the run.
+    try:
+        login, market = check_gateway_and_data()
+    except PreflightTimeout:
+        raise
+    except Exception as exc:                                      # noqa: BLE001
+        login = check_crashed_result(CHECK_GATEWAY, exc)
+        market = check_crashed_result(CHECK_MARKET_DATA, exc)
     results.append(login)
     results.append(market)
 
@@ -1138,7 +1213,7 @@ def run_checks(scan_out: Path, write_regime: bool = False,
             results.append(out_of_time_result(
                 spent, [n for n, _ in rest[index:]], budget_seconds))
             return results
-        results.append(run())
+        results.append(guarded(name, run))
     return results
 
 
@@ -1212,18 +1287,49 @@ def main(argv: list[str] | None = None) -> int:
     # ran out of time it writes NO_TRADE_TODAY and says the broker could not be
     # read in time. What it must never do again is hang for 44 minutes and write
     # nothing either way.
+    #
+    # The verdict is written in a finally block, so a run that throws, or one
+    # that is killed where it stands, still leaves an answer on disk. That is
+    # the 2026-09-10 lesson: a morning with no verdict file is worse than a
+    # morning that failed, because nothing downstream can tell it from a pass.
     results: list[Result] = []
     began = time.monotonic()
     arm_deadline(PREFLIGHT_BUDGET_SECONDS)
+    exit_code = 1
     try:
-        run_checks(scan_out, write_regime=args.write_regime, collected=results)
-    except PreflightTimeout:
-        done = {r.name for r in results}
-        results.append(out_of_time_result(
-            time.monotonic() - began,
-            [name for name in CHECK_ORDER if name not in done]))
+        try:
+            run_checks(scan_out, write_regime=args.write_regime, collected=results)
+        except PreflightTimeout:
+            done = {r.name for r in results}
+            results.append(out_of_time_result(
+                time.monotonic() - began,
+                [name for name in CHECK_ORDER if name not in done]))
+        except Exception as exc:                                  # noqa: BLE001
+            done = {r.name for r in results}
+            results.append(run_stopped_result(
+                [name for name in CHECK_ORDER if name not in done], exc))
     finally:
         disarm_deadline()
+        exit_code = write_verdict(results, now, scan_out, dry_run=args.dry_run)
+    return exit_code
+
+
+def write_verdict(results: list[Result], now: datetime, scan_out: Path,
+                  dry_run: bool = False) -> int:
+    """Print the answers, write the report, and stop the day if anything failed.
+
+    Split out of main so it can sit in a finally block: every way out of the
+    checks, tidy or not, comes through here and leaves a verdict file behind.
+
+    One guard is worth naming. If the run stopped early without recording a
+    failure, which is what being killed looks like from in here, a fail is
+    added for the checks that never ran. Checks that did not run must never be
+    counted as checks that passed.
+    """
+    done = {r.name for r in results}
+    missed = [name for name in CHECK_ORDER if name not in done]
+    if missed and all(r.passed for r in results):
+        results.append(run_stopped_result(missed))
 
     failed = [r.name for r in results if not r.passed]
     verdict = "fail" if failed else "pass"
@@ -1244,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "run_at": now.isoformat(),
         "verdict": verdict,
-        "dry_run": args.dry_run,
+        "dry_run": dry_run,
         "failed_checks": failed,
         # Lifted to the top so Tuesday's log answers the question without anyone
         # having to dig through the checks block. true, false, or null when the
@@ -1260,13 +1366,13 @@ def main(argv: list[str] | None = None) -> int:
         "checks": {r.name: asdict(r) for r in results},
         "scan_file": str(scan_out),
     }
-    path = report_path(now, args.dry_run)
+    path = report_path(now, dry_run)
     path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     record_checks(results, verdict, now)
     print(f"\nverdict: {verdict}")
     print(f"report: {path}")
 
-    if args.dry_run:
+    if dry_run:
         if failed:
             print(f"dry run, so no NO_TRADE_TODAY was created and no alert was "
                   f"sent. A real run would have stopped trading for "
