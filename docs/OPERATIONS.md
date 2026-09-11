@@ -71,22 +71,25 @@ Test the whole chain any time. It is harmless:
 ```
 
 Every five minutes during the trading day, and once an hour through the night
-and the weekend, it checks eight things:
+and the weekend, it checks nine things:
 
 1. `gateway_process`, IB Gateway is running.
 2. `gateway_port`, port 4002 is accepting connections. A running Gateway with
    a shut port is a hung Gateway.
-3. `ib_connect`, a read only login gets through and comes back with account
+3. `gateway_login`, IBKR did not turn the last login down. See the
+   subsection below. Read straight out of the IBC log, so it costs nothing and
+   works even when the port is shut, which is exactly when it is needed.
+4. `ib_connect`, a read only login gets through and comes back with account
    DUT077572.
-4. `ib_answers`, that same connection asks for the list of positions and gets
+5. `ib_answers`, that same connection asks for the list of positions and gets
    an answer inside twenty seconds. See the subsection below. Only asked when
-   checks 2 and 3 passed, because there is nothing to ask on otherwise.
-5. `market_data`, SPY quotes are real time rather than delayed. Only checked
+   checks 2 and 4 passed, because there is nothing to ask on otherwise.
+6. `market_data`, SPY quotes are real time rather than delayed. Only checked
    while the market is open, because there is nothing to quote at nine at night.
-6. `loop_tick`, the trading loop has ticked within the last ten minutes. Only
+7. `loop_tick`, the trading loop has ticked within the last ten minutes. Only
    checked during market hours, and only when the loop's launchd job is loaded.
-7. `disk_free`, more than a gigabyte free.
-8. `time_zone`, the launchd jobs still fire at the right New York minute. See
+8. `disk_free`, more than a gigabyte free.
+9. `time_zone`, the launchd jobs still fire at the right New York minute. See
    the time zone section below. Checked at every run, market hours or not,
    because the answer has nothing to do with the market being open and the
    useful time to hear it is the evening before rather than 09:35 on the day.
@@ -253,6 +256,69 @@ there waiting for you to approve the login.
 holds what the start script said, and
 `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/output/ibc_logs/`
 holds what Gateway itself said.
+
+#### A login IBKR refused
+
+Added 2026-09-10, the evening of the morning it cost.
+
+At 02:00 that morning IB Gateway ran its own nightly restart. That restart is
+not a fresh login. Gateway writes a small session token file on its way out,
+the IBC start script finds it and hands it back with `-Drestart=`, and the new
+Gateway resumes the old session. No password is typed, by design, and the log
+for that night shows none was: there is no "Setting password" line anywhere in
+that restart.
+
+The token was refused. Gateway put up a box titled "Re-login is required", IBC
+clicked the Re-login button, which is the only thing its handler does, and IBKR
+answered with a box titled "Unrecognized Username or Password". IBC 3.24.2 has
+no handler for that second box, so it stopped there. That line is the last one
+in the file:
+
+```
+2026-09-10 02:00:06:747 IBC: Re-login to session
+2026-09-10 02:00:06:747 IBC: Click button: Re-login
+2026-09-10 02:00:07:198 IBC: detected dialog entitled: Unrecognized Username or Password; event=Opened
+```
+
+**That message does not mean the password is wrong**, and on this occasion it
+was not. No password was offered. The same credentials file logged in at
+11:27:57 and again at 13:49:46 the same day, and the same nightly restart
+worked at 02:00:08 the day before. Treat "Unrecognized Username or Password"
+after a nightly restart as a stale session token until something else says
+otherwise.
+
+What made it expensive is that every other check saw only the consequence: a
+Gateway process that was alive with a shut port. That is the one shape the
+restart rules are most careful about, because a second Gateway started on top
+of a running one gives two logins fighting over one session. So the watchdog
+alerted at 03:00, 04:00 and 05:00 and repaired nothing, and the morning went
+with it.
+
+The check reads the refusal out of the newest IBC log and compares it with the
+newest completed login in the same file. A refusal with a login after it is
+history and passes. A refusal with nothing after it fails, and earns one stop
+and start through `agent/stop_gateway.sh` then `agent/start_gateway.sh`, which
+does type the password.
+
+Two things make this different from every other restart rule here:
+
+* **It acts at any hour.** The shut port rule below waits for the market,
+  because a Gateway repaired at four in the morning helps nobody. This one does
+  not wait, because there is nothing to wait for. Gateway is holding a dialog
+  and will hold it until something kills it, and a Gateway repaired at 03:00 is
+  one the 09:00 pre-flight can actually use.
+* **It is one attempt, full stop.** The attempt happens on the first run that
+  sees the refusal and never repeats while it stays failing. If the restart
+  does not take, the "restart did not take" message goes out and it becomes
+  yours. That matters here more than elsewhere: if the password really had
+  changed, an hourly retry would walk into IBKR's "too many failed login
+  attempts" lockout.
+
+This is the workaround IBC's own maintainer recommends for this failure. The
+IBC repository was archived on 2026-09-01 and the open pull request that would
+have handled the dialog inside IBC was rejected, on the grounds that a genuinely
+wrong password in the config would turn a cold restart into an endless loop. So
+there is no fix coming from upstream, and the guard has to live out here.
 
 #### A Gateway that is running but silent
 
