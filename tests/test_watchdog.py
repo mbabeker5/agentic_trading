@@ -1635,3 +1635,199 @@ def test_the_patience_is_fifteen_minutes_and_the_look_ahead_ninety():
     assert wd.RESTART_LOOKAHEAD == timedelta(minutes=90)
     assert wd.CHECK_GATEWAY_PORT in wd.RESTART_STOPS_FIRST
     assert wd.CHECK_IB_ANSWERS in wd.RESTART_STOPS_FIRST
+
+
+# ------------------------------- a login IBKR refused (2026-09-10, 02:00)
+#
+# The night IB Gateway restarted itself, resumed its old session from a saved
+# token instead of typing a password, and was refused. IBC clicked the
+# "Re-login" button Gateway offered, IBKR answered "Unrecognized Username or
+# Password", and IBC stopped there: that line is the last one in the log file.
+# Gateway then sat on a credentials box with its API port shut until 11:27.
+#
+# Every check that existed at the time saw a live process and a shut port,
+# which is the one shape the restart rules are most careful about, so the
+# watchdog alerted at 03:00, 04:00 and 05:00 and repaired nothing. The tests
+# below are about the check that reads the refusal itself, and about its being
+# allowed to act on it in the middle of the night, which is the only time it
+# can possibly be useful.
+
+#: The real lines, copied out of
+#: output/ibc_logs/ibc-3.24.2_GATEWAY-10.45_Wednesday.txt. The last three are
+#: the whole outage, and the file genuinely ends there.
+REFUSED_LINES = """2026-09-09 12:35:14:675 IBC: Setting Auto restart time
+2026-09-09 12:35:14:685 IBC: Login has completed
+2026-09-10 02:00:04:090 IBC: Re-starting session
+2026-09-10 02:00:06:747 IBC: Re-login to session
+2026-09-10 02:00:06:747 IBC: Click button: Re-login
+2026-09-10 02:00:07:198 IBC: detected dialog entitled: Unrecognized Username or Password; event=Activated
+2026-09-10 02:00:07:202 IBC: detected dialog entitled: Unrecognized Username or Password; event=Opened
+"""
+
+#: The same night after a repair: the refusal is still there, and a login
+#: completed afterwards.
+REPAIRED_LINES = REFUSED_LINES + \
+    "2026-09-10 03:01:44:031 IBC: Login has completed\n"
+
+THREE_IN_THE_MORNING = datetime(2026, 9, 10, 3, 0, tzinfo=wd.EASTERN)
+
+
+def write_ibc_log(folder, text: str, day: str = "Wednesday"):
+    path = folder / f"ibc-3.24.2_GATEWAY-10.45_{day}.txt"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def login_refused() -> dict[str, wd.Check]:
+    """What the nine checks looked like at 03:00 on 2026-09-10."""
+    checks = port_shut_process_alive()
+    checks[wd.CHECK_GATEWAY_LOGIN] = wd.Check(
+        wd.CHECK_GATEWAY_LOGIN, ok=False,
+        detail=("IBKR refused IB Gateway's login at 2026-09-10 02:00:07 and the "
+                "last login completed at 2026-09-09 12:35:14."))
+    return checks
+
+
+# ----- reading the refusal off the log
+
+def test_a_refusal_with_nothing_after_it_is_a_miss(tmp_path):
+    """The real file, ending exactly where IBC gave up."""
+    write_ibc_log(tmp_path, REFUSED_LINES)
+    check = wd.check_gateway_login(tmp_path)
+
+    assert check.ok is False
+    assert check.level == "error"
+    assert "02:00:07" in check.detail
+    assert "Unrecognized Username or Password" in check.detail
+
+
+def test_a_refusal_with_a_later_login_is_behind_us(tmp_path):
+    """What a repaired Gateway looks like: the refusal stays in the log."""
+    write_ibc_log(tmp_path, REPAIRED_LINES)
+    check = wd.check_gateway_login(tmp_path)
+
+    assert check.ok is True
+    assert "03:01:44" in check.detail
+
+
+def test_a_log_with_no_refusal_in_it_passes(tmp_path):
+    write_ibc_log(tmp_path, IBC_LINES)
+    assert wd.check_gateway_login(tmp_path).ok is True
+
+
+def test_a_refusal_with_no_login_anywhere_before_it_is_still_a_miss(tmp_path):
+    """A Gateway started cold and refused on its very first attempt."""
+    write_ibc_log(tmp_path, REFUSED_LINES.split("\n", 2)[2])
+    check = wd.check_gateway_login(tmp_path)
+
+    assert check.ok is False
+    assert "nothing has logged in at all" in check.detail
+
+
+def test_no_ibc_log_at_all_is_not_a_refused_login(tmp_path):
+    assert wd.check_gateway_login(tmp_path).ok is True
+    assert wd.check_gateway_login(tmp_path / "not there").ok is True
+
+
+def test_only_the_newest_log_file_counts(tmp_path):
+    """A refusal from a previous day must not fail a Gateway that is fine now.
+
+    A restart usually opens a fresh log file, so last night's refusal and this
+    morning's login end up in different files. Reading only the newest one is
+    what lets the check clear itself.
+    """
+    old = write_ibc_log(tmp_path, REFUSED_LINES, day="Wednesday")
+    new = write_ibc_log(tmp_path, IBC_LINES, day="Thursday")
+    os.utime(old, (1, 1))
+    os.utime(new, (2, 2))
+
+    assert wd.check_gateway_login(tmp_path).ok is True
+    assert wd.newest_ibc_login_refusal(tmp_path) is None
+
+
+def test_the_refusal_time_is_read_off_the_line(tmp_path):
+    write_ibc_log(tmp_path, REFUSED_LINES)
+    assert wd.newest_ibc_login_refusal(tmp_path) == datetime(
+        2026, 9, 10, 2, 0, 7, tzinfo=wd.EASTERN)
+
+
+# ----- what the watchdog does about it
+
+def test_a_refused_login_is_repaired_at_three_in_the_morning():
+    """The whole point. The old rules waited for the market and lost the day."""
+    actions, state = step(login_refused(), THREE_IN_THE_MORNING, {"checks": {}})
+
+    started = restarts_in(actions)
+    assert len(started) == 1, "one restart, not one per failing check"
+    assert started[0].check == wd.CHECK_GATEWAY_LOGIN, (
+        "the refused login is the reason, not the shut port it caused")
+    assert state["checks"][wd.CHECK_GATEWAY_LOGIN]["restart_attempted"] is True
+
+
+def test_that_restart_kills_the_old_gateway_first():
+    """There is a Gateway on screen holding a dialog. It has to go first."""
+    assert wd.CHECK_GATEWAY_LOGIN in wd.RESTART_STOPS_FIRST
+
+
+def test_the_refusal_is_alerted_the_first_time_it_is_seen():
+    actions, _state = step(login_refused(), THREE_IN_THE_MORNING, {"checks": {}})
+
+    refusal = [a for a in alerts_in(actions) if a.check == wd.CHECK_GATEWAY_LOGIN]
+    assert len(refusal) == 1
+    assert refusal[0].level == "error"
+    assert "password" in refusal[0].body.lower(), "the advice has to name the suspect"
+
+
+def test_ibcs_own_restart_window_is_still_left_alone():
+    """At 02:00 IBC is mid-restart. A second Gateway there is worse than waiting."""
+    two_in_the_morning = datetime(2026, 9, 10, 2, 0, tzinfo=wd.EASTERN)
+    actions, _state = step(login_refused(), two_in_the_morning, {"checks": {}})
+
+    assert restarts_in(actions) == [], "the 03:00 run picks it up instead"
+    assert alerts_in(actions) != [], "but Mo is still told at once"
+
+
+def test_a_refused_login_gets_one_restart_and_not_one_an_hour():
+    """Four hourly runs of the same outage, one repair attempt between them."""
+    checks = login_refused()
+    state = {"checks": {}}
+    attempts = 0
+    for hour in range(3, 7):
+        actions, state = step(
+            checks, datetime(2026, 9, 10, hour, 0, tzinfo=wd.EASTERN), state)
+        attempts += len(restarts_in(actions))
+
+    assert attempts == 1
+
+
+def test_a_repaired_login_says_so():
+    """The check going green again is worth one message."""
+    state = {"checks": {}}
+    _actions, state = step(login_refused(), THREE_IN_THE_MORNING, state)
+
+    mended = dict(login_refused())
+    mended[wd.CHECK_GATEWAY_LOGIN] = wd.Check(
+        wd.CHECK_GATEWAY_LOGIN, ok=True,
+        detail="A login was refused at 02:00:07 and a later one completed at 03:01:44.")
+    actions, _state = step(
+        mended, datetime(2026, 9, 10, 4, 0, tzinfo=wd.EASTERN), state)
+
+    recovered = [a for a in alerts_in(actions)
+                 if a.check == wd.CHECK_GATEWAY_LOGIN and a.level == "info"]
+    assert len(recovered) == 1
+
+
+def test_a_healthy_login_is_never_a_reason_to_restart():
+    actions, _state = step(healthy(), THREE_IN_THE_MORNING, {"checks": {}})
+    assert restarts_in(actions) == []
+    assert alerts_in(actions) == []
+
+
+def test_the_refused_login_check_is_wired_into_the_run():
+    assert wd.CHECK_GATEWAY_LOGIN in wd.CHECK_ORDER
+    assert wd.CHECK_GATEWAY_LOGIN in wd.RESTART_CHECKS
+    assert wd.CHECK_GATEWAY_LOGIN in wd.WHAT_TO_DO
+    assert wd.IBC_LOGIN_REFUSED_MARKER == "Unrecognized Username or Password"
+    assert wd.CHECK_ORDER.index(wd.CHECK_GATEWAY_LOGIN) > \
+        wd.CHECK_ORDER.index(wd.CHECK_GATEWAY_PORT), (
+            "the shut port is reported first, the reason for it second")

@@ -1,6 +1,6 @@
 """The thing that watches the trading plumbing and tells Mo when it breaks.
 
-One run of this script is one health check. It looks at eight things, decides
+One run of this script is one health check. It looks at nine things, decides
 what to do about what it found, and exits. launchd wakes it every five minutes
 during market hours and once an hour the rest of the time. See
 /Users/mtalib/workspace_repos/personal_repo/agentic_trading/docs/LAUNCHD.md
@@ -14,29 +14,41 @@ What it checks
 1. gateway_process  IB Gateway is actually running on this Mac.
 2. gateway_port     Something is accepting connections on port 4002, the paper
                     port. A process with a closed port is a hung Gateway.
-3. ib_connect       A read only connection gets through and the account it
+3. gateway_login    IBKR did not turn the last login down. Gateway restarts
+                    itself at 02:00 every night and resumes its old session
+                    from a saved token rather than typing a password. On
+                    2026-09-10 that token was refused, IBKR answered
+                    "Unrecognized Username or Password", and IBC, which has no
+                    handler for that dialog, stopped dead on it. Every other
+                    check saw only a live process with a shut port, the one
+                    shape the restart rules are most careful about, so the
+                    watchdog alerted hourly and repaired nothing for nine and a
+                    half hours. This check reads the refusal straight out of
+                    the IBC log and is allowed to repair it at any hour.
+                    Added 2026-09-10.
+4. ib_connect       A read only connection gets through and the account it
                     reports is DUT077572, the paper account. Read only, so this
                     connection cannot place an order even by accident.
-4. ib_answers       That same connection asks a real question, for the list of
+5. ib_answers       That same connection asks a real question, for the list of
                     positions, and gets an answer inside twenty seconds. A
                     Gateway that has lost its upstream connection to IBKR still
-                    accepts logins and still hands over the account id, so the
-                    first three checks all pass while nothing works. This is the
+                    accepts logins and still hands over the account id, so
+                    checks 1, 2 and 4 all pass while nothing works. This is the
                     one that catches it. Added 2026-09-07 after two outages in
-                    one day, both of them invisible to checks 1 to 3.
-5. market_data      SPY quotes are real time rather than delayed. IBKR error
+                    one day, both of them invisible to those three.
+6. market_data      SPY quotes are real time rather than delayed. IBKR error
                     354 means the subscription is missing and we are on delayed
                     prices. Error 10197 means a competing live session: Mo has a
                     quote screen or the mobile app open on the live login and it
                     has taken the data feed. That one is never Gateway's fault,
                     so it never causes a restart.
-6. loop_tick        The trading loop wrote a tick recently. Checked only during
+7. loop_tick        The trading loop wrote a tick recently. Checked only during
                     market hours, and only when the loop's launchd job is
                     loaded, because a loop that was never switched on has no
                     heartbeat to miss.
-7. disk_free        More than one gigabyte free. IB Gateway writes a lot of logs
+8. disk_free        More than one gigabyte free. IB Gateway writes a lot of logs
                     and a full disk fails everything at once.
-8. time_zone        The launchd jobs still fire at the right New York minute.
+9. time_zone        The launchd jobs still fire at the right New York minute.
 
 What it does about it
 ---------------------
@@ -47,8 +59,8 @@ actions. It reads no files and sends nothing, which is why it can be tested
 properly. The rules are:
 
 * The first time a check misses, alert once.
-* If that miss is IB Gateway being down, or Gateway being up and not answering,
-  also schedule exactly one restart attempt through agent/start_gateway.sh. One
+* If that miss is IB Gateway being down, Gateway being up and not answering,
+  or a login IBKR refused, also schedule exactly one restart attempt through agent/start_gateway.sh. One
   attempt per outage, not one per wake up, and never a second Gateway on top of
   a running one: when a Gateway is sitting there useless, agent/stop_gateway.sh
   runs first and the start only follows once it is gone.
@@ -221,6 +233,24 @@ RESTART_POLL_SECONDS = 5
 #: That line, and its time, is the only proof we have that a fresh Gateway got
 #: all the way in rather than sitting on a login prompt.
 IBC_LOGIN_MARKER = "Login has completed"
+
+#: WHAT IBKR SAYS WHEN IT TURNS A LOGIN DOWN, AND WHY THE WATCHDOG READS FOR IT.
+#:
+#: At 02:00 on 2026-09-10 IB Gateway ran its own nightly restart. That restart
+#: normally resumes the old session from a token file and types no password at
+#: all, and IBC's log for that night shows it never typed one. The token was
+#: refused, Gateway put up its "Re-login is required" box, IBC clicked the
+#: button, and IBKR answered with a dialog titled exactly this. IBC 3.24.2 has
+#: no handler for that title (it handles "Login failed" and "Login Error" by
+#: cold restarting, and this one by doing nothing), so it stopped there. That
+#: line is the last one in the file. Gateway sat on a credentials box with its
+#: API port shut for the next nine and a half hours.
+#:
+#: Nothing about that shape gets better on its own, and no IBC setting exists
+#: to retry it, so the watchdog does what IBC's missing handler would have
+#: done: stop Gateway and start it again, which does type the password.
+IBC_LOGIN_REFUSED_MARKER = "Unrecognized Username or Password"
+
 IBC_LOG_GLOB = "ibc-*.txt"
 
 #: IBKR message codes worth naming.
@@ -254,6 +284,7 @@ IBC_NIGHTLY_RESTART = (clock_time(1, 45), clock_time(2, 30))
 
 CHECK_GATEWAY_PROCESS = "gateway_process"
 CHECK_GATEWAY_PORT = "gateway_port"
+CHECK_GATEWAY_LOGIN = "gateway_login"
 CHECK_IB_CONNECT = "ib_connect"
 CHECK_IB_ANSWERS = "ib_answers"
 CHECK_MARKET_DATA = "market_data"
@@ -266,6 +297,7 @@ CHECK_TIME_ZONE = "time_zone"
 CHECK_ORDER = (
     CHECK_GATEWAY_PROCESS,
     CHECK_GATEWAY_PORT,
+    CHECK_GATEWAY_LOGIN,
     CHECK_IB_CONNECT,
     CHECK_IB_ANSWERS,
     CHECK_MARKET_DATA,
@@ -275,14 +307,15 @@ CHECK_ORDER = (
 )
 
 #: Only a miss on one of these can lead to starting IB Gateway.
-RESTART_CHECKS = (CHECK_GATEWAY_PROCESS, CHECK_GATEWAY_PORT, CHECK_IB_ANSWERS)
+RESTART_CHECKS = (CHECK_GATEWAY_PROCESS, CHECK_GATEWAY_PORT,
+                  CHECK_GATEWAY_LOGIN, CHECK_IB_ANSWERS)
 
 #: The misses where a restart has to stop the old Gateway before it starts a
-#: new one. Both of these can happen with a Gateway process still running, and
-#: two logins fighting over one session is worse than the hang being fixed.
+#: new one. All three can happen with a Gateway process still running, and two
+#: logins fighting over one session is worse than the hang being fixed.
 #: restart_gateway() only actually stops something when there is something to
 #: stop, so this is safe for the case where the process is already gone.
-RESTART_STOPS_FIRST = (CHECK_IB_ANSWERS, CHECK_GATEWAY_PORT)
+RESTART_STOPS_FIRST = (CHECK_IB_ANSWERS, CHECK_GATEWAY_PORT, CHECK_GATEWAY_LOGIN)
 
 #: HOW LONG A SHUT PORT ON A LIVE GATEWAY IS GIVEN BEFORE IT IS RESTARTED.
 #:
@@ -317,6 +350,15 @@ WHAT_TO_DO = {
     CHECK_GATEWAY_PORT: (
         "If Gateway is on screen but the port is shut, it has hung. Stop it with "
         "agent/stop_gateway.sh, then start it with agent/start_gateway.sh."),
+    CHECK_GATEWAY_LOGIN: (
+        "IBKR turned IB Gateway's login down. This is almost never a wrong "
+        "password: the nightly 2 AM restart resumes the old session from a "
+        "token and types no password at all, so the message means the token "
+        "was stale, not that the credentials are bad. The watchdog is already "
+        "stopping Gateway and starting it again, and that path does type the "
+        "password. If the second attempt is refused too, then the password "
+        "really has changed and only you can fix it, in Client Portal. Check "
+        "output/ibc_logs for a 'Login has completed' line after the refusal."),
     CHECK_IB_CONNECT: (
         "Gateway is up but will not hand over the account. Check it is logged "
         "into the paper account and that the API is enabled on port 4002."),
@@ -595,13 +637,23 @@ def _as_check(name: str, value) -> Check:
 def _may_restart(check: Check, checks: dict[str, Check]) -> bool:
     """Whether this miss is the kind that starting IB Gateway would fix.
 
-    Two ways in, and they are not the same shape.
+    Three ways in, and they are not the same shape.
 
     ib_answers is the straightforward one. A Gateway that is logged in and not
     answering is dead machinery whatever its process list says, and the only
     thing that has ever fixed it is a stop and a start. So it is allowed on its
     own. restart_gateway() stops the old copy first in that case, which is why
     this can say yes to a Gateway that is running.
+
+    gateway_login is the one added on 2026-09-10, and it is allowed on its own
+    for the same reason as ib_answers. A Gateway sitting on a refused login is
+    not mid-start and it is not going to change its mind: IBC has no handler
+    for that dialog and stops dead the moment it appears. The only thing that
+    clears it is the stop and start this leads to, which types the password
+    where the nightly restart never did. It is allowed at any hour, unlike the
+    shut port rule below, because there is nothing to wait for and a Gateway
+    fixed at three in the morning is a Gateway the 09:00 pre-flight can use.
+    The caller still keeps it out of IBC's own restart window.
 
     gateway_process and gateway_port are the older way in, and they still want
     no Gateway process running at all. Starting a second Gateway on top of a
@@ -617,7 +669,7 @@ def _may_restart(check: Check, checks: dict[str, Check]) -> bool:
         return False
     if check.code == CODE_COMPETING_SESSION:
         return False
-    if check.name == CHECK_IB_ANSWERS:
+    if check.name in (CHECK_IB_ANSWERS, CHECK_GATEWAY_LOGIN):
         return True
     process = checks.get(CHECK_GATEWAY_PROCESS)
     return process is not None and not process.ok and not process.skipped
@@ -1019,13 +1071,19 @@ def _parse_ibc_time(line: str) -> datetime | None:
     return moment.replace(tzinfo=EASTERN)
 
 
-def newest_ibc_login(log_dir: Path | None = None) -> datetime | None:
-    """When IBC last finished a login, read from the newest IBC log file.
+def _newest_ibc_event(marker: str, log_dir: Path | None = None) -> datetime | None:
+    """When the newest IBC log file last said `marker`, or None if it never did.
 
     IBC names its log files after the day of the week, so a Gateway started
     just after midnight writes into a different file from the one that was
     being written a minute earlier. Picking the newest file by when it was last
     written, rather than by the name that looks right, survives that.
+
+    Only the newest file is read, which is what makes the two callers below
+    comparable: a login and a refusal only mean anything relative to each other
+    when they come out of the same file. It is also what makes the refusal
+    check clear itself. A restart usually opens a new log file, and the new
+    file holds the fresh login and none of yesterday's refusals.
     """
     folder = log_dir or ibc_log_dir()
     try:
@@ -1039,12 +1097,62 @@ def newest_ibc_login(log_dir: Path | None = None) -> datetime | None:
     except OSError:
         return None
     for line in reversed(lines):
-        if IBC_LOGIN_MARKER not in line:
+        if marker not in line:
             continue
         moment = _parse_ibc_time(line)
         if moment is not None:
             return moment
     return None
+
+
+def newest_ibc_login(log_dir: Path | None = None) -> datetime | None:
+    """When IBC last finished a login."""
+    return _newest_ibc_event(IBC_LOGIN_MARKER, log_dir)
+
+
+def newest_ibc_login_refusal(log_dir: Path | None = None) -> datetime | None:
+    """When IBKR last turned a login down."""
+    return _newest_ibc_event(IBC_LOGIN_REFUSED_MARKER, log_dir)
+
+
+def check_gateway_login(log_dir: Path | None = None) -> Check:
+    """Did IBKR turn the last login down and leave Gateway sitting there.
+
+    This is the 2026-09-10 outage as a question the watchdog can ask. That
+    night Gateway restarted itself at 02:00, resumed from its saved session
+    token instead of typing a password, was refused, and IBC stopped on the
+    dialog. Every other check saw only the consequence: a process that was
+    alive and a port that was shut, which is the one shape the restart rules
+    are most careful about. So the watchdog alerted hourly and repaired
+    nothing, and the morning was gone.
+
+    The evidence is unambiguous and it is already on disk, so the check is
+    simply which came last in the newest IBC log: a login that completed, or a
+    refusal. A refusal with a completed login after it is history, and is what
+    a repaired Gateway looks like. A refusal with nothing after it is a
+    Gateway that is never coming back on its own.
+    """
+    refused_at = newest_ibc_login_refusal(log_dir)
+    if refused_at is None:
+        return Check(CHECK_GATEWAY_LOGIN, ok=True,
+                     detail="No refused login in the newest IBC log.")
+
+    login_at = newest_ibc_login(log_dir)
+    if login_at is not None and login_at >= refused_at:
+        return Check(
+            CHECK_GATEWAY_LOGIN, ok=True,
+            detail=(f"A login was refused at {refused_at:%H:%M:%S} and a later one "
+                    f"completed at {login_at:%H:%M:%S}, so it is behind us."))
+
+    since = ("nothing has logged in at all in this log"
+             if login_at is None
+             else f"the last login completed at {login_at:%Y-%m-%d %H:%M:%S}")
+    return Check(
+        CHECK_GATEWAY_LOGIN, ok=False, level="error",
+        detail=(f'IBKR refused IB Gateway\'s login at {refused_at:%Y-%m-%d %H:%M:%S} '
+                f'("{IBC_LOGIN_REFUSED_MARKER}") and {since}. Gateway is sitting on '
+                "a credentials box with its API port shut and IBC has no handler "
+                "for that dialog, so nothing will move until it is restarted."))
 
 
 def probe_gateway() -> GatewayProbe:
@@ -1429,7 +1537,7 @@ def check_disk(floor: int = DISK_FLOOR_BYTES) -> Check:
 
 def run_checks(now: datetime, schedule: Schedule,
                deadline: Deadline | None = None) -> dict[str, Check]:
-    """Do all eight checks and hand back the results, in the usual order.
+    """Do all nine checks and hand back the results, in the usual order.
 
     The whole set shares one ninety second budget. Before each remaining check
     the budget is asked whether there is time left, and once there is not, the
@@ -1438,7 +1546,7 @@ def run_checks(now: datetime, schedule: Schedule,
     launchd's next wake up never finds this one still going.
 
     The IB connection is the only expensive one here and it carries three of the
-    eight, so it is asked as one block.
+    nine, so it is asked as one block.
     """
     deadline = deadline or Deadline()
     market_hours = in_market_hours(now, schedule)
@@ -1449,6 +1557,7 @@ def run_checks(now: datetime, schedule: Schedule,
 
     ask(CHECK_GATEWAY_PROCESS, check_gateway_process)
     ask(CHECK_GATEWAY_PORT, check_gateway_port)
+    ask(CHECK_GATEWAY_LOGIN, check_gateway_login)
 
     port = results[CHECK_GATEWAY_PORT]
     if deadline.expired():
