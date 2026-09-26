@@ -1,10 +1,10 @@
 # Models: which brain runs which book
 
-Each strategy book names its model in one line of its yaml. The code in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/models.py` turns that line into a working connection. Two providers are wired up.
+Each strategy book names its model in one line of its yaml. The code in `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/agent/models.py` turns that line into a working connection. Every call goes through OpenRouter (since 2026-09-26 the `anthropic/` prefix is only a way of naming a Claude model; it is mapped to the OpenRouter id and no longer calls the Anthropic API).
 
 ## Month one decision (Mo, 2026-09-06)
 
-Every model call in month one goes through OpenRouter, one provider for all books, so cost and latency are measured the same way everywhere. The Anthropic-direct adapter stays in the code but is not used. The two ids in play:
+Every model call in month one goes through OpenRouter, one provider for all books, so cost and latency are measured the same way everywhere. The `anthropic/` adapter also routes through OpenRouter since 2026-09-26. The two ids in play:
 
 - Claude Fable 5.1: `openrouter/anthropic/claude-fable-5.1` (books A, C, D)
 - GPT-6 Astra: `openrouter/openai/gpt-6-astra` (book E)
@@ -14,11 +14,11 @@ Every model call in month one goes through OpenRouter, one provider for all book
 
 | You want | Write in the book's yaml |
 |---|---|
-| Claude Fable 5.1 (Anthropic direct) | `model: anthropic/claude-fable-5-1` |
-| Claude Opus 5 (Anthropic direct) | `model: anthropic/claude-opus-5` |
+| Claude Fable 5.1 (Anthropic id, sent via OpenRouter with no sampling settings) | `model: anthropic/claude-fable-5-1` |
+| Claude Opus 5 (Anthropic id, sent via OpenRouter) | `model: anthropic/claude-opus-5` |
 | GPT-6 Astra (OpenAI, via OpenRouter) | `model: openrouter/openai/gpt-6-astra` |
 | GPT-6 Astra Pro (via OpenRouter) | `model: openrouter/openai/gpt-6-astra-pro` |
-| Claude Fable 5.1 via OpenRouter instead of direct | `model: openrouter/anthropic/claude-fable-5.1` |
+| Claude Fable 5.1 by its OpenRouter id | `model: openrouter/anthropic/claude-fable-5.1` |
 | Any other OpenRouter model | `model: openrouter/<id from https://openrouter.ai/models>` |
 
 The word before the first slash picks the provider. Everything after it is the provider's own model id, copied exactly.
@@ -39,12 +39,12 @@ For a book, use `openrouter/openai/gpt-6-astra`. It costs the same per token as 
 ## Keys
 
 - OpenRouter: `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/openrouter.env`, one line `OPENROUTER_API_KEY=...`. Gitignored. Test call made 2026-09-06 11:50 ET to `openai/gpt-6-astra`: reply "ready", 23 tokens in, 5 out, 3.6 seconds, key works. OpenRouter returns a cost of 0 in the response on this key, because the key routes through BYOK and bills an upstream account. The real figure only appears in the key's own counters. See "The cost field lies on this key" below. The ledger must treat a 0 as "not yet known", never as free.
-- Anthropic: the code reads `ANTHROPIC_API_KEY` from the environment or from `/Users/mtalib/workspace_repos/personal_repo/agentic_trading/.secrets/anthropic.env`. Neither exists on this Mac yet, so the Anthropic adapter is written but not yet exercised. Mo needs to create an API key at https://console.anthropic.com and save it to that file before a Claude-direct book can run.
+- Anthropic: no longer used. Since 2026-09-26 the code never reads an Anthropic key; `anthropic/<id>` books run on the OpenRouter key above.
 
 ## Deliberate choices
 
 - **No silent fallback between models.** Anthropic offers an automatic switch to a different model when a request is refused. That is switched off here, because a book labelled "Fable" that quietly ran on Opus for a day would poison the comparison. A refusal or an error comes back as "no decision" and is logged as such.
-- **Cost is recorded per call.** OpenRouter reports the exact dollar cost. For Anthropic direct the code multiplies tokens by the published price list. Both land in the ledger so model cost becomes a column in the month-end comparison.
+- **Cost is recorded per call.** OpenRouter reports the dollar cost (but see "The cost field lies on this key" below). It lands in the ledger so model cost becomes a column in the month-end comparison.
 - **Same prompt, same data, different model.** The adapter takes a system prompt and a user message and returns text. Nothing provider-specific leaks into the strategy prompts, so a model swap changes exactly one line.
 
 ## Quick test

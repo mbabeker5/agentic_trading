@@ -288,22 +288,11 @@ own counters on the OpenRouter site. Details in
 
 **Read by** `<root>/agent/models.py`.
 
-#### `.secrets/anthropic.env` (does not exist yet)
+#### `.secrets/anthropic.env` (retired, not needed)
 
-```
-ANTHROPIC_API_KEY=...
-```
-
-**Where the value comes from.** console.anthropic.com, Settings, API keys.
-
-This file does not exist on the old Mac either, so there is nothing to carry
-across. It is listed here so that the absence is on record rather than looking
-like something lost in the move. It is needed before any book that calls Claude
-directly can run.
-
-**Read by** `<root>/agent/models.py`, which checks the environment variable
-first, then this file, then whatever Anthropic credentials already exist on the
-machine.
+Since 2026-09-26 `<root>/agent/models.py` never calls the Anthropic API and never
+reads an Anthropic key. Books named `anthropic/<id>` are sent through OpenRouter
+with the key in `.secrets/openrouter.env`. Do not create this file.
 
 #### `.secrets/finviz.env` (does not exist, and is switched off)
 

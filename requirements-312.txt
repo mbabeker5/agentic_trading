@@ -1,7 +1,6 @@
 aeventkit==2.1.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
-anthropic==1.4.0
 anyio==4.14.2
 attrs==26.1.0
 Authlib==1.8.0
